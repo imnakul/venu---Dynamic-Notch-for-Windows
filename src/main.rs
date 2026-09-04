@@ -1,3 +1,4 @@
+mod autostart;
 mod config;
 mod flash;
 mod gui;
@@ -8,7 +9,10 @@ mod tray;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Console::FreeConsole;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
 };
@@ -67,13 +71,66 @@ fn create_app_icon_data() -> Option<egui::IconData> {
     })
 }
 
+/// Named mutex held for the life of the process. A second launch — say, the
+/// user double-clicking the exe while the tray copy is already running —
+/// finds it taken and quietly exits instead of fighting over the notch.
+fn acquire_single_instance() -> bool {
+    unsafe {
+        let name = HSTRING::from("Local\\Venu.SingleInstance");
+        match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
+            Ok(handle) => {
+                // Bound but never closed: the mutex must outlive `main`, and
+                // HANDLE carries no destructor of its own.
+                let _ = handle;
+                GetLastError() != ERROR_ALREADY_EXISTS
+            }
+            // If the mutex cannot be created, assume we are alone rather than
+            // refusing to start for everyone.
+            Err(_) => true,
+        }
+    }
+}
+
+/// Keep the registry autostart entry and the saved preference in step.
+///
+/// - Preference on: rewrite the entry every run, so an updated or moved
+///   `venu.exe` never leaves a stale path registered for sign-in.
+/// - Preference off but an entry exists: the installer wrote it, or the
+///   config file was reset. Adopt it, so the toggle in Preferences matches
+///   what actually happens at sign-in.
+fn reconcile_autostart(config: &RwLock<AppConfig>) {
+    let mut cfg = config.write();
+    if cfg.launch_on_startup {
+        if let Err(e) = autostart::enable() {
+            eprintln!("[startup] could not refresh the autostart entry: {e}");
+        }
+    } else if autostart::is_registered() {
+        match autostart::enable() {
+            Ok(()) => {
+                cfg.launch_on_startup = true;
+                cfg.save();
+            }
+            Err(e) => eprintln!("[startup] could not adopt the autostart entry: {e}"),
+        }
+    }
+}
+
 fn main() {
     // Immediately detach console when launched from Windows Explorer
     unsafe {
         let _ = FreeConsole();
     }
 
+    // A second copy would draw a second notch in the same place.
+    if !acquire_single_instance() {
+        return;
+    }
+
     let config = Arc::new(RwLock::new(AppConfig::load()));
+
+    // The autostart entry is owned by the saved preference (the toggle under
+    // Settings > App > Preferences); reconcile before anything renders.
+    reconcile_autostart(&config);
 
     // Spawn Overlay Render, System Tray & Win32 Message Loop thread
     let overlay_config = Arc::clone(&config);
@@ -139,12 +196,20 @@ fn main() {
         }
     });
 
+    // `--startup` is what the sign-in entry appends: at boot Venu should come
+    // up in the tray, not open the settings window over the desktop. The tray
+    // menu restores the window through the same path as "Open Settings".
+    // `--minimized` is an alias for launching it by hand the same way.
+    let quiet = std::env::args()
+        .skip(1)
+        .any(|a| a == "--startup" || a == "--minimized");
+
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
         .with_inner_size([760.0, 600.0])
         .with_min_inner_size([620.0, 480.0])
-        .with_visible(true)
-        .with_active(true);
+        .with_visible(!quiet)
+        .with_active(!quiet);
 
     if let Some(icon) = create_app_icon_data() {
         viewport_builder = viewport_builder.with_icon(icon);

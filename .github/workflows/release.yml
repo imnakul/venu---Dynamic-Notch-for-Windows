@@ -24,14 +24,23 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$version "packaging/venu.iss"
+
       - name: Rename binary with version tag
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}"
+          $version = "${{ github.ref_name }}".TrimStart("v")
           Copy-Item "target/release/venu.exe" "venu-$version.exe"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: venu-*.exe
+          files: |
+            venu-*.exe
+            dist/venu-setup-*.exe
           generate_release_notes: true

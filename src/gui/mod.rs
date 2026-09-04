@@ -610,6 +610,43 @@ impl SettingsApp {
         );
 
         Self::divider(ui);
+        Self::section_title(ui, "STARTUP");
+        Self::row_stacked(
+            ui,
+            "Launch on startup",
+            Some(
+                "Start Venu quietly in the tray when you sign in to Windows. It lives under \
+                  your user's autostart key — no admin rights — and can also be paused from \
+                  Task Manager's Startup list.",
+            ),
+            |ui| {
+                let mut enabled = cx.cfg.launch_on_startup;
+                let check = ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text("Registers venu.exe under the per-user Run key");
+                if check.changed() {
+                    let result = if enabled {
+                        crate::autostart::enable()
+                    } else {
+                        crate::autostart::disable()
+                    };
+                    match result {
+                        Ok(()) => {
+                            cx.cfg.launch_on_startup = enabled;
+                            *cx.changed = true;
+                        }
+                        Err(e) => eprintln!("[settings] autostart toggle failed: {e}"),
+                    }
+                }
+                if enabled {
+                    if let Some(cmd) = crate::autostart::registered_command() {
+                        ui.label(RichText::new(cmd).size(10.5).color(theme::text_tertiary()));
+                    }
+                }
+            },
+        );
+
+        Self::divider(ui);
         Self::section_title(ui, "YOUR SETTINGS");
 
         ui.label(

@@ -42,9 +42,17 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
 ]
+
+[build-dependencies]
+# Embeds the version resource and app icon into venu.exe, so Explorer, the
+# Start Menu and the installer can all see what they are looking at.
+winresource = "0.1"

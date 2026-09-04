@@ -924,6 +924,11 @@ pub struct AppConfig {
     /// overlays — this is only the chrome around the controls.
     #[serde(default)]
     pub ui_theme: UiTheme,
+    /// Whether Venu registers itself to start when Windows signs in. The
+    /// registry side of this lives in `crate::autostart`; the entry is
+    /// refreshed against this flag on every launch.
+    #[serde(default)]
+    pub launch_on_startup: bool,
 }
 
 fn default_phrase_spacing() -> u32 {
@@ -951,6 +956,7 @@ impl Default for AppConfig {
             marquee: MarqueeConfig::default(),
             flash: FlashConfig::default(),
             ui_theme: UiTheme::default(),
+            launch_on_startup: false,
         }
     }
 }

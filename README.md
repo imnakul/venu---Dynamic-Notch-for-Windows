@@ -168,6 +168,7 @@ Venu is designed to run quietly in the background.
 - System tray support
 - Quick controls from the tray
 - Single-instance application behavior
+- Launch on startup (quiet, tray-only sign-in start)
 - Native Windows file dialogs
 - Windows 10 and Windows 11 support
 - Local JSON configuration
@@ -186,11 +187,20 @@ AI usage information is displayed locally by Venu based on the integrations and 
 
 ## Installation
 
-### Download Venu
+### Installer (recommended)
 
-Download the latest Windows release from the [GitHub Releases](https://github.com/imnakul/venu---Dynamic-Notch-for-Windows/releases) page and run `venu.exe`.
+Download `venu-setup-x.y.z.exe` from the [GitHub Releases](https://github.com/imnakul/venu---Dynamic-Notch-for-Windows/releases) page and run it. The installer:
 
-No installer or administrator permissions are required for the portable release.
+- installs Venu per-user into `%LOCALAPPDATA%\Programs\Venu` — no administrator rights needed
+- adds a Start Menu shortcut (and optionally a desktop shortcut)
+- offers to enable **Launch on startup**, so Venu is already running quietly in the tray the next time you turn your PC on
+- ships an uninstaller that removes all of the above
+
+### Portable
+
+Download `venu-x.y.z.exe` from the Releases page and run it directly. No installation, no admin rights.
+
+Either way, **Launch on startup** can be toggled any time from **Settings > App > Preferences**. The setting lives under your user profile (`HKCU\...\CurrentVersion\Run`), keeps pointing at the copy of Venu you last ran, and a sign-in start stays quiet in the tray instead of opening the settings window. Only one Venu runs at a time.
 
 ### Build from Source
 
@@ -209,6 +219,14 @@ The compiled executable will be available at:
 ```text
 target/release/venu.exe
 ```
+
+To build the Windows installer as well, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
+
+```bash
+iscc packaging/venu.iss
+```
+
+The setup executable is written to `dist/venu-setup-<version>.exe`. A tooling-free per-user install/uninstall is also available as `scripts/install.ps1` / `scripts/uninstall.ps1`.
 
 ## How to Use Venu
 
