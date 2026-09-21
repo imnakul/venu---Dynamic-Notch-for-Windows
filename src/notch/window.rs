@@ -9,6 +9,13 @@
 //!   are created once. `WM_NCHITTEST` reports `HTTRANSPARENT` for every pixel
 //!   outside the silhouette, so the empty margin stays click-through.
 //!
+//! * A frame is only painted when it would differ from the one already on
+//!   screen. The notch spends nearly all of its life collapsed and unchanged,
+//!   and a layered window costs a full Direct2D scene plus a
+//!   `UpdateLayeredWindow` blit every time it is redrawn — so repainting it
+//!   sixty times a second to show the same pill is the single most expensive
+//!   thing the process can do while idle. See [`FrameKey`].
+//!
 //! * Wheel events are captured with a low-level mouse hook rather than
 //!   `WM_MOUSEWHEEL`. The notch is a `WS_EX_NOACTIVATE` window and never takes
 //!   focus, so it would only receive wheel messages if the user happens to have
@@ -18,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -42,7 +49,7 @@ use crate::notch::anim::lerp;
 use crate::notch::backdrop;
 use crate::notch::geom::NotchShape;
 use crate::notch::hook;
-use crate::notch::paint::Painter;
+use crate::notch::paint::{clock_key, Motion, Painter};
 use crate::notch::state::NotchState;
 use crate::notch::surface::D2DSurface;
 use crate::notch::theme;
@@ -54,6 +61,42 @@ const HTCLIENT: LRESULT = LRESULT(1);
 /// Extra slop around the drawn silhouette that still counts as a hover, so the
 /// notch opens as the cursor arrives rather than after it has landed.
 const HOVER_SLOP: f32 = 4.0;
+
+/// How often a frame whose only motion is ambient — a breathing indicator
+/// dot, or the desktop showing through a glass theme — is repainted.
+///
+/// A pulse takes the best part of four seconds to breathe in and out, so
+/// about ten frames a second is some forty steps per cycle: indistinguishable
+/// from sixty, at a sixth of the cost. The overlay thread polls faster than
+/// this while idle, so the real cadence is the next poll after the interval
+/// rather than the interval exactly.
+const AMBIENT_FRAME: Duration = Duration::from_millis(90);
+
+/// How often the monitor layout is re-read.
+///
+/// `EnumDisplayMonitors` is a syscall per display and a monitor arriving or
+/// leaving is not a per-frame event — but it does have to be picked up
+/// without restarting Venu, so it is polled rather than cached forever.
+const MONITOR_REFRESH: Duration = Duration::from_secs(2);
+
+/// How often the notch re-asserts its place in the z-order while it is idle.
+///
+/// `WS_EX_TOPMOST` keeps it in the topmost band, but another topmost window
+/// that activates still lands above it. Painting used to re-assert the order
+/// as a side effect sixty times a second; now that idle frames are skipped,
+/// this is what keeps the notch from being left buried — at a cost of one
+/// `SetWindowPos` a second instead of sixty.
+const Z_ORDER_REFRESH: Duration = Duration::from_secs(1);
+
+/// Longest the notch will go without repainting, however still it is.
+///
+/// [`FrameKey`] is meant to be exhaustive, but it is a list that has to be
+/// kept in step with the painter by hand, and there are ways for a layered
+/// window's contents to be dropped from underneath it that nothing in this
+/// process sees — a lost Direct2D device, a session reconnect. A frame every
+/// few seconds is close enough to free that it is worth spending to make any
+/// of that self-correcting rather than permanent.
+const KEEPALIVE_FRAME: Duration = Duration::from_secs(5);
 
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -214,6 +257,52 @@ struct Placement {
     top: f32,
 }
 
+/// Everything a painted frame is made of.
+///
+/// Two ticks with equal keys would put the same pixels on screen, so the
+/// second one can skip the paint, the blit and all the Direct2D and
+/// DirectWrite work behind them. Anything a slide reads has to be represented
+/// here — leaving something out means the notch would go on showing a stale
+/// version of it until something else happened to change.
+///
+/// The one thing deliberately absent is the free-running clock behind the
+/// ambient pulses and the notification glow. That is reported by the painter
+/// as [`Motion`] instead, so a slide can animate without the gate having to
+/// know which slides do.
+#[derive(PartialEq)]
+struct FrameKey {
+    placement: Placement,
+    shape: NotchShape,
+    expand: f32,
+    carousel: f32,
+    toast: f32,
+    active: usize,
+    pinned: bool,
+    editing: bool,
+    caret_on: bool,
+    edit_buffer: String,
+    marquee_offset: f32,
+    click_through_flash: f32,
+    selected_notification: Option<u64>,
+    capture_excluded: bool,
+    /// Local time, to the second.
+    clock: u64,
+    /// Bumped by the media poller when what is playing actually changes.
+    media: u64,
+    /// Bumped by the notification centre on every change to it.
+    notifications: u64,
+}
+
+/// What one frame of the notch asked for.
+pub struct TickOutcome {
+    /// Something the user changed in the notch itself needs writing to disk.
+    pub config_dirty: bool,
+    /// The notch is mid-motion and wants the next frame at full rate. When
+    /// this is false the overlay thread drops to a slow poll that watches for
+    /// hover and input without drawing anything.
+    pub animating: bool,
+}
+
 pub struct NotchWindow {
     hwnd: HWND,
     surface: D2DSurface,
@@ -228,6 +317,17 @@ pub struct NotchWindow {
     /// it is turned back off the moment they leave that theme.
     capture_excluded: bool,
     last_wallpaper: String,
+    /// Monitor rectangles, re-read every [`MONITOR_REFRESH`] rather than on
+    /// every frame.
+    monitors: Vec<RECT>,
+    monitors_read_at: Instant,
+    /// The frame currently on screen, and what it asked for. `None` until the
+    /// first paint, which is why the notch always draws once on creation.
+    last_key: Option<FrameKey>,
+    last_cfg: Option<AppConfig>,
+    last_motion: Motion,
+    last_paint: Instant,
+    z_asserted_at: Instant,
 }
 
 unsafe impl Send for NotchWindow {}
@@ -255,7 +355,8 @@ impl NotchWindow {
     pub fn create(cfg: &AppConfig) -> windows::core::Result<Self> {
         Self::register_class()?;
 
-        let placement = Self::compute_placement(cfg);
+        let monitors = monitor_rects();
+        let placement = Self::compute_placement(cfg, &monitors);
         let ex_style = Self::ex_style_for(cfg, false);
 
         let hwnd = unsafe {
@@ -296,6 +397,13 @@ impl NotchWindow {
             ex_style,
             capture_excluded: false,
             last_wallpaper: cfg.wallpaper.path.clone(),
+            monitors,
+            monitors_read_at: Instant::now(),
+            last_key: None,
+            last_cfg: None,
+            last_motion: Motion::Still,
+            last_paint: Instant::now(),
+            z_asserted_at: Instant::now(),
         })
     }
 
@@ -320,8 +428,16 @@ impl NotchWindow {
         style.0
     }
 
-    fn compute_placement(cfg: &AppConfig) -> Placement {
-        let monitors = monitor_rects();
+    /// Re-read the monitor layout if it has been long enough, so a display
+    /// being plugged in or unplugged is picked up without a restart.
+    fn refresh_monitors(&mut self) {
+        if self.monitors_read_at.elapsed() >= MONITOR_REFRESH {
+            self.monitors = monitor_rects();
+            self.monitors_read_at = Instant::now();
+        }
+    }
+
+    fn compute_placement(cfg: &AppConfig, monitors: &[RECT]) -> Placement {
         let m = monitors
             .get(cfg.notch.monitor_index)
             .copied()
@@ -335,7 +451,7 @@ impl NotchWindow {
         // trimmed to whatever is actually drawn — see `visible_rect`.
         let mut expanded_w = 0.0f32;
         let mut expanded_h = 0.0f32;
-        for slide in cfg.notch.effective_slides() {
+        for &slide in cfg.notch.effective_slides() {
             let (w, h) = slide_expanded_size(cfg, slide);
             let (cw, ch) = slide_collapsed_size(cfg, slide);
             expanded_w = expanded_w.max(w).max(cw);
@@ -471,15 +587,17 @@ impl NotchWindow {
     }
 
     /// One frame: reposition if settings moved, sample input, advance the
-    /// springs, paint, and blit.
-    pub fn tick(&mut self, cfg: &mut AppConfig, dt: f32) -> bool {
+    /// springs, and paint — the last of those only if the result would
+    /// actually differ from what is already on screen.
+    pub fn tick(&mut self, cfg: &mut AppConfig, dt: f32) -> TickOutcome {
         let mut config_dirty = false;
 
         // -- geometry -------------------------------------------------------
         // No `SetWindowPos` here: `UpdateLayeredWindow` moves and resizes the
         // window on every frame anyway, and doing it twice would flash the
         // untrimmed frame for one frame whenever a setting changed.
-        self.placement = Self::compute_placement(cfg);
+        self.refresh_monitors();
+        self.placement = Self::compute_placement(cfg, &self.monitors);
 
         if self.last_wallpaper != cfg.wallpaper.path {
             self.last_wallpaper = cfg.wallpaper.path.clone();
@@ -630,11 +748,71 @@ impl NotchWindow {
         );
 
         // -- paint ----------------------------------------------------------
-        if let Err(e) = self.render(cfg, shape) {
-            eprintln!("[notch] render failed: {e:?}");
+        //
+        // Everything above is cheap: a cursor read, some arithmetic and a few
+        // atomics. The paint below is not, so it is only spent when the frame
+        // would come out different — or when the last one it drew said it was
+        // still moving under its own clock.
+        let key = self.frame_key(shape);
+        let changed = self.last_key.as_ref() != Some(&key) || self.last_cfg.as_ref() != Some(cfg);
+
+        let since_paint = self.last_paint.elapsed();
+        let due = match self.last_motion {
+            Motion::Continuous => true,
+            Motion::Ambient => since_paint >= AMBIENT_FRAME,
+            Motion::Still => since_paint >= KEEPALIVE_FRAME,
+        };
+
+        if changed || due {
+            if let Err(e) = self.render(cfg, shape) {
+                eprintln!("[notch] render failed: {e:?}");
+            }
+            self.last_motion = self.painter.take_motion();
+            self.last_paint = Instant::now();
+            self.last_key = Some(key);
+            if self.last_cfg.as_ref() != Some(cfg) {
+                self.last_cfg = Some(cfg.clone());
+            }
+        } else if self.z_asserted_at.elapsed() >= Z_ORDER_REFRESH {
+            // Painting re-asserts the z-order on its way past; an idle notch
+            // still has to, or a topmost window that activated over it would
+            // keep it covered indefinitely.
+            self.assert_z_order(cfg);
         }
 
-        config_dirty
+        TickOutcome {
+            config_dirty,
+            // A frame that differed from the one before it means something is
+            // still in flight — a spring, the marquee, a countdown — and the
+            // next one should not be kept waiting.
+            animating: changed || self.last_motion == Motion::Continuous,
+        }
+    }
+
+    /// Snapshot of everything that would change what the next frame looks
+    /// like. See [`FrameKey`].
+    fn frame_key(&self, shape: NotchShape) -> FrameKey {
+        FrameKey {
+            placement: self.placement,
+            shape,
+            expand: self.state.expand.value,
+            carousel: self.state.carousel.value,
+            toast: self.state.toast_progress.value,
+            active: self.state.active,
+            pinned: self.state.pinned,
+            editing: self.state.editing,
+            caret_on: self.state.caret_on,
+            // Empty while not editing, and an empty `String` does not
+            // allocate, so the idle path stays free of heap traffic.
+            edit_buffer: self.state.edit_buffer.clone(),
+            marquee_offset: self.state.marquee_offset,
+            click_through_flash: self.state.click_through_flash,
+            selected_notification: self.state.selected_notification_id,
+            capture_excluded: self.capture_excluded,
+            clock: clock_key(),
+            media: self.painter.media.revision(),
+            notifications: crate::notch::notify::global_store().read().revision(),
+        }
     }
 
     fn handle_click(&mut self, cfg: &AppConfig, cx: f32, cy: f32, shape: NotchShape) {
@@ -785,7 +963,33 @@ impl NotchWindow {
         }
     }
 
+    /// Put the window back where it belongs in the z-order.
+    fn assert_z_order(&mut self, cfg: &AppConfig) {
+        let z = if cfg.notch.always_on_top {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                z,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | SWP_NOACTIVATE
+                    | SWP_SHOWWINDOW,
+            );
+        }
+        self.z_asserted_at = Instant::now();
+    }
+
     fn render(&mut self, cfg: &AppConfig, shape: NotchShape) -> windows::core::Result<()> {
+        self.assert_z_order(cfg);
+
         // The surface stays at the full layout size — it is the expensive
         // object, and painting always uses layout coordinates. Only the window
         // shrinks, by blitting the sub-rectangle that has anything in it.
@@ -828,24 +1032,6 @@ impl NotchWindow {
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-
-            let z = if cfg.notch.always_on_top {
-                HWND_TOPMOST
-            } else {
-                HWND_NOTOPMOST
-            };
-            let _ = SetWindowPos(
-                self.hwnd,
-                z,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOSIZE
-                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                    | SWP_NOACTIVATE
-                    | SWP_SHOWWINDOW,
-            );
 
             if let Err(e) = UpdateLayeredWindow(
                 self.hwnd,

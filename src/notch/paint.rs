@@ -6,6 +6,8 @@
 //! the contents rise into it a beat later, which is what stops the panel from
 //! looking like a texture being stretched.
 
+use std::cell::Cell;
+
 use windows::core::{Interface, PCWSTR};
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::GENERIC_READ;
@@ -80,6 +82,29 @@ struct CachedArt {
     bitmap: ID2D1Bitmap,
 }
 
+/// How much of the last painted frame was moving on its own.
+///
+/// The notch is an always-on overlay, so the only frames worth paying for are
+/// the ones that differ from the one before. Almost everything that moves (the
+/// open spring, the carousel, the marquee, the text) is visible in the notch's
+/// own state and can be compared directly. What cannot is the motion
+/// the painter drives from the free-running clock: the breathing accent dot,
+/// the glow that sweeps a notification's border, and the desktop showing
+/// through a glass theme. Those are reported from inside the paint instead,
+/// so the frame gate never has to guess at what a slide happens to draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Motion {
+    /// Nothing is moving by itself. Repaint only when the state changes.
+    #[default]
+    Still,
+    /// Slow, low-amplitude motion — a pulse fading in and out, a blurred
+    /// backdrop. A handful of frames a second is indistinguishable from sixty
+    /// and costs a fraction as much.
+    Ambient,
+    /// Motion that has to be smooth: keep the full frame rate.
+    Continuous,
+}
+
 pub struct Painter {
     pub text: TextEngine,
     /// GDI capture surface for the frosted theme's blur. Allocated lazily and
@@ -97,6 +122,11 @@ pub struct Painter {
     pub media: MediaWatcher,
     media_art: Option<CachedArt>,
     media_art_failed: Option<u64>,
+    /// Raised by the drawing code while a frame is being painted. A `Cell`
+    /// because the slides that report it are split between `&self` and
+    /// `&mut self` methods and threading a flag back out of every one of them
+    /// would be noise.
+    motion: Cell<Motion>,
 }
 
 /// Local time, read once per frame.
@@ -149,6 +179,21 @@ impl Clock {
     }
 }
 
+/// Everything the slides read off the clock, packed into one word so a frame
+/// can be compared against the one before it.
+///
+/// A second is the finest granularity anything here uses: the clock face shows
+/// minutes, but the day-progress bar beneath it moves with the seconds.
+pub fn clock_key() -> u64 {
+    let c = Clock::now();
+    (c.second as u64)
+        | (c.minute as u64) << 8
+        | (c.hour24 as u64) << 16
+        | (c.day as u64) << 24
+        | (c.month as u64) << 32
+        | (c.weekday as u64) << 40
+}
+
 impl Painter {
     pub fn new() -> windows::core::Result<Self> {
         let text = TextEngine::new()?;
@@ -169,7 +214,30 @@ impl Painter {
             media: MediaWatcher::spawn(),
             media_art: None,
             media_art_failed: None,
+            motion: Cell::new(Motion::Still),
         })
+    }
+
+    /// What the frame just painted needs from the next one. Reading it clears
+    /// it, so each report covers exactly one frame.
+    pub fn take_motion(&self) -> Motion {
+        self.motion.replace(Motion::Still)
+    }
+
+    /// Note that this frame contains motion of its own, and how smooth it has
+    /// to be. The strongest report in a frame wins.
+    fn report(&self, motion: Motion) {
+        self.motion.set(self.motion.get().max(motion));
+    }
+
+    /// The ambient breathing applied to live indicator dots.
+    ///
+    /// Goes through the painter rather than straight to the state so that
+    /// asking for the pulse is what keeps the frames coming: any slide that
+    /// draws one stays animated without having to be listed anywhere else.
+    fn pulse(&self, state: &NotchState) -> f32 {
+        self.report(Motion::Ambient);
+        state.pulse()
     }
 
     /// Called when the wallpaper path changes so the next frame re-decodes.
@@ -420,6 +488,8 @@ impl Painter {
         }
 
         self.pal = theme::Palette::for_theme(cfg.notch.theme);
+        // Each frame reports its own motion from scratch.
+        self.motion.set(Motion::Still);
 
         let generation = surface.generation();
         let factory = surface.factory.clone();
@@ -525,7 +595,7 @@ impl Painter {
                 &factory,
                 cfg,
                 state,
-                &slides,
+                slides,
                 shape,
                 expanded_alpha,
                 generation,
@@ -564,6 +634,11 @@ impl Painter {
         if glow_alpha <= 0.01 {
             return;
         }
+
+        // The sweep, the hue cycle and the drain all run off `state.elapsed`,
+        // which the frame gate cannot see. Hold the full frame rate for as
+        // long as the glow is on screen.
+        self.report(Motion::Continuous);
 
         let app_color = cfg
             .notch
@@ -830,7 +905,7 @@ impl Painter {
                 shape.right - 7.5,
                 shape.bottom - 7.5,
                 2.0,
-                theme::fade(self.pal.text_lo, 0.75 * state.pulse()),
+                theme::fade(self.pal.text_lo, 0.75 * self.pulse(state)),
             );
         }
 
@@ -898,6 +973,12 @@ impl Painter {
         shape: &NotchShape,
         origin: (i32, i32),
     ) {
+        // What is behind the notch is not ours to watch for changes, so a
+        // glass theme has to keep resampling. Ambient rather than continuous:
+        // a blur this heavy, behind a strip this small, reads the same at a
+        // few frames a second as it does at sixty.
+        self.report(Motion::Ambient);
+
         let x = origin.0 + shape.left.floor() as i32;
         let y = origin.1 + shape.top.floor() as i32;
         let w = shape.width().ceil() as i32;
@@ -1117,7 +1198,7 @@ impl Painter {
                     dot_x,
                     cy,
                     dot_r,
-                    theme::fade(cfg.notch.accent, alpha * state.pulse()),
+                    theme::fade(cfg.notch.accent, alpha * self.pulse(state)),
                 );
 
                 let text_x = dot_x + dot_r + 9.0;
@@ -1250,7 +1331,7 @@ impl Painter {
                     dot_r,
                     theme::fade(
                         cfg.notch.accent,
-                        alpha * if now.playing { state.pulse() } else { 0.5 },
+                        alpha * if now.playing { self.pulse(state) } else { 0.5 },
                     ),
                 );
 
@@ -1302,7 +1383,7 @@ impl Painter {
                         } else {
                             self.pal.text_lo
                         },
-                        alpha * if has_unread { state.pulse() } else { 0.7 },
+                        alpha * if has_unread { self.pulse(state) } else { 0.7 },
                     ),
                 );
 
@@ -1749,7 +1830,7 @@ impl Painter {
             body.left + 3.0,
             body.top + 6.0,
             3.0,
-            theme::fade([0.22, 0.74, 0.97, 1.0], alpha * state.pulse()),
+            theme::fade([0.22, 0.74, 0.97, 1.0], alpha * self.pulse(state)),
         );
 
         let unread = store.unread_count();
@@ -1974,7 +2055,7 @@ impl Painter {
             body.left + 3.0,
             body.top + 6.0,
             3.0,
-            theme::fade(cfg.notch.accent, alpha * state.pulse()),
+            theme::fade(cfg.notch.accent, alpha * self.pulse(state)),
         );
         self.label(
             t,

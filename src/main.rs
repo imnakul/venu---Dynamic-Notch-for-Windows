@@ -17,8 +17,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
 };
 
-/// Target frame interval for the overlay thread, in milliseconds.
+/// Frame interval for the overlay thread while something is actually moving.
 const FRAME_MS: u32 = 16;
+
+/// Interval the overlay thread falls back to once nothing is animating.
+///
+/// Venu spends nearly all of its life like this: a collapsed pill showing the
+/// same thing it showed a second ago. A tick at this rate reads the cursor,
+/// drains the input bus and advances the springs — all of it arithmetic and a
+/// syscall or two — and paints nothing, so the notch still opens the instant
+/// the cursor reaches it without the process drawing sixty identical frames a
+/// second to sit still.
+const IDLE_POLL_MS: u32 = 32;
 
 use config::AppConfig;
 use flash::FlashManager;
@@ -172,14 +182,18 @@ fn main() {
             let dt = now.duration_since(last_instant).as_secs_f32();
             last_instant = now;
 
-            {
+            // Each of these reports whether it still has something in flight.
+            // None of them do while Venu sits in the tray with the notch shut,
+            // which is the state it is in almost all of the time.
+            let mut animating = {
                 let cfg = overlay_config.read();
-                manager.render_tick(&cfg, dt);
-                flash.tick(&cfg, dt);
-            }
+                let overlays = manager.render_tick(&cfg, dt);
+                let flashing = flash.tick(&cfg, dt);
+                overlays || flashing
+            };
 
             // Takes its own lock: inline editing writes back into the config.
-            notch.tick(dt);
+            animating |= notch.tick(dt);
 
             // Wait for the next frame *or* the next input message, whichever
             // comes first. A plain sleep here would hold mouse messages for up
@@ -187,8 +201,9 @@ fn main() {
             // covers a wide strip along the top of the screen, that shows up as
             // a cursor that drags whenever it crosses that strip.
             unsafe {
+                let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
                 let elapsed = last_instant.elapsed().as_millis() as u32;
-                let wait = FRAME_MS.saturating_sub(elapsed);
+                let wait = budget.saturating_sub(elapsed);
                 if wait > 0 {
                     MsgWaitForMultipleObjectsEx(None, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 }
@@ -224,6 +239,6 @@ fn main() {
     let _ = eframe::run_native(
         "Venu",
         native_options,
-        Box::new(|cc| Ok(Box::new(SettingsApp::new(cc, gui_config)))),
+        Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, gui_config, !quiet)))),
     );
 }

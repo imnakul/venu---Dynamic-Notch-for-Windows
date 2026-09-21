@@ -67,7 +67,11 @@ impl NotchManager {
         }
     }
 
-    pub fn tick(&mut self, dt: f32) {
+    /// Advance the notch by one frame. Returns whether it wants the next one
+    /// at full rate; when it does not, the overlay thread drops to a slow
+    /// poll instead of driving sixty frames a second into a picture that is
+    /// not changing.
+    pub fn tick(&mut self, dt: f32) -> bool {
         let enabled = self.config.read().notch.enabled;
 
         if !enabled {
@@ -79,7 +83,7 @@ impl NotchManager {
             // on screen; otherwise a stale bound rect would keep swallowing
             // chords over empty desktop.
             hook::silence();
-            return;
+            return false;
         }
 
         if self.window.is_none() && !self.create_failed {
@@ -94,18 +98,18 @@ impl NotchManager {
         }
 
         let Some(window) = self.window.as_mut() else {
-            return;
+            return false;
         };
 
         // The write lock is held for the frame because inline editing and slide
         // changes mutate the config in place. Contention is with the settings
         // window only, which touches it at human speed.
-        let dirty = {
+        let outcome = {
             let mut cfg = self.config.write();
             window.tick(&mut cfg, dt)
         };
 
-        if dirty {
+        if outcome.config_dirty {
             self.save_countdown = Some(SAVE_DEBOUNCE);
         }
 
@@ -116,5 +120,7 @@ impl NotchManager {
                 self.config.read().save();
             }
         }
+
+        outcome.animating
     }
 }

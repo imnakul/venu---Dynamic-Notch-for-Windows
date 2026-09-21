@@ -56,7 +56,11 @@ impl FlashManager {
         }
     }
 
-    pub fn tick(&mut self, cfg: &AppConfig, dt: f32) {
+    /// Advance the flash by one frame. Returns whether one is on screen: the
+    /// flash animates, so while it is up the overlay thread has to keep
+    /// running at full rate. Between flashes this is a countdown and nothing
+    /// else.
+    pub fn tick(&mut self, cfg: &AppConfig, dt: f32) -> bool {
         let flash = &cfg.flash;
         let preview = PREVIEW_REQUESTED.swap(false, Ordering::SeqCst);
 
@@ -69,7 +73,7 @@ impl FlashManager {
             self.window = None;
             self.countdown = None;
             if !preview {
-                return;
+                return false;
             }
         }
 
@@ -95,7 +99,7 @@ impl FlashManager {
         }
 
         let Some(show) = self.showing.as_mut() else {
-            return;
+            return false;
         };
 
         show.elapsed += dt;
@@ -112,7 +116,7 @@ impl FlashManager {
             if !flash.enabled {
                 self.window = None;
             }
-            return;
+            return false;
         }
 
         if let Some(w) = self.window.as_mut() {
@@ -120,8 +124,11 @@ impl FlashManager {
                 eprintln!("[flash] render error: {e:?}");
                 self.window = None;
                 self.showing = None;
+                return false;
             }
         }
+
+        true
     }
 
     fn begin(&mut self, flash: &FlashConfig) {
