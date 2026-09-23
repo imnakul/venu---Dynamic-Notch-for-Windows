@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct EdgeSelection {
     pub top: bool,
     pub right: bool,
@@ -10,7 +10,7 @@ pub struct EdgeSelection {
     pub left: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct PaddingConfig {
     pub top: u32,
     pub right: u32,
@@ -18,7 +18,7 @@ pub struct PaddingConfig {
     pub left: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FontConfig {
     pub family: String,
     pub size: f32,
@@ -37,7 +37,7 @@ impl Default for FontConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColorConfig {
     pub text_color: [f32; 4], // RGBA 0.0 - 1.0
     pub bg_color: [f32; 4],   // RGBA 0.0 - 1.0
@@ -52,7 +52,7 @@ impl Default for ColorConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimConfig {
     pub speed: f32, // pixels per second
     pub reverse: bool,
@@ -293,7 +293,7 @@ impl NotificationGlowStyle {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
@@ -367,7 +367,7 @@ impl NotificationConfig {
 
 /// One line on today's short list. Deliberately not a to-do system: this is
 /// only meant to hold the handful of things today is actually about.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusItem {
     pub text: String,
     pub done: bool,
@@ -382,7 +382,7 @@ impl StatusItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusConfig {
     /// Small tracked label above the focus line, e.g. "TODAY".
     pub heading: String,
@@ -406,7 +406,7 @@ impl Default for StatusConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WallpaperConfig {
     /// Absolute path to a PNG/JPG/BMP/GIF. Empty means "show the placeholder".
     pub path: String,
@@ -477,7 +477,7 @@ impl WallpaperConfig {
 /// a value: `0` means "whatever the notch itself is set to", so the slide only
 /// diverges where the user deliberately made it diverge, and the notch's own
 /// settings keep working as the single place to change everything at once.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MarqueeConfig {
     /// Whether the line scrolls. Off, it simply sits there: the same message,
@@ -533,7 +533,7 @@ impl MarqueeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotchConfig {
     pub enabled: bool,
     pub monitor_index: usize,
@@ -610,11 +610,19 @@ impl Default for NotchConfig {
 impl NotchConfig {
     /// Slides, guaranteed non-empty, so the carousel always has something to
     /// land on even if every slide was unchecked in settings.
-    pub fn effective_slides(&self) -> Vec<SlideKind> {
+    /// The deck as it is actually shown.
+    ///
+    /// Borrowed rather than cloned: this is read several times per frame — by
+    /// the placement maths, the carousel blend and the painter — and handing
+    /// back a fresh `Vec` each time put a heap allocation on every one of
+    /// those calls, sixty times a second, for a list that almost never
+    /// changes.
+    pub fn effective_slides(&self) -> &[SlideKind] {
+        const FALLBACK: [SlideKind; 1] = [SlideKind::Clock];
         if self.slides.is_empty() {
-            vec![SlideKind::Clock]
+            &FALLBACK
         } else {
-            self.slides.clone()
+            &self.slides
         }
     }
 
@@ -759,7 +767,7 @@ impl FlashAnim {
 /// image, or both appears in the middle of the screen — then leaves on its
 /// own. Everything that can hold more than one entry rotates: each flash uses
 /// the next text, the next image, and the next colour in turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FlashConfig {
     pub enabled: bool,
@@ -890,7 +898,7 @@ impl FlashConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub text: String,
     /// Master switch for the edge marquee — the strips of scrolling text

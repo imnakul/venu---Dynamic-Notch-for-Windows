@@ -270,6 +270,9 @@ pub struct SettingsApp {
     /// Decoded wallpaper, kept between frames so the preview does not re-read
     /// the file sixty times a second.
     preview: wallpaper::PreviewCache,
+    /// Whether the window is on screen. Venu is a tray app: most of the time
+    /// this is false, and a hidden window has nothing worth redrawing.
+    on_screen: bool,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -309,7 +312,13 @@ fn flash_interval_text(v: f64) -> String {
 }
 
 impl SettingsApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config: Arc<RwLock<AppConfig>>) -> Self {
+    /// `on_screen` is false when Venu was started into the tray, which is what
+    /// the sign-in entry does.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        config: Arc<RwLock<AppConfig>>,
+        on_screen: bool,
+    ) -> Self {
         *EGUI_CTX.write() = Some(cc.egui_ctx.clone());
         setup_custom_fonts(&cc.egui_ctx);
 
@@ -328,6 +337,7 @@ impl SettingsApp {
             slide_dir: 1.0,
             palette: None,
             preview: wallpaper::PreviewCache::new(),
+            on_screen,
         }
     }
 
@@ -2723,14 +2733,17 @@ impl eframe::App for SettingsApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
+            // Closing puts Venu back in the tray rather than ending it.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.on_screen = false;
         }
 
         if crate::tray::SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.on_screen = true;
             ctx.request_repaint();
         }
 
@@ -2918,7 +2931,26 @@ impl eframe::App for SettingsApp {
             cfg_guard.save();
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // Nothing on this window animates on a clock of its own: egui asks for
+        // its own frames while a cross-fade or the page slide is running, and
+        // the tray wakes the context directly when it wants the window back.
+        // What is left is the config the notch shares with it — an inline
+        // focus edit or the click-through chord can change it from the other
+        // thread — so while the window is on screen it re-reads that a few
+        // times a second, and while it is in the tray it does not run at all.
+        //
+        // This used to ask for a frame every 50ms unconditionally, which had
+        // the whole settings UI rebuilding, laying out and tessellating twenty
+        // times a second for the entire time Venu was running, hidden or not.
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if self.on_screen && !minimized {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else if SETTINGS_HWND.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            // The window handle is found by walking this process's windows,
+            // which only works once one exists. Keep looking, slowly, until it
+            // does — the tray needs it to restore the window.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
 

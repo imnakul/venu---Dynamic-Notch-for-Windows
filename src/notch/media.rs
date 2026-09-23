@@ -6,7 +6,7 @@
 //! only because this thread does nothing else: no message pump, no UI, so a
 //! stalled wait starves nothing but itself.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +49,11 @@ enum Command {
 /// feature can be toggled off and on freely without leaking one.
 pub struct MediaWatcher {
     snapshot: Arc<RwLock<NowPlaying>>,
+    /// Bumped only when a poll actually found something different. The notch
+    /// reads it every tick to decide whether the frame on screen is still
+    /// current, so a poll that finds the same track playing must not look
+    /// like a change.
+    revision: Arc<AtomicU64>,
     tx: Sender<Command>,
     running: Arc<AtomicBool>,
 }
@@ -56,15 +61,18 @@ pub struct MediaWatcher {
 impl MediaWatcher {
     pub fn spawn() -> Self {
         let snapshot = Arc::new(RwLock::new(NowPlaying::default()));
+        let revision = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
 
         let worker_snapshot = snapshot.clone();
+        let worker_revision = revision.clone();
         let worker_running = running.clone();
-        std::thread::spawn(move || run(worker_snapshot, worker_running, rx));
+        std::thread::spawn(move || run(worker_snapshot, worker_revision, worker_running, rx));
 
         Self {
             snapshot,
+            revision,
             tx,
             running,
         }
@@ -72,6 +80,13 @@ impl MediaWatcher {
 
     pub fn snapshot(&self) -> NowPlaying {
         self.snapshot.read().clone()
+    }
+
+    /// Monotonic counter over every change to what is playing. Equal
+    /// revisions mean the notch would draw the same Now Playing it drew last
+    /// time, without having to clone and compare the snapshot.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn play_pause(&self) {
@@ -93,7 +108,12 @@ impl Drop for MediaWatcher {
     }
 }
 
-fn run(snapshot: Arc<RwLock<NowPlaying>>, running: Arc<AtomicBool>, rx: Receiver<Command>) {
+fn run(
+    snapshot: Arc<RwLock<NowPlaying>>,
+    revision: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
+    rx: Receiver<Command>,
+) {
     // COM apartment for this thread only; the overlay's own STA thread is
     // initialized separately and neither knows about the other.
     if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
@@ -104,7 +124,12 @@ fn run(snapshot: Arc<RwLock<NowPlaying>>, running: Arc<AtomicBool>, rx: Receiver
     let mut last_track_key: Option<String> = None;
 
     while running.load(Ordering::Relaxed) {
-        poll_once(&snapshot, &mut art_generation, &mut last_track_key);
+        poll_once(
+            &snapshot,
+            &revision,
+            &mut art_generation,
+            &mut last_track_key,
+        );
 
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(cmd) => handle_command(cmd),
@@ -132,14 +157,37 @@ fn handle_command(cmd: Command) {
     };
 }
 
+/// Publish `next` and bump the revision, but only if it differs from what is
+/// already there. Most polls find the same track in the same state, and the
+/// notch treats a bumped revision as a reason to repaint.
+fn publish(snapshot: &Arc<RwLock<NowPlaying>>, revision: &Arc<AtomicU64>, next: NowPlaying) {
+    {
+        let current = snapshot.read();
+        // `art` is compared through `art_generation`, which the poller bumps
+        // whenever it reads new bytes — cheaper than comparing the bytes.
+        if current.has_session == next.has_session
+            && current.playing == next.playing
+            && current.title == next.title
+            && current.artist == next.artist
+            && current.art_generation == next.art_generation
+        {
+            return;
+        }
+    }
+
+    *snapshot.write() = next;
+    revision.fetch_add(1, Ordering::Release);
+}
+
 fn poll_once(
     snapshot: &Arc<RwLock<NowPlaying>>,
+    revision: &Arc<AtomicU64>,
     art_generation: &mut u64,
     last_track_key: &mut Option<String>,
 ) {
     let Some(session) = current_session() else {
         *last_track_key = None;
-        *snapshot.write() = NowPlaying::default();
+        publish(snapshot, revision, NowPlaying::default());
         return;
     };
 
@@ -175,14 +223,18 @@ fn poll_once(
         snapshot.read().art.clone()
     };
 
-    *snapshot.write() = NowPlaying {
-        has_session: true,
-        playing,
-        title,
-        artist,
-        art,
-        art_generation: *art_generation,
-    };
+    publish(
+        snapshot,
+        revision,
+        NowPlaying {
+            has_session: true,
+            playing,
+            title,
+            artist,
+            art,
+            art_generation: *art_generation,
+        },
+    );
 }
 
 fn read_thumbnail(reference: &IRandomAccessStreamReference) -> Option<Vec<u8>> {

@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Direct2D::{
 /// degenerate arc produces artefacts on some drivers.
 const MIN_RADIUS: f32 = 0.5;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NotchShape {
     pub left: f32,
     pub top: f32,

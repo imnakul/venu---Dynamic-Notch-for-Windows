@@ -61,6 +61,10 @@ pub struct ToastAlert {
 pub struct NotificationCenter {
     pub items: Vec<Notification>,
     pub active_toast: Option<ToastAlert>,
+    /// Bumped by every mutation. The notch reads it once a tick to decide
+    /// whether the frame on screen is still the right one, which is cheaper
+    /// and more exact than diffing the list itself.
+    revision: u64,
 }
 
 static NOTIFICATION_STORE: parking_lot::RwLock<Option<Arc<RwLock<NotificationCenter>>>> =
@@ -103,6 +107,12 @@ fn current_time_formatted() -> (u64, String) {
 }
 
 impl NotificationCenter {
+    /// Monotonic counter over every change to the centre. Equal revisions
+    /// mean the notch would draw the same notifications it drew last time.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn unread_count(&self) -> usize {
         self.items.iter().filter(|n| !n.read).count()
     }
@@ -133,6 +143,7 @@ impl NotificationCenter {
         };
 
         // Insert at head of history
+        self.revision += 1;
         self.items.insert(0, notif.clone());
         if self.items.len() > MAX_NOTIFICATIONS {
             self.items.truncate(MAX_NOTIFICATIONS);
@@ -160,11 +171,13 @@ impl NotificationCenter {
             toast.remaining -= dt;
             if toast.remaining <= 0.0 {
                 self.active_toast = None;
+                self.revision += 1;
             }
         }
     }
 
     pub fn dismiss_toast(&mut self) {
+        self.revision += 1;
         if let Some(toast) = self.active_toast.take() {
             if let Some(item) = self
                 .items
@@ -177,12 +190,14 @@ impl NotificationCenter {
     }
 
     pub fn clear_all(&mut self) {
+        self.revision += 1;
         self.items.clear();
         self.active_toast = None;
     }
 
     #[allow(dead_code)]
     pub fn mark_all_read(&mut self) {
+        self.revision += 1;
         for item in &mut self.items {
             item.read = true;
         }
@@ -190,6 +205,7 @@ impl NotificationCenter {
 
     #[allow(dead_code)]
     pub fn dismiss_item(&mut self, id: u64) {
+        self.revision += 1;
         if let Some(toast) = &self.active_toast {
             if toast.notification.id == id {
                 self.active_toast = None;
