@@ -1,16 +1,70 @@
 name: Release
 
+# A release is cut for every new version, whichever way it arrives:
+#   - a `vX.Y.Z` tag pushed by hand,
+#   - a version bump in Cargo.toml merged to main (the tag is created here),
+#   - a manual "Run workflow" from the Actions tab.
+# Versions that already have a tag are skipped, so re-runs never duplicate a
+# release.
 on:
   push:
     tags:
       - "v*.*.*"
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+      - .github/workflows/release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should-release: ${{ steps.resolve.outputs.should-release }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and check for an existing tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "${version}" != "${manifest_version}" ]]; then
+              echo "::error::Tag v${version} does not match Cargo.toml version ${manifest_version}"
+              exit 1
+            fi
+            should_release=true
+          elif git ls-remote --exit-code --tags origin "refs/tags/v${manifest_version}" >/dev/null; then
+            version="${manifest_version}"
+            should_release=false
+            echo "::notice::v${version} is already tagged; nothing to release"
+          else
+            version="${manifest_version}"
+            should_release=true
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "should-release=${should_release}" >> "${GITHUB_OUTPUT}"
+
   build-and-release:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should-release == 'true'
     runs-on: windows-latest
+    concurrency:
+      group: release-v${{ needs.resolve-version.outputs.version }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -28,18 +82,17 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$version "packaging/venu.iss"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$env:VERSION "packaging/venu.iss"
 
       - name: Rename binary with version tag
         shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          Copy-Item "target/release/venu.exe" "venu-$version.exe"
+        run: Copy-Item "target/release/venu.exe" "venu-$env:VERSION.exe"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           files: |
             venu-*.exe
             dist/venu-setup-*.exe
