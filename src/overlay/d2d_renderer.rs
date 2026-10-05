@@ -9,10 +9,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+    IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
@@ -44,6 +44,7 @@ struct CachedText {
 pub struct D2DRenderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
+    font_collection: Option<IDWriteFontCollection>,
     dc_target: Option<ID2D1DCRenderTarget>,
     mem_dc: HDC,
     hbitmap: HBITMAP,
@@ -63,10 +64,15 @@ impl D2DRenderer {
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let font_collection = crate::fonts::build_private_collection(&dwrite_factory);
+        if font_collection.is_none() {
+            eprintln!("[marquee] bundled fonts unavailable, using system fonts");
+        }
 
         Ok(Self {
             d2d_factory,
             dwrite_factory,
+            font_collection,
             dc_target: None,
             mem_dc: HDC::default(),
             hbitmap: HBITMAP::default(),
@@ -199,10 +205,19 @@ impl D2DRenderer {
                 DWRITE_FONT_STYLE_NORMAL
             };
 
-            let family_hstr = HSTRING::from(&config.font.family);
+            let family = crate::fonts::family_for_collection(
+                &config.font.family,
+                self.font_collection.is_some(),
+            );
+            let family_hstr = HSTRING::from(family);
+            let collection = if crate::fonts::is_bundled_family(&config.font.family) {
+                self.font_collection.as_ref()
+            } else {
+                None
+            };
             let text_format: IDWriteTextFormat = self.dwrite_factory.CreateTextFormat(
                 PCWSTR(family_hstr.as_ptr()),
-                None,
+                collection,
                 weight,
                 style,
                 DWRITE_FONT_STRETCH_NORMAL,

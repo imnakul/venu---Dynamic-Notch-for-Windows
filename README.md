@@ -85,6 +85,7 @@ Available slides include:
 - **Wallpaper**: Image preview with optional caption
 - **Marquee**: Moving reminder or custom text
 - **AI Usage**: Claude, Codex, and Antigravity usage information
+- **Stats**: whole-PC CPU and physical RAM, the busiest GPU engine, and battery or AC power
 
 ### Media Controls
 
@@ -166,7 +167,8 @@ Venu includes a precision color editor instead of relying on the default Windows
 Venu is designed to run quietly in the background.
 
 - System tray support
-- Quick controls from the tray
+- Quick controls and Settings access from the tray, plus a Settings button in the notch
+- Ordinary launches open quietly in the tray; pass `--settings` to open the Settings window directly
 - Single-instance application behavior
 - Launch on startup (quiet, tray-only sign-in start)
 - Native Windows file dialogs
@@ -198,9 +200,9 @@ Download `venu-setup-x.y.z.exe` from the [GitHub Releases](https://github.com/im
 
 ### Portable
 
-Download `venu-x.y.z.exe` from the Releases page and run it directly. No installation, no admin rights.
+Download `venu-x.y.z.exe` from the Releases page and run it directly. No installation, no admin rights. Venu starts quietly in the tray; choose **Open Settings** from the tray menu or use the notch's Settings button. Run `venu-x.y.z.exe --settings` when you want to open Settings on launch.
 
-Either way, **Launch on startup** can be toggled any time from **Settings > App > Preferences**. The setting lives under your user profile (`HKCU\...\CurrentVersion\Run`), keeps pointing at the copy of Venu you last ran, and a sign-in start stays quiet in the tray instead of opening the settings window. Only one Venu runs at a time.
+Either way, **Launch on startup** can be toggled any time from **Settings > App > Preferences**. The setting lives under your user profile (`HKCU\...\CurrentVersion\Run`), keeps pointing at the copy of Venu you last ran, and a sign-in start stays quiet in the tray instead of opening the settings window. `--startup` and `--minimized` also keep the launch quiet; an explicit `--settings` opens the window even when one of those flags is present. Only one Venu runs at a time.
 
 ### Build from Source
 
@@ -277,7 +279,7 @@ Venu is built as a native Windows desktop application with a focus on performanc
 - **Graphics**: Direct2D and DirectWrite through Windows bindings
 - **Backdrop**: GDI screen capture with DWM capture exclusion and Direct2D interpolation
 - **Media**: Windows System Media Transport Controls (SMTC / WinRT)
-- **Typography**: Plus Jakarta Sans and Noto Sans Devanagari
+- **Typography**: Geist and Geist Mono, with Noto Sans Devanagari and Windows font fallback for multilingual text
 
 ## For Developers
 

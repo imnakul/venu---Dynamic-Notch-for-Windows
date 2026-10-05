@@ -1,35 +1,21 @@
 //! DirectWrite plumbing for the notch.
 //!
-//! The interesting part is [`build_private_collection`]: the two typefaces
-//! shipped in the repo are registered as a private, in-memory font collection
-//! so the notch gets Plus Jakarta Sans without asking the user to install
+//! The fonts module registers the bundled typefaces as a private, in-memory
+//! collection so the notch gets Geist and Geist Mono without installing
 //! anything. System font fallback still applies on top of the private
 //! collection, so emoji, CJK and Devanagari in the marquee keep resolving.
 
 use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontCollection,
-    IDWriteInlineObject, IDWriteTextFormat, IDWriteTextLayout, IDWriteTextLayout1,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteInlineObject,
+    IDWriteTextFormat, IDWriteTextLayout, IDWriteTextLayout1, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_TEXT_RANGE,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 
-/// Typefaces bundled with the binary, exposed to DirectWrite as a private
-/// collection. Keep the family names in sync with the actual `name` table.
-const BUNDLED_FONTS: [(&[u8], &str); 2] = [
-    (
-        include_bytes!("../../PlusJakartaSans.ttf"),
-        "Plus Jakarta Sans",
-    ),
-    (
-        include_bytes!("../../NotoSansDevanagari.ttf"),
-        "Noto Sans Devanagari",
-    ),
-];
-
 /// Used whenever the configured family name is blank.
-const FALLBACK_FAMILY: &str = "Segoe UI";
+const FALLBACK_FAMILY: &str = crate::fonts::GEIST;
 
 pub struct TextEngine {
     pub factory: IDWriteFactory,
@@ -47,16 +33,20 @@ impl TextEngine {
     pub fn new() -> windows::core::Result<Self> {
         let factory: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
 
-        let (private_collection, private_families) = match build_private_collection(&factory) {
-            Some(collection) => (
-                Some(collection),
-                BUNDLED_FONTS.iter().map(|(_, n)| n.to_string()).collect(),
-            ),
-            None => {
-                eprintln!("[notch] private font collection unavailable, using system fonts");
-                (None, Vec::new())
-            }
-        };
+        let (private_collection, private_families) =
+            match crate::fonts::build_private_collection(&factory) {
+                Some(collection) => (
+                    Some(collection),
+                    crate::fonts::bundled_fonts()
+                        .iter()
+                        .map(|(_, name)| name.to_string())
+                        .collect(),
+                ),
+                None => {
+                    eprintln!("[notch] private font collection unavailable, using system fonts");
+                    (None, Vec::new())
+                }
+            };
 
         Ok(Self {
             factory,
@@ -86,14 +76,17 @@ impl TextEngine {
         size: f32,
         weight: DWRITE_FONT_WEIGHT,
     ) -> windows::core::Result<IDWriteTextFormat> {
-        let family = Self::resolve_family(family);
-        let family_hstr = HSTRING::from(family);
+        let mut family = Self::resolve_family(family);
         let locale = HSTRING::from("en-us");
 
         // Only hand DirectWrite the private collection when the requested
-        // family actually lives in it; otherwise the system collection is what
-        // resolves "Segoe UI" and friends.
-        let collection = if self.is_private(family) {
+        // family actually lives in it; otherwise use the system family list.
+        let has_private = self.is_private(family) && self.private_collection.is_some();
+        if crate::fonts::is_bundled_family(family) && !has_private {
+            family = crate::fonts::SYSTEM_FALLBACK;
+        }
+        let family_hstr = HSTRING::from(family);
+        let collection = if has_private {
             self.private_collection.clone()
         } else {
             None
@@ -182,34 +175,5 @@ impl TextEngine {
                 metrics.height,
             )
         }
-    }
-}
-
-/// Register the bundled TTFs with DirectWrite. Returns `None` on any platform
-/// or API failure; every caller treats that as "use system fonts".
-fn build_private_collection(factory: &IDWriteFactory) -> Option<IDWriteFontCollection> {
-    let factory5: IDWriteFactory5 = factory.cast().ok()?;
-
-    unsafe {
-        let loader = factory5.CreateInMemoryFontFileLoader().ok()?;
-        factory5.RegisterFontFileLoader(&loader).ok()?;
-
-        let builder = factory5.CreateFontSetBuilder().ok()?;
-
-        for (data, _) in BUNDLED_FONTS {
-            let file = loader
-                .CreateInMemoryFontFileReference(
-                    &factory5,
-                    data.as_ptr() as *const std::ffi::c_void,
-                    data.len() as u32,
-                    None,
-                )
-                .ok()?;
-            builder.AddFontFile(&file).ok()?;
-        }
-
-        let font_set = builder.CreateFontSet().ok()?;
-        let collection = factory5.CreateFontCollectionFromFontSet(&font_set).ok()?;
-        Some(collection.into())
     }
 }

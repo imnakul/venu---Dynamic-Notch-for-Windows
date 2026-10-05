@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title desc">
+  <title id="title">Venu whole-PC Stats visual mockup</title>
+  <desc id="desc">An illustrative, dark-theme mockup of the collapsed notch metrics and expanded whole-system overview. All displayed readings are sample values, not measured telemetry.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101116"/>
+      <stop offset="0.52" stop-color="#1a1b24"/>
+      <stop offset="1" stop-color="#111218"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="52%" cy="40%" r="65%">
+      <stop offset="0" stop-color="#34303a" stop-opacity=".72"/>
+      <stop offset="1" stop-color="#14151b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#202127" stop-opacity=".98"/>
+      <stop offset="1" stop-color="#111216" stop-opacity=".99"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e98b52"/>
+      <stop offset="1" stop-color="#ffb66d"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-30%" width="150%" height="180%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <style>
+      .ui { font-family: Geist, "Segoe UI", sans-serif; }
+      .mono { font-family: "Geist Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+      .quiet { fill: #93939f; }
+      .soft { fill: #b9bac3; }
+      .bright { fill: #f5f4f6; }
+      .line { stroke: #ffffff; stroke-opacity: .12; }
+      .micro { font-size: 11px; font-weight: 650; letter-spacing: 1.5px; }
+    </style>
+  </defs>
+  <rect width="1440" height="760" fill="url(#background)"/>
+  <rect width="1440" height="760" fill="url(#glow)"/>
+  <circle cx="1260" cy="116" r="175" fill="#db8153" opacity=".09" filter="url(#shadow)"/>
+  <circle cx="210" cy="645" r="220" fill="#7773a8" opacity=".075" filter="url(#shadow)"/>
+
+  <g class="ui">
+    <text x="88" y="90" fill="#f5f4f6" font-size="17" font-weight="700" letter-spacing=".8">VENU</text>
+    <text x="88" y="124" fill="#f5f4f6" font-size="31" font-weight="620">Whole-PC Stats</text>
+    <text x="88" y="151" class="quiet" font-size="14">A quiet system overview, composed for the notch.</text>
+    <rect x="1124" y="82" width="228" height="32" rx="16" fill="#ffffff" fill-opacity=".06" stroke="#ffffff" stroke-opacity=".13"/>
+    <circle cx="1144" cy="98" r="4" fill="#f1a06a"/>
+    <text x="1157" y="102" fill="#d5d4db" font-size="10" font-weight="650" letter-spacing="1.15">ILLUSTRATIVE MOCKUP</text>
+
+    <text x="112" y="229" class="quiet micro">COLLAPSED NOTCH</text>
+    <text x="112" y="251" class="quiet" font-size="12">Three readings stay legible at a glance.</text>
+  </g>
+
+  <rect x="100" y="274" width="444" height="124" rx="36" fill="#000000" opacity=".45" filter="url(#shadow)"/>
+  <rect x="108" y="264" width="428" height="104" rx="33" fill="url(#glass)" stroke="#ffffff" stroke-opacity=".13"/>
+  <path d="M141 265 H503" stroke="#ffffff" stroke-opacity=".055"/>
+  <g class="ui">
+    <text x="177" y="300" class="quiet micro" text-anchor="middle" font-size="9">CPU</text>
+    <text x="177" y="337" class="mono bright" text-anchor="middle" font-size="25" font-weight="560">24%</text>
+    <line x1="248" y1="292" x2="248" y2="344" class="line"/>
+    <text x="322" y="300" class="quiet micro" text-anchor="middle" font-size="9">RAM</text>
+    <text x="322" y="337" class="mono bright" text-anchor="middle" font-size="25" font-weight="560">58%</text>
+    <line x1="394" y1="292" x2="394" y2="344" class="line"/>
+    <text x="467" y="300" class="quiet micro" text-anchor="middle" font-size="9">GPU</text>
+    <text x="467" y="337" class="mono bright" text-anchor="middle" font-size="25" font-weight="560">12%</text>
+  </g>
+
+  <g class="ui">
+    <text x="640" y="229" class="quiet micro">EXPANDED OVERVIEW</text>
+    <text x="640" y="251" class="quiet" font-size="12">One surface, three aligned metrics, no dashboard clutter.</text>
+  </g>
+
+  <rect x="613" y="276" width="744" height="386" rx="34" fill="#000000" opacity=".5" filter="url(#shadow)"/>
+  <rect x="620" y="265" width="730" height="378" rx="30" fill="url(#glass)" stroke="#ffffff" stroke-opacity=".14"/>
+  <path d="M654 266 H1315" stroke="#ffffff" stroke-opacity=".055"/>
+  <g class="ui">
+    <text x="676" y="312" fill="#9a9ba5" font-size="10" font-weight="700" letter-spacing="1.8">YOUR PC</text>
+    <text x="676" y="340" class="bright" font-size="17" font-weight="620">Whole-system overview</text>
+    <circle cx="1250" cy="307" r="3.3" fill="url(#ember)"/>
+    <text x="1260" y="311" fill="#a8a8b2" font-size="9" font-weight="650" letter-spacing="1.1">LIVE · 1 SEC</text>
+
+    <text x="676" y="390" class="quiet micro">CPU</text>
+    <text x="676" y="444" class="mono bright" font-size="40" font-weight="520">24%</text>
+    <text x="676" y="469" class="soft" font-size="12">All processors</text>
+    <rect x="676" y="505" width="174" height="3" rx="1.5" fill="#ffffff" fill-opacity=".1"/>
+    <rect x="676" y="505" width="42" height="3" rx="1.5" fill="url(#ember)"/>
+
+    <line x1="895" y1="378" x2="895" y2="522" class="line"/>
+    <text x="928" y="390" class="quiet micro">RAM</text>
+    <text x="928" y="444" class="mono bright" font-size="40" font-weight="520">58%</text>
+    <text x="928" y="469" class="soft" font-size="12">Physical memory</text>
+    <rect x="928" y="505" width="174" height="3" rx="1.5" fill="#ffffff" fill-opacity=".1"/>
+    <rect x="928" y="505" width="101" height="3" rx="1.5" fill="url(#ember)"/>
+
+    <line x1="1147" y1="378" x2="1147" y2="522" class="line"/>
+    <text x="1180" y="390" class="quiet micro">GPU</text>
+    <text x="1180" y="444" class="mono bright" font-size="40" font-weight="520">12%</text>
+    <text x="1180" y="469" class="soft" font-size="12">Busiest physical engine</text>
+    <rect x="1180" y="505" width="132" height="3" rx="1.5" fill="#ffffff" fill-opacity=".1"/>
+    <rect x="1180" y="505" width="16" height="3" rx="1.5" fill="url(#ember)"/>
+
+    <line x1="676" y1="551" x2="1313" y2="551" class="line"/>
+    <text x="676" y="588" class="quiet" font-size="9" font-weight="700" letter-spacing="1.3">RAM</text>
+    <text x="716" y="588" class="mono soft" font-size="11">9.3 / 16.0 GB</text>
+    <text x="1016" y="588" class="quiet" font-size="9" font-weight="700" letter-spacing="1.3">POWER</text>
+    <text x="1072" y="588" class="mono soft" font-size="11">AC POWER</text>
+  </g>
+
+  <g class="ui">
+    <text x="88" y="710" fill="#a4a4ae" font-size="11" letter-spacing=".35">EXAMPLE VALUES ONLY · GPU IS THE BUSIEST PHYSICAL ENGINE AFTER COMBINING PER-PROCESS READINGS</text>
+    <text x="1352" y="710" fill="#777984" font-size="10" text-anchor="end">DESIGN PREVIEW</text>
+  </g>
+</svg>
