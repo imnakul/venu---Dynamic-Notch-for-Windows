@@ -10,7 +10,7 @@
 ;     it after the install
 
 #ifndef MyAppVersion
-#define MyAppVersion "0.4.2"
+#define MyAppVersion "0.4.3"
 #endif
 
 #define MyAppName "Venu"
