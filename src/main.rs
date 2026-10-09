@@ -7,6 +7,7 @@ mod gui;
 mod launch;
 mod notch;
 mod overlay;
+mod startup_log;
 mod stats;
 mod stats_math;
 mod tray;
@@ -132,6 +133,8 @@ fn reconcile_autostart(config: &RwLock<AppConfig>) {
 }
 
 fn main() {
+    startup_log::install_panic_hook();
+
     // Immediately detach console when launched from Windows Explorer
     unsafe {
         let _ = FreeConsole();
@@ -243,9 +246,11 @@ fn main() {
     };
 
     let gui_config = Arc::clone(&config);
-    let _ = eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "Venu",
         native_options,
         Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, gui_config, show_settings)))),
-    );
+    ) {
+        startup_log::record_eframe_error(&error);
+    }
 }

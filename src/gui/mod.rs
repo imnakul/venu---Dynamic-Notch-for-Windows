@@ -12,6 +12,7 @@ use crate::config::{
 
 mod color_picker;
 mod filedlg;
+mod font_setup;
 mod theme;
 mod wallpaper;
 
@@ -82,56 +83,7 @@ pub unsafe fn find_settings_hwnd() -> Option<windows::Win32::Foundation::HWND> {
 }
 
 pub fn setup_custom_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    fonts.font_data.insert(
-        "Geist".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../fonts/Geist.ttf")),
-    );
-    fonts.font_data.insert(
-        "GeistMono".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../fonts/GeistMono.ttf")),
-    );
-    fonts.font_data.insert(
-        "NotoSansDevanagari".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../NotoSansDevanagari.ttf")),
-    );
-    fonts.font_data.insert(
-        "PlusJakartaSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../PlusJakartaSans.ttf")),
-    );
-
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "Geist".to_owned());
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(1, "NotoSansDevanagari".to_owned());
-
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "GeistMono".to_owned());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(1, "NotoSansDevanagari".to_owned());
-
-    // Keep the prior bundled family available to configs that explicitly
-    // selected it. The defaults and migrated configurations use Geist.
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push("PlusJakartaSans".to_owned());
-
-    ctx.set_fonts(fonts);
+    font_setup::setup_custom_fonts(ctx);
 }
 
 /// The things this app actually is, from the user's point of view: the
