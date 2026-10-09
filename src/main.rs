@@ -132,6 +132,82 @@ fn reconcile_autostart(config: &RwLock<AppConfig>) {
     }
 }
 
+fn run_overlay_thread(overlay_config: Arc<RwLock<AppConfig>>) {
+    // WIC (used for notch wallpapers) needs an initialised apartment on
+    // whichever thread decodes the image.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+    }
+
+    let _tray = match SystemTray::new() {
+        Ok(tray) => Some(tray),
+        Err(_) => {
+            // A tray window is the normal Settings entry point. If Windows
+            // refuses to create it, show Settings so the failure is visible
+            // and the user can still reach the app controls.
+            tray::request_settings_window();
+            None
+        }
+    };
+    let mut manager = OverlayManager::new();
+    let mut notch = NotchManager::new(Arc::clone(&overlay_config));
+    let mut flash = FlashManager::new();
+    let mut last_instant = Instant::now();
+    let mut next_tick = last_instant;
+
+    loop {
+        // Process Win32 Message Queue for layered windows & System Tray
+        unsafe {
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut msg,
+                None,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+            )
+            .as_bool()
+            {
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
+        }
+
+        let now = Instant::now();
+        // Input wakes the message pump, not the renderer. Rendering on
+        // every wake lets mouse traffic (or our own window messages) run
+        // the animation faster than the intended frame rate.
+        if now < next_tick {
+            let wait = (next_tick - now).as_millis() as u32 + 1;
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
+            continue;
+        }
+        let dt = now.duration_since(last_instant).as_secs_f32();
+        last_instant = now;
+
+        // Each of these reports whether it still has something in flight.
+        // None of them do while Venu sits in the tray with the notch shut,
+        // which is the state it is in almost all of the time.
+        let mut animating = {
+            let cfg = overlay_config.read();
+            let overlays = manager.render_tick(&cfg, dt);
+            let flashing = flash.tick(&cfg, dt);
+            overlays || flashing
+        };
+
+        // Takes its own lock: inline editing writes back into the config.
+        animating |= notch.tick(dt);
+
+        let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
+        next_tick = now + Duration::from_millis(budget as u64);
+    }
+}
+
 fn main() {
     startup_log::install_panic_hook();
 
@@ -157,84 +233,43 @@ fn main() {
     // Settings > App > Preferences); reconcile before anything renders.
     reconcile_autostart(&config);
 
-    // Spawn Overlay Render, System Tray & Win32 Message Loop thread
+    // Install the wake channel before starting the tray thread so early tray
+    // or notch requests remain queued until the main thread is ready.
+    let settings_requests = tray::install_settings_request_channel();
+
+    // Spawn Overlay Render, System Tray & Win32 Message Loop thread.
     let overlay_config = Arc::clone(&config);
-    std::thread::spawn(move || {
-        // WIC (used for notch wallpapers) needs an initialised apartment on
-        // whichever thread decodes the image.
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-            );
-        }
-
-        let _tray = SystemTray::new().ok();
-        let mut manager = OverlayManager::new();
-        let mut notch = NotchManager::new(Arc::clone(&overlay_config));
-        let mut flash = FlashManager::new();
-        let mut last_instant = Instant::now();
-        let mut next_tick = last_instant;
-
-        loop {
-            // Process Win32 Message Queue for layered windows & System Tray
-            unsafe {
-                let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-                while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
-                    &mut msg,
-                    None,
-                    0,
-                    0,
-                    windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
-                )
-                .as_bool()
-                {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
-                }
+    let overlay_thread = std::thread::Builder::new()
+        .name("Venu overlay".to_owned())
+        .spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_overlay_thread(overlay_config)
+            }))
+            .is_err()
+            {
+                // The overlay thread's message loop is the tray's lifetime.
+                // If it exits unexpectedly, wake Settings rather than leave
+                // the main thread blocked with no visible way to recover.
+                tray::request_settings_window();
             }
+        });
+    let overlay_started = overlay_thread.is_ok();
 
-            let now = Instant::now();
-            // Input wakes the message pump, not the renderer. Rendering on
-            // every wake lets mouse traffic (or our own window messages) run
-            // the animation faster than the intended frame rate.
-            if now < next_tick {
-                let wait = (next_tick - now).as_millis() as u32 + 1;
-                unsafe {
-                    MsgWaitForMultipleObjectsEx(None, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-                }
-                continue;
-            }
-            let dt = now.duration_since(last_instant).as_secs_f32();
-            last_instant = now;
+    // Do not create eframe or a Settings window on a normal launch. eframe
+    // forces its native viewport visible after the first rendered frame even
+    // when NativeOptions requested a hidden window. The tray/notch wake channel
+    // creates the GUI only when someone asks to open Settings.
+    let show_settings = show_settings || !overlay_started || settings_requests.recv().is_ok();
+    if !show_settings {
+        return;
+    }
 
-            // Each of these reports whether it still has something in flight.
-            // None of them do while Venu sits in the tray with the notch shut,
-            // which is the state it is in almost all of the time.
-            let mut animating = {
-                let cfg = overlay_config.read();
-                let overlays = manager.render_tick(&cfg, dt);
-                let flashing = flash.tick(&cfg, dt);
-                overlays || flashing
-            };
-
-            // Takes its own lock: inline editing writes back into the config.
-            animating |= notch.tick(dt);
-
-            let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
-            next_tick = now + Duration::from_millis(budget as u64);
-        }
-    });
-
-    // Normal launches start in the tray. `--startup` is still supplied by the
-    // sign-in entry, and `--minimized` remains its quiet alias. `--settings`
-    // explicitly opens the window and takes precedence over either quiet flag.
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
         .with_inner_size([760.0, 600.0])
         .with_min_inner_size([620.0, 480.0])
-        .with_visible(show_settings)
-        .with_active(show_settings);
+        .with_visible(true)
+        .with_active(true);
 
     if let Some(icon) = create_app_icon_data() {
         viewport_builder = viewport_builder.with_icon(icon);
