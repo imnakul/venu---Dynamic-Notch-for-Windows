@@ -45,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{AppConfig, NotchAlign, NotchTheme, SlideKind};
-use crate::notch::anim::lerp;
+use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::backdrop;
 use crate::notch::geom::NotchShape;
 use crate::notch::hook;
@@ -218,6 +218,9 @@ fn slide_collapsed_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
             override_or(cfg.marquee.collapsed_width, base_w, 40.0),
             override_or(cfg.marquee.collapsed_height, base_h, 16.0),
         ),
+        // Three metrics need enough room to breathe even when the ordinary
+        // collapsed pill is configured for a clock or a short status line.
+        SlideKind::Stats => (base_w.max(260.0), base_h.max(30.0)),
         _ => (base_w, base_h),
     }
 }
@@ -242,6 +245,10 @@ fn slide_expanded_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
             override_or(cfg.marquee.panel_width, base_w, min_w),
             override_or(cfg.marquee.panel_height, base_h, min_h),
         ),
+        // Leave enough height for the overview heading, three values and the
+        // power/memory footer, while still allowing the width to follow the
+        // user's chosen notch size.
+        SlideKind::Stats => (base_w.max(min_w), base_h.max(164.0)),
         _ => (base_w, base_h),
     }
 }
@@ -804,8 +811,32 @@ impl NotchWindow {
     /// Snapshot of everything that would change what the next frame looks
     /// like. See [`FrameKey`].
     fn frame_key(&self, shape: NotchShape, cfg: &AppConfig) -> FrameKey {
-        let active_slide = cfg.notch.effective_slides().get(self.state.active).copied();
-        let stats_revision = if active_slide == Some(SlideKind::Stats) {
+        let slides = cfg.notch.effective_slides();
+        let position = self.state.carousel.value;
+        let expand = self.state.expand.value;
+        let collapsed_visible = 1.0 - smoothstep(0.02, 0.30, expand) > 0.004;
+        let expanded_alpha = smoothstep(0.42, 0.96, expand);
+        let expanded_visible = expanded_alpha > 0.004
+            && slides.iter().enumerate().any(|(index, slide)| {
+                *slide == SlideKind::Stats
+                    && (index as f32 - position).abs() <= 1.05
+                    && expanded_alpha
+                        * (1.0 - (index as f32 - position).abs())
+                            .clamp(0.0, 1.0)
+                            .powf(1.4)
+                        > 0.006
+            });
+        let collapsed_stats_visible = collapsed_visible
+            && slides.get(self.state.active) == Some(&SlideKind::Stats)
+            && crate::notch::notify::global_store()
+                .read()
+                .active_toast
+                .is_none();
+        let stats_visible = collapsed_stats_visible || expanded_visible;
+        if stats_visible {
+            crate::stats::request_sampling();
+        }
+        let stats_revision = if stats_visible {
             crate::stats::snapshot().revision
         } else {
             0

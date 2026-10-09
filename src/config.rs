@@ -29,7 +29,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "Segoe UI".to_string(),
+            family: "Geist".to_string(),
             size: 20.0,
             bold: true,
             italic: false,
@@ -605,7 +605,7 @@ impl Default for NotchConfig {
             accent: [1.0, 0.604, 0.235, 1.0],     // ember
             surface: [0.031, 0.031, 0.043, 0.97], // obsidian
             theme: NotchTheme::Dark,
-            font_family: "Plus Jakarta Sans".to_string(),
+            font_family: "Geist".to_string(),
             clock_24h: false,
             collapse_delay_ms: 220,
             scroll_to_switch: true,
@@ -637,6 +637,47 @@ impl NotchConfig {
     pub fn clamped_active(&self) -> usize {
         let len = self.effective_slides().len();
         self.active_slide.min(len.saturating_sub(1))
+    }
+
+    /// Add or remove only the Stats face, preserving the current face and the
+    /// user's order for every other slide.
+    pub fn set_stats_enabled(&mut self, enabled: bool) {
+        let previous_kind = self.effective_slides().get(self.clamped_active()).copied();
+        let previous_index = self.clamped_active();
+
+        if enabled {
+            if !self.slides.contains(&SlideKind::Stats) {
+                self.slides.push(SlideKind::Stats);
+            }
+        } else {
+            self.slides.retain(|slide| *slide != SlideKind::Stats);
+            if self.default_collapsed == CollapsedMode::Stats {
+                self.default_collapsed = CollapsedMode::LastActive;
+            }
+        }
+
+        self.active_slide = previous_kind
+            .filter(|kind| self.slides.contains(kind))
+            .and_then(|kind| self.slides.iter().position(|slide| *slide == kind))
+            .unwrap_or_else(|| {
+                if self.slides.is_empty() {
+                    0
+                } else {
+                    previous_index.min(self.slides.len() - 1)
+                }
+            });
+    }
+
+    /// Make Stats the resting face without disturbing the carousel position.
+    pub fn set_stats_default(&mut self, enabled: bool) {
+        if enabled {
+            if !self.slides.contains(&SlideKind::Stats) {
+                self.slides.push(SlideKind::Stats);
+            }
+            self.default_collapsed = CollapsedMode::Stats;
+        } else if self.default_collapsed == CollapsedMode::Stats {
+            self.default_collapsed = CollapsedMode::LastActive;
+        }
     }
 }
 
@@ -828,7 +869,7 @@ impl Default for FlashConfig {
             texts: vec!["⚡ Stay focused!".to_string()],
             images: Vec::new(),
             font: FontConfig {
-                family: "Segoe UI".to_string(),
+                family: "Geist".to_string(),
                 size: 96.0,
                 bold: true,
                 italic: false,
@@ -978,6 +1019,25 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Upgrade only the old bundled/default family names. Other user-selected
+    /// families stay intact, and the rest of the JSON config is untouched.
+    fn migrate_font_defaults(&mut self) -> bool {
+        let mut changed = false;
+        if is_legacy_default_font(&self.font.family, "Segoe UI") {
+            self.font.family = "Geist".to_string();
+            changed = true;
+        }
+        if is_legacy_default_font(&self.notch.font_family, "Plus Jakarta Sans") {
+            self.notch.font_family = "Geist".to_string();
+            changed = true;
+        }
+        if is_legacy_default_font(&self.flash.font.family, "Segoe UI") {
+            self.flash.font.family = "Geist".to_string();
+            changed = true;
+        }
+        changed
+    }
+
     pub fn config_path() -> PathBuf {
         if let Some(mut path) = dirs::config_dir() {
             path.push("venu");
@@ -993,7 +1053,10 @@ impl AppConfig {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
+                if let Ok(mut config) = serde_json::from_str::<AppConfig>(&content) {
+                    if config.migrate_font_defaults() {
+                        config.save();
+                    }
                     return config;
                 }
             }
@@ -1005,7 +1068,8 @@ impl AppConfig {
             legacy_path.push("config.json");
             if legacy_path.exists() {
                 if let Ok(content) = fs::read_to_string(&legacy_path) {
-                    if let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
+                    if let Ok(mut config) = serde_json::from_str::<AppConfig>(&content) {
+                        let _ = config.migrate_font_defaults();
                         config.save();
                         return config;
                     }
@@ -1023,5 +1087,82 @@ impl AppConfig {
         if let Ok(content) = serde_json::to_string_pretty(self) {
             let _ = fs::write(path, content);
         }
+    }
+}
+
+fn is_legacy_default_font(family: &str, previous_default: &str) -> bool {
+    let family = family.trim();
+    family.is_empty() || family.eq_ignore_ascii_case(previous_default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_font_defaults_use_geist() {
+        let config = AppConfig::default();
+        assert_eq!(config.font.family, "Geist");
+        assert_eq!(config.notch.font_family, "Geist");
+        assert_eq!(config.flash.font.family, "Geist");
+    }
+
+    #[test]
+    fn font_migration_changes_only_legacy_defaults_and_round_trips() {
+        let mut config = AppConfig::default();
+        config.font.family = "Segoe UI".to_string();
+        config.notch.font_family = "Plus Jakarta Sans".to_string();
+        config.flash.font.family = "  ".to_string();
+
+        assert!(config.migrate_font_defaults());
+        assert_eq!(config.font.family, "Geist");
+        assert_eq!(config.notch.font_family, "Geist");
+        assert_eq!(config.flash.font.family, "Geist");
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, config);
+        assert!(!config.clone().migrate_font_defaults());
+
+        config.flash.font.family = "Segoe UI".to_string();
+        assert!(config.migrate_font_defaults());
+        assert_eq!(config.flash.font.family, "Geist");
+
+        config.font.family = "Plus Jakarta Sans".to_string();
+        config.notch.font_family = "Segoe UI".to_string();
+        config.flash.font.family = "Arial".to_string();
+        assert!(!config.migrate_font_defaults());
+        assert_eq!(config.font.family, "Plus Jakarta Sans");
+        assert_eq!(config.notch.font_family, "Segoe UI");
+        assert_eq!(config.flash.font.family, "Arial");
+    }
+
+    #[test]
+    fn stats_controls_preserve_other_slides_and_the_current_face() {
+        let mut notch = NotchConfig::default();
+        notch.slides = vec![SlideKind::Clock, SlideKind::Media, SlideKind::Usage];
+        notch.active_slide = 1;
+        notch.set_stats_enabled(true);
+        assert_eq!(
+            notch.slides,
+            [
+                SlideKind::Clock,
+                SlideKind::Media,
+                SlideKind::Usage,
+                SlideKind::Stats
+            ]
+        );
+        assert_eq!(notch.clamped_active(), 1);
+
+        notch.set_stats_default(true);
+        assert_eq!(notch.default_collapsed, CollapsedMode::Stats);
+        assert_eq!(notch.clamped_active(), 1);
+        notch.set_stats_enabled(false);
+        assert_eq!(
+            notch.slides,
+            [SlideKind::Clock, SlideKind::Media, SlideKind::Usage]
+        );
+        assert_eq!(notch.default_collapsed, CollapsedMode::LastActive);
+        assert_eq!(notch.clamped_active(), 1);
     }
 }

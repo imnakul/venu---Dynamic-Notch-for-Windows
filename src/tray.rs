@@ -12,13 +12,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, GetCursorPos, GetWindowLongPtrW, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, GWLP_USERDATA,
-    HICON, ICONINFO, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
+    DestroyMenu, DestroyWindow, FindWindowW, GetCursorPos, GetWindowLongPtrW, PostMessageW,
+    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu,
+    GWLP_USERDATA, HICON, ICONINFO, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
 };
 
 const WM_TRAY_ICON: u32 = WM_USER + 101;
+const WM_VENU_OPEN_SETTINGS: u32 = WM_USER + 102;
 const ID_TRAY_SETTINGS: usize = 2001;
 const ID_TRAY_EXIT: usize = 2002;
 
@@ -167,6 +168,25 @@ pub fn restore_settings_window() {
     }
 }
 
+/// Ask the already-running Venu instance to open its Settings window. This is
+/// used when a second launch explicitly supplies `--settings`.
+pub fn request_existing_settings() {
+    unsafe {
+        let title = HSTRING::from("VenuTray");
+        // The primary process may still be creating its hidden tray window
+        // after acquiring the single-instance mutex.
+        for _ in 0..20 {
+            if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
+                if !hwnd.is_invalid() {
+                    let _ = PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 impl SystemTray {
     pub fn new() -> windows::core::Result<Self> {
         unsafe {
@@ -240,6 +260,10 @@ impl SystemTray {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_VENU_OPEN_SETTINGS => {
+                restore_settings_window();
+                LRESULT(0)
+            }
             WM_TRAY_ICON => {
                 let msg_type = lparam.0 as u32;
                 if msg_type == WM_LBUTTONDBLCLK || msg_type == WM_LBUTTONUP {

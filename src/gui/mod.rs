@@ -85,6 +85,18 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     fonts.font_data.insert(
+        "Geist".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../fonts/Geist.ttf")),
+    );
+    fonts.font_data.insert(
+        "GeistMono".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../fonts/GeistMono.ttf")),
+    );
+    fonts.font_data.insert(
+        "NotoSansDevanagari".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../NotoSansDevanagari.ttf")),
+    );
+    fonts.font_data.insert(
         "PlusJakartaSans".to_owned(),
         egui::FontData::from_static(include_bytes!("../../PlusJakartaSans.ttf")),
     );
@@ -93,13 +105,31 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "PlusJakartaSans".to_owned());
+        .insert(0, "Geist".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(1, "NotoSansDevanagari".to_owned());
 
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "PlusJakartaSans".to_owned());
+        .insert(0, "GeistMono".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(1, "NotoSansDevanagari".to_owned());
+
+    // Keep the prior bundled family available to configs that explicitly
+    // selected it. The defaults and migrated configurations use Geist.
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("PlusJakartaSans".to_owned());
 
     ctx.set_fonts(fonts);
 }
@@ -169,6 +199,12 @@ const PAGES: &[Page] = &[
         title: "Slides",
         blurb: "Which faces the notch carries, and the order the wheel walks through them.",
         draw: SettingsApp::page_notch_slides,
+    },
+    Page {
+        group: Group::Notch,
+        title: "Stats",
+        blurb: "Whole-PC activity for the notch and the rest of your system.",
+        draw: SettingsApp::page_app_stats,
     },
     Page {
         group: Group::Notch,
@@ -243,12 +279,6 @@ const PAGES: &[Page] = &[
                 middle of the screen — then leaves on its own. Nothing to dismiss, nothing to \
                 forget.",
         draw: SettingsApp::page_flashscreen,
-    },
-    Page {
-        group: Group::App,
-        title: "Stats",
-        blurb: "Live system health at a glance: processor, memory, GPU activity and power state.",
-        draw: SettingsApp::page_app_stats,
     },
     Page {
         group: Group::App,
@@ -605,127 +635,181 @@ impl SettingsApp {
         Self::sec_flash_behavior(ui, cx.cfg, cx.changed);
     }
 
-    fn page_app_stats(ui: &mut egui::Ui, _cx: &mut PageCtx<'_>) {
+    fn page_app_stats(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
 
         let stats = crate::stats::snapshot();
-        Self::section_title(ui, "SYSTEM HEALTH");
+        let metrics = [
+            ("CPU", stats.cpu_pct, "All processors"),
+            ("RAM", stats.ram_pct, "Physical memory"),
+            ("GPU", stats.gpu_pct, "Busiest engine across the PC"),
+        ];
 
-        let cpu = stats
-            .cpu_pct
-            .map(|v| format!("{v:.0}%"))
-            .unwrap_or_else(|| "—".to_string());
-        let ram = stats
-            .ram_pct
-            .map(|v| format!("{v:.0}%"))
-            .unwrap_or_else(|| "—".to_string());
-        let gpu = stats
-            .gpu_pct
-            .map(|v| format!("{v:.0}%"))
-            .unwrap_or_else(|| "—".to_string());
-        let power = match (stats.battery_pct, stats.ac_online) {
-            (Some(pct), _) if stats.charging => format!("{pct}%"),
-            (Some(pct), _) => format!("{pct}%"),
-            (None, Some(true)) => "AC".to_string(),
-            (None, Some(false)) => "BAT".to_string(),
-            _ => "—".to_string(),
-        };
-
-        let power_hint = match (stats.battery_pct, stats.ac_online, stats.charging) {
-            (Some(_), _, true) => "Charging",
-            (Some(_), Some(true), false) => "Plugged in",
-            (Some(_), Some(false), false) => "On battery",
-            (None, Some(true), _) => "AC power",
-            (None, Some(false), _) => "Battery power",
-            _ => "Unavailable",
-        };
-
-        let ram_hint = if stats.ram_total > 0 {
-            format!(
-                "{} used of {}",
-                crate::stats::format_bytes(stats.ram_used),
-                crate::stats::format_bytes(stats.ram_total)
-            )
-        } else {
-            "Physical memory".to_string()
-        };
-
-        ui.columns(4, |cols| {
-            let cards = [
-                ("CPU", cpu.as_str(), "Processor"),
-                ("RAM", ram.as_str(), ram_hint.as_str()),
-                ("GPU", gpu.as_str(), "Busiest engine"),
-                ("POWER", power.as_str(), power_hint),
-            ];
-
-            for (ui, (label, value, hint)) in cols.iter_mut().zip(cards) {
-                Frame::none()
-                    .fill(theme::surface())
-                    .stroke(Stroke::new(1.0, theme::divider()))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(Margin::same(14.0))
-                    .show(ui, |ui| {
-                        ui.set_min_height(86.0);
+        Frame::none()
+            .fill(theme::surface())
+            .stroke(Stroke::new(1.0_f32, theme::divider()))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(20.0))
+            .show(ui, |ui| {
+                ui.set_min_height(206.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
                         ui.label(
+                            RichText::new("YOUR PC")
+                                .size(10.0)
+                                .strong()
+                                .color(theme::text_tertiary()),
+                        );
+                        ui.label(
+                            RichText::new("Whole-system overview")
+                                .size(15.0)
+                                .strong()
+                                .color(theme::text_primary()),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("UPDATES EVERY SECOND")
+                                .size(9.0)
+                                .strong()
+                                .color(theme::text_tertiary()),
+                        );
+                        ui.add_space(7.0);
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 3.5, theme::accent());
+                    });
+                });
+
+                ui.add_space(16.0);
+                let column_rects = ui.columns(3, |columns| {
+                    for (column, (label, value, hint)) in columns.iter_mut().zip(metrics) {
+                        column.label(
                             RichText::new(label)
                                 .size(10.0)
                                 .strong()
                                 .color(theme::text_tertiary()),
                         );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(value)
-                                .size(25.0)
+                        let sample = value;
+                        let rendered_value = sample
+                            .map(|pct| format!("{pct:.0}%"))
+                            .unwrap_or_else(|| "—".to_string());
+                        column.label(
+                            RichText::new(rendered_value)
+                                .font(egui::FontId::new(29.0, egui::FontFamily::Monospace))
                                 .strong()
                                 .color(theme::text_primary()),
                         );
-                        ui.add_space(3.0);
-                        ui.label(
+                        column.add_space(2.0);
+                        column.label(
                             RichText::new(hint)
                                 .size(10.5)
                                 .color(theme::text_secondary()),
                         );
-                    });
-            }
-        });
-
-        ui.add_space(18.0);
-        Self::section_title(ui, "LIVE MONITOR");
-
-        let rows = [
-            ("CPU utilization", stats.cpu_pct, "Total processor load"),
-            ("Memory pressure", stats.ram_pct, "Physical RAM in use"),
-            ("GPU activity", stats.gpu_pct, "Highest active GPU engine"),
-        ];
-
-        for (label, value, hint) in rows {
-            Self::row_stacked(ui, label, Some(hint), |ui| {
-                let pct = value.unwrap_or(0.0).clamp(0.0, 100.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::ProgressBar::new(pct / 100.0)
-                            .desired_width(190.0)
-                            .show_percentage(),
-                    );
-                    if value.is_none() {
-                        ui.label(
-                            RichText::new("Unavailable")
-                                .size(10.5)
-                                .color(theme::text_tertiary()),
-                        );
+                        if let Some(pct) = sample {
+                            column.add_space(8.0);
+                            column.add(
+                                egui::ProgressBar::new(pct / 100.0)
+                                    .desired_width(column.available_width()),
+                            );
+                        } else {
+                            column.add_space(11.0);
+                            column.label(
+                                RichText::new("Waiting for sample")
+                                    .size(9.5)
+                                    .color(theme::text_tertiary()),
+                            );
+                        }
                     }
+                    columns
+                        .iter()
+                        .map(|column| column.max_rect())
+                        .collect::<Vec<_>>()
+                });
+                for index in 0..column_rects.len().saturating_sub(1) {
+                    let left = column_rects[index];
+                    let right = column_rects[index + 1];
+                    let x = (left.right() + right.left()) * 0.5;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(x, left.top() + 4.0),
+                            egui::pos2(x, left.bottom() - 4.0),
+                        ],
+                        Stroke::new(1.0_f32, theme::divider()),
+                    );
+                }
+
+                ui.add_space(13.0);
+                ui.separator();
+                ui.add_space(5.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("MEMORY")
+                            .size(9.0)
+                            .strong()
+                            .color(theme::text_tertiary()),
+                    );
+                    let memory = if stats.ram_total > 0 {
+                        format!(
+                            "{} of {}",
+                            crate::stats::format_bytes(stats.ram_used),
+                            crate::stats::format_bytes(stats.ram_total)
+                        )
+                    } else {
+                        "—".to_string()
+                    };
+                    ui.label(
+                        RichText::new(memory)
+                            .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                            .color(theme::text_primary()),
+                    );
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new("POWER")
+                            .size(9.0)
+                            .strong()
+                            .color(theme::text_tertiary()),
+                    );
+                    ui.label(
+                        RichText::new(stats.power_value())
+                            .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                            .color(theme::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(format!("· {}", stats.power_hint()))
+                            .size(10.0)
+                            .color(theme::text_secondary()),
+                    );
                 });
             });
-        }
 
-        ui.add_space(4.0);
+        ui.add_space(20.0);
+        Self::section_title(ui, "SHOW IN THE NOTCH");
+        let mut include_stats = cx.cfg.notch.slides.contains(&SlideKind::Stats);
+        if ui
+            .checkbox(&mut include_stats, "Include Stats in the notch carousel")
+            .changed()
+        {
+            cx.cfg.notch.set_stats_enabled(include_stats);
+            *cx.changed = true;
+        }
+        let mut default_stats =
+            cx.cfg.notch.default_collapsed == crate::config::CollapsedMode::Stats;
+        if ui
+            .checkbox(&mut default_stats, "Rest on Stats when the notch closes")
+            .changed()
+        {
+            cx.cfg.notch.set_stats_default(default_stats);
+            *cx.changed = true;
+        }
         ui.label(
             RichText::new(
-                "Updated about once per second. GPU uses Windows performance counters and may be unavailable on some drivers or remote sessions.",
+                "CPU and memory cover the entire PC. GPU is the busiest physical engine after combining its process readings.",
             )
             .size(10.5)
-            .color(theme::text_tertiary()),
+            .color(theme::text_secondary()),
         );
     }
 
@@ -1242,6 +1326,8 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Font Family", |ui| {
             let fonts = [
+                "Geist",
+                "Geist Mono",
                 "Segoe UI",
                 "Plus Jakarta Sans",
                 "Arial",
@@ -1613,6 +1699,8 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Font Family", |ui| {
             let fonts = [
+                "Geist",
+                "Geist Mono",
                 "Segoe UI",
                 "Plus Jakarta Sans",
                 "Arial",
@@ -2321,7 +2409,11 @@ impl SettingsApp {
             *changed = true;
         }
         if let Some(i) = remove {
-            cfg.notch.slides.remove(i);
+            if cfg.notch.slides.get(i) == Some(&SlideKind::Stats) {
+                cfg.notch.set_stats_enabled(false);
+            } else {
+                cfg.notch.slides.remove(i);
+            }
             *changed = true;
         }
 
@@ -2509,6 +2601,8 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Font", |ui| {
             let fonts = [
+                "Geist",
+                "Geist Mono",
                 "Plus Jakarta Sans",
                 "Segoe UI",
                 "Consolas",
@@ -2931,6 +3025,7 @@ impl eframe::App for SettingsApp {
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            self.on_screen = false;
                         }
 
                         ui.add_space(6.0);
@@ -3073,6 +3168,9 @@ impl eframe::App for SettingsApp {
         // the whole settings UI rebuilding, laying out and tessellating twenty
         // times a second for the entire time Venu was running, hidden or not.
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if self.on_screen && !minimized && PAGES[self.active].title == "Stats" {
+            crate::stats::request_sampling();
+        }
         if self.on_screen && !minimized {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         } else if SETTINGS_HWND.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -3326,7 +3424,7 @@ fn paint_sidebar_hugeicon(
                 painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
             }
         }
-        (Group::App, "Stats") => {
+        (Group::Notch, "Stats") => {
             // Hugeicons: Analytics bars
             painter.line_segment(
                 [

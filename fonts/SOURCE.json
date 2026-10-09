@@ -1,0 +1,34 @@
+[
+  {
+    "file": "Geist.ttf",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/geist/Geist%5Bwght%5D.ttf",
+    "bytes": 169056,
+    "sha256": "73894e0448cae90a92b6c2f8732b7bb9acb7b94c418bff559dad4a18e1de9659",
+    "source_bytes": 169056,
+    "source_sha256": "73894e0448cae90a92b6c2f8732b7bb9acb7b94c418bff559dad4a18e1de9659"
+  },
+  {
+    "file": "GeistMono.ttf",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/geistmono/GeistMono%5Bwght%5D.ttf",
+    "bytes": 171948,
+    "sha256": "d00e590b8eb3a59acc329b2d044fd143ae935090b7da33199ebee27cc7de8196",
+    "source_bytes": 171948,
+    "source_sha256": "d00e590b8eb3a59acc329b2d044fd143ae935090b7da33199ebee27cc7de8196"
+  },
+  {
+    "file": "Geist-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/geist/OFL.txt",
+    "bytes": 4386,
+    "sha256": "fb64c1011862d97fe49c633ad9180ffd80a61aab6ff220a2935704e8a0c3a7c4",
+    "source_bytes": 4387,
+    "source_sha256": "1781d2806a07d91c4edf4740b88449fab7d0eadad53f7c351b94cd4d4eb8c00f"
+  },
+  {
+    "file": "GeistMono-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/geistmono/OFL.txt",
+    "bytes": 4386,
+    "sha256": "fb64c1011862d97fe49c633ad9180ffd80a61aab6ff220a2935704e8a0c3a7c4",
+    "source_bytes": 4387,
+    "source_sha256": "1781d2806a07d91c4edf4740b88449fab7d0eadad53f7c351b94cd4d4eb8c00f"
+  }
+]

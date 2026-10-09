@@ -28,10 +28,11 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+    IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_METRICS,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
@@ -204,6 +205,7 @@ fn scale_xy(sx: f32, sy: f32) -> Matrix3x2 {
 pub struct FlashRenderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
+    font_collection: Option<IDWriteFontCollection>,
     wic: Option<IWICImagingFactory>,
     dc_target: Option<ID2D1DCRenderTarget>,
     mem_dc: HDC,
@@ -233,12 +235,17 @@ impl FlashRenderer {
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let font_collection = crate::fonts::build_private_collection(&dwrite_factory);
+        if font_collection.is_none() {
+            eprintln!("[flash] bundled fonts unavailable, using system fonts");
+        }
         let wic: Option<IWICImagingFactory> =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok() };
 
         Ok(Self {
             d2d_factory,
             dwrite_factory,
+            font_collection,
             wic,
             dc_target: None,
             mem_dc: HDC::default(),
@@ -562,12 +569,21 @@ impl FlashRenderer {
                 DWRITE_FONT_STYLE_NORMAL
             };
 
-            let family_hstr = HSTRING::from(&cfg.font.family);
+            let family = crate::fonts::family_for_collection(
+                &cfg.font.family,
+                self.font_collection.is_some(),
+            );
+            let family_hstr = HSTRING::from(family);
+            let collection = if crate::fonts::is_bundled_family(&cfg.font.family) {
+                self.font_collection.as_ref()
+            } else {
+                None
+            };
             let text_format: IDWriteTextFormat = self
                 .dwrite_factory
                 .CreateTextFormat(
                     PCWSTR(family_hstr.as_ptr()),
-                    None,
+                    collection,
                     weight,
                     style,
                     DWRITE_FONT_STRETCH_NORMAL,

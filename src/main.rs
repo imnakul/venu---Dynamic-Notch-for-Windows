@@ -1,10 +1,14 @@
 mod autostart;
 mod config;
 mod flash;
+mod font_families;
+mod fonts;
 mod gui;
+mod launch;
 mod notch;
 mod overlay;
 mod stats;
+mod stats_math;
 mod tray;
 
 use parking_lot::RwLock;
@@ -34,6 +38,7 @@ const IDLE_POLL_MS: u32 = 32;
 use config::AppConfig;
 use flash::FlashManager;
 use gui::SettingsApp;
+use launch::settings_visible_from_args;
 use notch::NotchManager;
 use overlay::OverlayManager;
 use tray::SystemTray;
@@ -132,8 +137,14 @@ fn main() {
         let _ = FreeConsole();
     }
 
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let show_settings = settings_visible_from_args(args.iter());
+
     // A second copy would draw a second notch in the same place.
     if !acquire_single_instance() {
+        if show_settings {
+            tray::request_existing_settings();
+        }
         return;
     }
 
@@ -212,20 +223,15 @@ fn main() {
         }
     });
 
-    // `--startup` is what the sign-in entry appends: at boot Venu should come
-    // up in the tray, not open the settings window over the desktop. The tray
-    // menu restores the window through the same path as "Open Settings".
-    // `--minimized` is an alias for launching it by hand the same way.
-    let quiet = std::env::args()
-        .skip(1)
-        .any(|a| a == "--startup" || a == "--minimized");
-
+    // Normal launches start in the tray. `--startup` is still supplied by the
+    // sign-in entry, and `--minimized` remains its quiet alias. `--settings`
+    // explicitly opens the window and takes precedence over either quiet flag.
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
         .with_inner_size([760.0, 600.0])
         .with_min_inner_size([620.0, 480.0])
-        .with_visible(!quiet)
-        .with_active(!quiet);
+        .with_visible(show_settings)
+        .with_active(show_settings);
 
     if let Some(icon) = create_app_icon_data() {
         viewport_builder = viewport_builder.with_icon(icon);
@@ -240,6 +246,6 @@ fn main() {
     let _ = eframe::run_native(
         "Venu",
         native_options,
-        Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, gui_config, !quiet)))),
+        Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, gui_config, show_settings)))),
     );
 }
