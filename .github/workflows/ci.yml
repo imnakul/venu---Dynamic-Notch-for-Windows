@@ -23,7 +23,7 @@ jobs:
         run: cargo build --locked
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --features startup-smoke-renderer
 
       - name: Collect startup smoke diagnostics
         if: failure()

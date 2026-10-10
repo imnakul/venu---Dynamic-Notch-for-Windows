@@ -303,10 +303,20 @@ fn main() {
         viewport_builder = viewport_builder.with_icon(icon);
     }
 
-    let native_options = eframe::NativeOptions {
+    let mut native_options = eframe::NativeOptions {
         viewport: viewport_builder,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+
+    // GitHub's hosted Windows runner exposes only the legacy OpenGL 1.1
+    // implementation. The smoke-test-only feature supplies WGPU so the test
+    // can create and inspect a real Settings HWND without changing the
+    // renderer used by ordinary builds.
+    #[cfg(feature = "startup-smoke-renderer")]
+    if std::env::var_os("VENU_STARTUP_SMOKE").is_some() {
+        native_options.renderer = eframe::Renderer::Wgpu;
+    }
 
     let gui_config = Arc::clone(&config);
     if let Err(error) = eframe::run_native(

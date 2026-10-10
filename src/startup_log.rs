@@ -23,7 +23,7 @@ pub fn record_eframe_error(error: &eframe::Error) {
         eframe::Error::WinitEventLoop(_) => "event_loop",
         _ => "graphics_or_runtime",
     };
-    if std::env::var_os("VENU_STARTUP_DIAGNOSTICS").is_some() {
+    if cfg!(debug_assertions) && std::env::var_os("VENU_STARTUP_SMOKE").is_some() {
         let detail = sanitize_diagnostic(&error.to_string());
         write_record(&format!("eframe_error kind={kind} detail={detail}"));
     } else {
