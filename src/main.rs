@@ -133,6 +133,7 @@ fn reconcile_autostart(config: &RwLock<AppConfig>) {
 }
 
 fn run_overlay_thread(overlay_config: Arc<RwLock<AppConfig>>) {
+    startup_log::record_event("overlay_thread_started");
     // WIC (used for notch wallpapers) needs an initialised apartment on
     // whichever thread decodes the image.
     unsafe {
@@ -218,12 +219,14 @@ fn main() {
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let show_settings = settings_visible_from_args(args.iter());
+    startup_log::record_event("process_starting");
 
     // A second copy would draw a second notch in the same place.
     if !acquire_single_instance() {
         if show_settings {
             tray::request_existing_settings();
         }
+        startup_log::record_event("secondary_instance_exiting");
         return;
     }
 
@@ -247,6 +250,7 @@ fn main() {
             }))
             .is_err()
             {
+                startup_log::record_event("overlay_thread_panicked");
                 // The overlay thread's message loop is the tray's lifetime.
                 // If it exits unexpectedly, wake Settings rather than leave
                 // the main thread blocked with no visible way to recover.
@@ -254,13 +258,36 @@ fn main() {
             }
         });
     let overlay_started = overlay_thread.is_ok();
+    startup_log::record_event(if overlay_started {
+        "overlay_thread_spawned"
+    } else {
+        "overlay_thread_spawn_failed"
+    });
 
     // Do not create eframe or a Settings window on a normal launch. eframe
     // forces its native viewport visible after the first rendered frame even
     // when NativeOptions requested a hidden window. The tray/notch wake channel
     // creates the GUI only when someone asks to open Settings.
-    let show_settings = show_settings || !overlay_started || settings_requests.recv().is_ok();
+    let show_settings = if show_settings {
+        startup_log::record_event("settings_requested_by_launch_argument");
+        true
+    } else if !overlay_started {
+        startup_log::record_event("settings_opening_after_overlay_spawn_failure");
+        true
+    } else {
+        match settings_requests.recv() {
+            Ok(()) => {
+                startup_log::record_event("settings_request_received_by_main_thread");
+                true
+            }
+            Err(_) => {
+                startup_log::record_event("settings_request_channel_closed");
+                false
+            }
+        }
+    };
     if !show_settings {
+        startup_log::record_event("process_exiting_without_settings");
         return;
     }
     startup_log::record_event("settings_gui_starting");
@@ -289,4 +316,5 @@ fn main() {
     ) {
         startup_log::record_eframe_error(&error);
     }
+    startup_log::record_event("settings_gui_event_loop_returned");
 }

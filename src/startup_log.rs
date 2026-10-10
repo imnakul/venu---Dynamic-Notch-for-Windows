@@ -23,7 +23,12 @@ pub fn record_eframe_error(error: &eframe::Error) {
         eframe::Error::WinitEventLoop(_) => "event_loop",
         _ => "graphics_or_runtime",
     };
-    write_record(&format!("eframe_error kind={kind}"));
+    if std::env::var_os("VENU_STARTUP_DIAGNOSTICS").is_some() {
+        let detail = sanitize_diagnostic(&error.to_string());
+        write_record(&format!("eframe_error kind={kind} detail={detail}"));
+    } else {
+        write_record(&format!("eframe_error kind={kind}"));
+    }
 }
 
 /// Record a fixed lifecycle marker without including user data or arbitrary
@@ -56,7 +61,7 @@ fn record_panic(info: &PanicHookInfo<'_>) {
 }
 
 fn write_record(event: &str) {
-    let Some(local_data) = dirs::data_local_dir() else {
+    let Some(local_data) = local_data_directory() else {
         return;
     };
     let path = local_data.join("Venu").join("startup.log");
@@ -92,4 +97,26 @@ fn write_record(event: &str) {
     } else if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(record.as_bytes());
     }
+}
+
+/// Honor the standard override first so tests and portable deployments can
+/// isolate application data. `dirs::data_local_dir()` queries the Windows
+/// known-folder API directly and ignores a process-local LOCALAPPDATA value.
+fn local_data_directory() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::data_local_dir)
+}
+
+/// Keep test-only error detail on one bounded line. Production startup logs
+/// only use fixed event names and do not record arbitrary runtime messages.
+fn sanitize_diagnostic(detail: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    detail
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_CHARS)
+        .collect::<String>()
+        .replace('"', "'")
 }
