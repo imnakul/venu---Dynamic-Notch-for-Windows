@@ -63,6 +63,11 @@ pub fn request_settings_window() {
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(ctx) = crate::gui::get_egui_context() {
         crate::startup_log::record_event("settings_request_egui_repaint_requested");
+        if crate::gui::wake_settings_window() {
+            crate::startup_log::record_event("settings_request_native_restore_posted");
+        } else {
+            crate::startup_log::record_event("settings_request_native_target_missing");
+        }
         ctx.request_repaint();
     } else if let Some(sender) = SETTINGS_REQUEST_SENDER.get() {
         crate::startup_log::record_event("settings_request_channel_send_attempted");
