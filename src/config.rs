@@ -1039,7 +1039,7 @@ impl AppConfig {
     }
 
     pub fn config_path() -> PathBuf {
-        if let Some(mut path) = dirs::config_dir() {
+        if let Some(mut path) = app_config_directory() {
             path.push("venu");
             let _ = fs::create_dir_all(&path);
             path.push("config.json");
@@ -1063,7 +1063,7 @@ impl AppConfig {
         }
 
         // Backward compatibility fallback: check legacy movingtext path if venu doesn't exist yet
-        if let Some(mut legacy_path) = dirs::config_dir() {
+        if let Some(mut legacy_path) = app_config_directory() {
             legacy_path.push("movingtext");
             legacy_path.push("config.json");
             if legacy_path.exists() {
@@ -1095,9 +1095,41 @@ fn is_legacy_default_font(family: &str, previous_default: &str) -> bool {
     family.is_empty() || family.eq_ignore_ascii_case(previous_default)
 }
 
+fn app_config_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let appdata_override = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let appdata_override = None;
+
+    app_config_directory_from(appdata_override, dirs::config_dir())
+}
+
+fn app_config_directory_from(
+    appdata_override: Option<PathBuf>,
+    known_folder: Option<PathBuf>,
+) -> Option<PathBuf> {
+    appdata_override
+        .filter(|path| !path.as_os_str().is_empty())
+        .or(known_folder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appdata_override_is_used_before_the_known_folder() {
+        let override_path = PathBuf::from("C:/test/AppData/Roaming");
+        let known_folder = PathBuf::from("C:/user/AppData/Roaming");
+        assert_eq!(
+            app_config_directory_from(Some(override_path.clone()), Some(known_folder.clone())),
+            Some(override_path)
+        );
+        assert_eq!(
+            app_config_directory_from(Some(PathBuf::new()), Some(known_folder.clone())),
+            Some(known_folder)
+        );
+    }
 
     #[test]
     fn new_font_defaults_use_geist() {

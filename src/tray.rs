@@ -1,4 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::OnceLock;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -39,12 +41,39 @@ fn debug_log(msg: &str) {
     }
 }
 
-/// Set by the tray thread when the settings window should be shown again;
-/// polled by `SettingsApp::update` (which keeps repainting every ~50ms even
-/// while hidden) so the restore goes through eframe's own viewport command
-/// channel instead of poking the native HWND out-of-band, which desyncs
-/// winit's visibility/focus state and breaks later Hide/Close.
+/// Set by the tray thread when an existing Settings window should be shown.
+/// `SettingsApp::update` consumes this and uses eframe viewport commands so
+/// winit's visibility and focus state stay in sync.
 pub static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SETTINGS_REQUEST_SENDER: OnceLock<SyncSender<()>> = OnceLock::new();
+
+/// Install the main thread's wake channel before the tray thread starts. A
+/// one-slot channel coalesces repeated clicks while the Settings window is
+/// still being constructed.
+pub fn install_settings_request_channel() -> Receiver<()> {
+    let (sender, receiver) = sync_channel(1);
+    let _ = SETTINGS_REQUEST_SENDER.set(sender);
+    receiver
+}
+
+/// Request Settings to open. Before eframe exists this wakes the main thread;
+/// afterward it asks the existing eframe window to restore itself.
+pub fn request_settings_window() {
+    crate::startup_log::record_event("settings_request_queued");
+    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+    if let Some(ctx) = crate::gui::get_egui_context() {
+        crate::startup_log::record_event("settings_request_egui_repaint_requested");
+        if crate::gui::wake_settings_window() {
+            crate::startup_log::record_event("settings_request_native_restore_posted");
+        } else {
+            crate::startup_log::record_event("settings_request_native_target_missing");
+        }
+        ctx.request_repaint();
+    } else if let Some(sender) = SETTINGS_REQUEST_SENDER.get() {
+        crate::startup_log::record_event("settings_request_channel_send_attempted");
+        let _ = sender.try_send(());
+    }
+}
 
 pub struct SystemTray {
     hwnd: HWND,
@@ -145,27 +174,7 @@ fn create_app_icon() -> windows::core::Result<HICON> {
 }
 
 pub fn restore_settings_window() {
-    SHOW_REQUESTED.store(true, Ordering::SeqCst);
-
-    if let Some(ctx) = crate::gui::get_egui_context() {
-        ctx.request_repaint();
-    }
-
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            AllowSetForegroundWindow, BringWindowToTop, SetForegroundWindow, ShowWindow,
-            SW_RESTORE, SW_SHOW,
-        };
-
-        let _ = AllowSetForegroundWindow(std::process::id());
-
-        if let Some(hwnd) = crate::gui::find_settings_hwnd() {
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = BringWindowToTop(hwnd);
-            let _ = SetForegroundWindow(hwnd);
-        }
-    }
+    request_settings_window();
 }
 
 /// Ask the already-running Venu instance to open its Settings window. This is
@@ -178,12 +187,17 @@ pub fn request_existing_settings() {
         for _ in 0..20 {
             if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
                 if !hwnd.is_invalid() {
-                    let _ = PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                    if PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok() {
+                        crate::startup_log::record_event("settings_request_posted_to_primary");
+                    } else {
+                        crate::startup_log::record_event("settings_request_post_failed");
+                    }
                     return;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        crate::startup_log::record_event("settings_request_target_missing");
     }
 }
 
@@ -215,6 +229,7 @@ impl SystemTray {
                 instance,
                 None,
             )?;
+            crate::startup_log::record_event("tray_owner_window_created");
 
             let hicon = create_app_icon()?;
 
@@ -261,6 +276,7 @@ impl SystemTray {
     ) -> LRESULT {
         match msg {
             WM_VENU_OPEN_SETTINGS => {
+                crate::startup_log::record_event("settings_request_message_received");
                 restore_settings_window();
                 LRESULT(0)
             }
@@ -334,5 +350,19 @@ impl Drop for SystemTray {
                 let _ = DestroyWindow(self.hwnd);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{install_settings_request_channel, request_settings_window};
+
+    #[test]
+    fn request_before_gui_startup_is_buffered_for_main_thread() {
+        let requests = install_settings_request_channel();
+        request_settings_window();
+
+        assert_eq!(requests.try_recv(), Ok(()));
+        assert!(requests.try_recv().is_err());
     }
 }

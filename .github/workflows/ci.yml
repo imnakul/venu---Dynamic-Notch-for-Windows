@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   build:
@@ -22,8 +21,42 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Prepare Mesa software OpenGL for the native window smoke test
+        shell: pwsh
+        run: |
+          $version = '26.2.4'
+          $archive = Join-Path $env:RUNNER_TEMP "mesa3d-$version-release-msvc.7z"
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$version/mesa3d-$version-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualHash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne '351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695') {
+            throw "Mesa archive SHA256 mismatch: $actualHash"
+          }
+          $extractDir = Join-Path $env:RUNNER_TEMP "venu-mesa-$version"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          & $sevenZip x $archive 'x64/opengl32.dll' 'x64/libgallium_wgl.dll' "-o$extractDir" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract Mesa software OpenGL runtime' }
+          foreach ($name in @('opengl32.dll', 'libgallium_wgl.dll')) {
+            if (-not (Test-Path (Join-Path $extractDir "x64\$name"))) {
+              throw "Mesa runtime file is missing: $name"
+            }
+          }
+
       - name: Test
         run: cargo test --locked
+        env:
+          VENU_STARTUP_TEST_OPENGL_DIR: ${{ runner.temp }}\venu-mesa-26.2.4\x64
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: '1'
+
+      - name: Collect startup smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-smoke-diagnostics
+          path: ${{ runner.temp }}/venu-startup-smoke-*
+          if-no-files-found: ignore
 
       - name: Check formatting
         run: cargo fmt --check

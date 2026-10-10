@@ -82,6 +82,24 @@ pub unsafe fn find_settings_hwnd() -> Option<windows::Win32::Foundation::HWND> {
     None
 }
 
+/// Wake an existing Settings viewport after it has been hidden. Requesting an
+/// egui repaint alone does not wake every backend once its only window is
+/// hidden, so post the native restore to the known Settings HWND as well; the
+/// next eframe update still applies its viewport visibility/focus commands.
+pub fn wake_settings_window() -> bool {
+    let Some(hwnd) = (unsafe { find_settings_hwnd() }) else {
+        return false;
+    };
+
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::ShowWindowAsync(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+        )
+        .as_bool()
+    }
+}
+
 pub fn setup_custom_fonts(ctx: &egui::Context) {
     font_setup::setup_custom_fonts(ctx);
 }
@@ -307,6 +325,7 @@ impl SettingsApp {
         config: Arc<RwLock<AppConfig>>,
         on_screen: bool,
     ) -> Self {
+        crate::startup_log::record_event("settings_gui_created");
         *EGUI_CTX.write() = Some(cc.egui_ctx.clone());
         setup_custom_fonts(&cc.egui_ctx);
 
@@ -2910,12 +2929,14 @@ impl eframe::App for SettingsApp {
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Closing puts Venu back in the tray rather than ending it.
+            crate::startup_log::record_event("settings_gui_close_request_processed");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.on_screen = false;
         }
 
         if crate::tray::SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            crate::startup_log::record_event("settings_gui_restore_request_processed");
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
