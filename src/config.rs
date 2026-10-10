@@ -305,6 +305,9 @@ impl NotificationGlowStyle {
 #[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
+    /// Opt-in Windows toast history. This works only in an identity-enabled
+    /// package after the user grants Windows notification access.
+    pub windows_listener_enabled: bool,
     /// Allowed apps whose notifications will trigger the Dynamic Notch alert toast.
     pub allowed_apps: Vec<String>,
     /// How long the dynamic alert capsule dwells on screen before settling back (in seconds).
@@ -332,6 +335,7 @@ impl Default for NotificationConfig {
 
         Self {
             enabled: true,
+            windows_listener_enabled: false,
             allowed_apps: vec![
                 "Antigravity".to_string(),
                 "Codex".to_string(),
@@ -1167,6 +1171,15 @@ mod tests {
         assert_eq!(config.font.family, "Plus Jakarta Sans");
         assert_eq!(config.notch.font_family, "Segoe UI");
         assert_eq!(config.flash.font.family, "Arial");
+    }
+
+    #[test]
+    fn old_notification_config_defaults_windows_listener_to_off() {
+        let old_config = r#"{"enabled":true,"allowed_apps":["Codex"],"webhook_port":18923}"#;
+        let decoded: NotificationConfig = serde_json::from_str(old_config).unwrap();
+        assert!(!decoded.windows_listener_enabled);
+        assert!(decoded.enabled);
+        assert_eq!(decoded.allowed_apps, ["Codex"]);
     }
 
     #[test]

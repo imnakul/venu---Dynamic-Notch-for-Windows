@@ -105,6 +105,11 @@ Turn the Dynamic Notch into a lightweight notification hub.
 - Application-specific colors
 - Custom animated notification glow styles
 - Local webhook support for external tools and scripts
+- Optional Windows toast history from all apps, with four recent entries kept in session memory
+
+Windows toast history uses the supported Windows Notification Listener API. Windows requires an identity-enabled package and a separate permission grant from the user. The ordinary portable executable and Inno Setup installer remain unpackaged, so this listener reports that package identity is required until Venu is registered through an identity-enabled installation. It reads Windows toast notifications; legacy tray balloons and custom popup windows are outside this API. Connect it from **Settings > Notch > Notifications** to show the Windows consent prompt.
+
+The listener and permission flow are opt-in. Venu keeps up to four Windows entries in memory for the current run; dismissing or clearing them affects only Venu's local history and does not remove notifications from Windows. Notification text is not written to disk or sent to a service. See [identity package preparation](packaging/identity/README.md) for the optional sparse-package workflow and its signing requirements.
 
 ### AI Agent and Developer Notifications
 

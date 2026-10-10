@@ -60,3 +60,12 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Validate sparse identity package template
+        shell: pwsh
+        run: |
+          [xml]$manifest = Get-Content packaging/identity/AppxManifest.xml -Raw
+          $listenerCapability = $manifest.SelectSingleNode("//*[local-name()='Capability' and @Name='userNotificationListener']")
+          if (-not $listenerCapability) { throw 'Manifest is missing userNotificationListener capability.' }
+          $scriptText = Get-Content packaging/identity/build-sparse-identity.ps1 -Raw
+          $null = [scriptblock]::Create($scriptText)
