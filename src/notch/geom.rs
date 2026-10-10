@@ -274,11 +274,39 @@ pub fn notification_clear_button(body: D2D_RECT_F) -> D2D_RECT_F {
     }
 }
 
-/// Individual notification item rectangle in the list view.
+const NOTIFICATION_LIST_TOP: f32 = 26.0;
+const NOTIFICATION_ROW_GAP: f32 = 4.0;
+const NOTIFICATION_ROW_MIN_HEIGHT: f32 = 22.0;
+const NOTIFICATION_ROW_MAX_HEIGHT: f32 = 34.0;
+pub const NOTIFICATION_MAX_VISIBLE_ROWS: usize = 4;
+
+/// How many rows fit without crossing the slide body's lower edge.
+pub fn notification_row_count(body: D2D_RECT_F) -> usize {
+    let available = (body.bottom - body.top - NOTIFICATION_LIST_TOP).max(0.0);
+    let fit = ((available + NOTIFICATION_ROW_GAP)
+        / (NOTIFICATION_ROW_MIN_HEIGHT + NOTIFICATION_ROW_GAP))
+        .floor() as usize;
+    fit.min(NOTIFICATION_MAX_VISIBLE_ROWS)
+}
+
+/// Individual notification item rectangle in the responsive list view.
+/// The painter and click handling share these bounds.
 pub fn notification_item_rect(body: D2D_RECT_F, index: usize) -> D2D_RECT_F {
-    let list_top = body.top + 26.0;
-    let item_h = 38.0;
-    let iy = list_top + (index as f32) * (item_h + 6.0);
+    let count = notification_row_count(body);
+    let list_top = body.top + NOTIFICATION_LIST_TOP;
+    if count == 0 || index >= count {
+        return D2D_RECT_F {
+            left: body.left,
+            top: list_top,
+            right: body.right,
+            bottom: list_top,
+        };
+    }
+
+    let available = (body.bottom - list_top).max(0.0);
+    let item_h = ((available - NOTIFICATION_ROW_GAP * (count - 1) as f32) / count as f32)
+        .clamp(NOTIFICATION_ROW_MIN_HEIGHT, NOTIFICATION_ROW_MAX_HEIGHT);
+    let iy = list_top + (index as f32) * (item_h + NOTIFICATION_ROW_GAP);
     D2D_RECT_F {
         left: body.left,
         top: iy,
@@ -304,5 +332,52 @@ pub fn notification_dismiss_button(body: D2D_RECT_F) -> D2D_RECT_F {
         top: body.bottom - 22.0,
         right: body.right,
         bottom: body.bottom + 2.0,
+    }
+}
+
+#[cfg(test)]
+mod notification_layout_tests {
+    use super::{notification_item_rect, notification_row_count};
+    use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+
+    #[test]
+    fn four_notification_rows_fit_inside_the_default_panel_body() {
+        let body = D2D_RECT_F {
+            left: 28.0,
+            top: 16.0,
+            right: 732.0,
+            bottom: 177.0,
+        };
+
+        assert_eq!(notification_row_count(body), 4);
+        let rows = (0..4)
+            .map(|index| notification_item_rect(body, index))
+            .collect::<Vec<_>>();
+        for row in &rows {
+            assert!(row.top >= body.top + 26.0);
+            assert!(row.bottom <= body.bottom);
+            assert!(row.bottom > row.top);
+        }
+        for pair in rows.windows(2) {
+            assert!(pair[0].bottom < pair[1].top);
+        }
+    }
+
+    #[test]
+    fn notification_rows_shrink_gracefully_for_short_panels() {
+        let body = D2D_RECT_F {
+            left: 12.0,
+            top: 4.0,
+            right: 500.0,
+            bottom: 84.0,
+        };
+
+        assert_eq!(notification_row_count(body), 2);
+        let last = notification_item_rect(body, 1);
+        assert!(last.bottom <= body.bottom);
+        assert_eq!(
+            notification_item_rect(body, 2).top,
+            notification_item_rect(body, 2).bottom
+        );
     }
 }

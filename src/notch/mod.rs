@@ -50,14 +50,18 @@ pub struct NotchManager {
 
 impl NotchManager {
     pub fn new(config: Arc<RwLock<AppConfig>>) -> Self {
-        let (port, allowed) = {
+        let (port, allowed, windows_listener_enabled, toast_duration_secs) = {
             let cfg = config.read();
             (
                 cfg.notch.notifications.webhook_port,
                 cfg.notch.notifications.allowed_apps.clone(),
+                cfg.notch.notifications.windows_listener_enabled,
+                cfg.notch.notifications.toast_duration_secs,
             )
         };
         notify::start_webhook_server(port, allowed);
+        crate::native_notifications::set_toast_duration(toast_duration_secs);
+        crate::native_notifications::set_enabled(windows_listener_enabled);
 
         Self {
             config,
