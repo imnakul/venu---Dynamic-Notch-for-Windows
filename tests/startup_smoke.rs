@@ -26,6 +26,52 @@ struct ChildProcess {
     remove_diagnostics: bool,
 }
 
+/// App-local Mesa binaries give the headless Windows runner a software
+/// OpenGL context. The test owns and removes these files after all child
+/// processes stop, and local runs without the CI runtime use the machine's
+/// normal OpenGL driver.
+struct SoftwareOpenGlRuntime {
+    copied_files: Vec<PathBuf>,
+}
+
+impl SoftwareOpenGlRuntime {
+    fn install() -> Self {
+        let mut runtime = Self {
+            copied_files: Vec::new(),
+        };
+        let Some(source_dir) = std::env::var_os("VENU_STARTUP_TEST_OPENGL_DIR").map(PathBuf::from)
+        else {
+            return runtime;
+        };
+        let executable = PathBuf::from(env!("CARGO_BIN_EXE_venu"));
+        let executable_dir = executable
+            .parent()
+            .expect("Venu executable has a parent directory");
+
+        for file_name in ["opengl32.dll", "libgallium_wgl.dll"] {
+            let source = source_dir.join(file_name);
+            assert!(source.is_file(), "Mesa smoke runtime is missing {source:?}");
+            let destination = executable_dir.join(file_name);
+            assert!(
+                !destination.exists(),
+                "refusing to replace existing OpenGL runtime {destination:?}"
+            );
+            fs::copy(&source, &destination)
+                .unwrap_or_else(|error| panic!("copy Mesa runtime {source:?}: {error}"));
+            runtime.copied_files.push(destination);
+        }
+        runtime
+    }
+}
+
+impl Drop for SoftwareOpenGlRuntime {
+    fn drop(&mut self) {
+        for path in &self.copied_files {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 impl ChildProcess {
     fn launch(args: &[&str], label: &str) -> Self {
         let nonce = SystemTime::now()
@@ -328,6 +374,7 @@ fn close_settings(child: &mut ChildProcess, phase: &str) {
 
 #[test]
 fn tray_default_startup_and_settings_restore_work_at_runtime() {
+    let _software_opengl = SoftwareOpenGlRuntime::install();
     let mut app = ChildProcess::launch(&[], "tray");
     // The tray owner HWND is intentionally hidden; Shell_NotifyIcon renders
     // its icon separately in Explorer's notification area.

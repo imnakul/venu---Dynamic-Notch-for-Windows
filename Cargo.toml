@@ -5,12 +5,6 @@ edition = "2021"
 description = "A sleek, hardware-accelerated Dynamic Notch for Windows with live background blur, media controls, multi-glass finishes, and desktop notifications."
 license = "MIT"
 
-[features]
-# The hosted Windows smoke runner has no OpenGL 2.0 context. Compile the WGPU
-# renderer only for the native-window integration test; shipped builds keep
-# the existing Glow renderer and binary size.
-startup-smoke-renderer = ["eframe/wgpu"]
-
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
