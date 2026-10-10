@@ -2911,12 +2911,14 @@ impl eframe::App for SettingsApp {
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Closing puts Venu back in the tray rather than ending it.
+            crate::startup_log::record_event("settings_gui_close_request_processed");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.on_screen = false;
         }
 
         if crate::tray::SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            crate::startup_log::record_event("settings_gui_restore_request_processed");
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

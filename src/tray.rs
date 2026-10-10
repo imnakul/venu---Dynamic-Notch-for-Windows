@@ -62,8 +62,10 @@ pub fn request_settings_window() {
     crate::startup_log::record_event("settings_request_queued");
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(ctx) = crate::gui::get_egui_context() {
+        crate::startup_log::record_event("settings_request_egui_repaint_requested");
         ctx.request_repaint();
     } else if let Some(sender) = SETTINGS_REQUEST_SENDER.get() {
+        crate::startup_log::record_event("settings_request_channel_send_attempted");
         let _ = sender.try_send(());
     }
 }
