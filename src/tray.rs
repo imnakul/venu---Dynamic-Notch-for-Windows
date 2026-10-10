@@ -59,6 +59,7 @@ pub fn install_settings_request_channel() -> Receiver<()> {
 /// Request Settings to open. Before eframe exists this wakes the main thread;
 /// afterward it asks the existing eframe window to restore itself.
 pub fn request_settings_window() {
+    crate::startup_log::record_event("settings_request_queued");
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(ctx) = crate::gui::get_egui_context() {
         ctx.request_repaint();
@@ -179,12 +180,17 @@ pub fn request_existing_settings() {
         for _ in 0..20 {
             if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
                 if !hwnd.is_invalid() {
-                    let _ = PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                    if PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok() {
+                        crate::startup_log::record_event("settings_request_posted_to_primary");
+                    } else {
+                        crate::startup_log::record_event("settings_request_post_failed");
+                    }
                     return;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        crate::startup_log::record_event("settings_request_target_missing");
     }
 }
 
@@ -216,6 +222,7 @@ impl SystemTray {
                 instance,
                 None,
             )?;
+            crate::startup_log::record_event("tray_owner_window_created");
 
             let hicon = create_app_icon()?;
 
@@ -262,6 +269,7 @@ impl SystemTray {
     ) -> LRESULT {
         match msg {
             WM_VENU_OPEN_SETTINGS => {
+                crate::startup_log::record_event("settings_request_message_received");
                 restore_settings_window();
                 LRESULT(0)
             }

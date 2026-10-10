@@ -307,6 +307,7 @@ impl SettingsApp {
         config: Arc<RwLock<AppConfig>>,
         on_screen: bool,
     ) -> Self {
+        crate::startup_log::record_event("settings_gui_created");
         *EGUI_CTX.write() = Some(cc.egui_ctx.clone());
         setup_custom_fonts(&cc.egui_ctx);
 

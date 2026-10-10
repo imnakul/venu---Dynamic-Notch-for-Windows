@@ -26,6 +26,13 @@ pub fn record_eframe_error(error: &eframe::Error) {
     write_record(&format!("eframe_error kind={kind}"));
 }
 
+/// Record a fixed lifecycle marker without including user data or arbitrary
+/// error payloads. The smoke test reads these events when a child window fails
+/// to appear, and the bounded log remains useful for real startup diagnosis.
+pub fn record_event(event: &'static str) {
+    write_record(event);
+}
+
 fn record_panic(info: &PanicHookInfo<'_>) {
     let site = info.location().map_or_else(
         || "unknown".to_owned(),

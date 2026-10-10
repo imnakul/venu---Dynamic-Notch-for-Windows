@@ -25,5 +25,13 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Collect startup smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-smoke-diagnostics
+          path: ${{ runner.temp }}/venu-startup-smoke-*
+          if-no-files-found: ignore
+
       - name: Check formatting
         run: cargo fmt --check

@@ -263,6 +263,7 @@ fn main() {
     if !show_settings {
         return;
     }
+    startup_log::record_event("settings_gui_starting");
 
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
