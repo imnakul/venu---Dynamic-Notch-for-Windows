@@ -153,6 +153,13 @@ struct PageCtx<'a> {
     changed: &'a mut bool,
     temp_text: &'a mut String,
     preview: &'a mut wallpaper::PreviewCache,
+    native_notification_action: &'a mut Option<NativeNotificationAction>,
+}
+
+#[derive(Clone, Copy)]
+enum NativeNotificationAction {
+    Connect,
+    Disconnect,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -279,6 +286,7 @@ pub struct SettingsApp {
     /// Whether the window is on screen. Venu is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
+    native_notification_action: Option<NativeNotificationAction>,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -345,6 +353,7 @@ impl SettingsApp {
             palette: None,
             preview: wallpaper::PreviewCache::new(),
             on_screen,
+            native_notification_action: None,
         }
     }
 
@@ -561,7 +570,7 @@ impl SettingsApp {
     }
 
     fn page_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_notifications(ui, cx.cfg, cx.changed);
+        Self::sec_notch_notifications(ui, cx);
     }
 
     fn page_edge_overview(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -2086,7 +2095,9 @@ impl SettingsApp {
         );
     }
 
-    fn sec_notch_notifications(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+    fn sec_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        let cfg = &mut *cx.cfg;
+        let changed = &mut *cx.changed;
         Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
 
         if ui
@@ -2110,10 +2121,55 @@ impl SettingsApp {
         );
 
         Self::divider(ui);
+        Self::section_title(ui, "WINDOWS NOTIFICATION CENTER");
+        ui.label(
+            RichText::new(
+                "Read recent toast notifications from Windows apps in the notch. Windows requires an identity-enabled install and your permission.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Access status")
+                    .size(12.0)
+                    .color(theme::text_primary()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(crate::native_notifications::status_label())
+                        .size(11.0)
+                        .color(theme::text_secondary()),
+                );
+            });
+        });
+        ui.add_space(6.0);
+        if cfg.notch.notifications.windows_listener_enabled {
+            if ui.button("Disconnect Windows notifications").clicked() {
+                cfg.notch.notifications.windows_listener_enabled = false;
+                *changed = true;
+                *cx.native_notification_action = Some(NativeNotificationAction::Disconnect);
+            }
+        }
+        if !crate::native_notifications::is_connected()
+            && ui.button("Request or retry Windows permission…").clicked()
+        {
+            *cx.native_notification_action = Some(NativeNotificationAction::Connect);
+        }
+        ui.label(
+            RichText::new(
+                "Windows shows its own consent prompt. Your local history keeps the latest four notifications for this session; clearing it does not remove anything from Windows.",
+            )
+            .size(11.0)
+            .color(theme::text_tertiary()),
+        );
+
+        Self::divider(ui);
         Self::section_title(ui, "ALLOWED APPS");
 
         ui.label(
-            RichText::new("Only notifications from these apps will trigger dynamic alerts:")
+            RichText::new("Webhook alerts from these apps can trigger dynamic alerts. Windows notifications above include all apps:")
                 .size(12.0)
                 .color(theme::text_secondary()),
         );
@@ -3120,6 +3176,7 @@ impl eframe::App for SettingsApp {
                             changed: &mut config_changed,
                             temp_text: &mut self.temp_text,
                             preview: &mut self.preview,
+                            native_notification_action: &mut self.native_notification_action,
                         };
                         (page.draw)(ui, &mut cx);
                     });
@@ -3128,6 +3185,22 @@ impl eframe::App for SettingsApp {
         if config_changed {
             cfg_guard.save();
         }
+        drop(cfg_guard);
+
+        if let Some(action) = self.native_notification_action.take() {
+            match action {
+                NativeNotificationAction::Connect => {
+                    crate::native_notifications::request_access_on_ui_thread(
+                        std::sync::Arc::clone(&self.config),
+                    );
+                }
+                NativeNotificationAction::Disconnect => {
+                    crate::native_notifications::set_enabled(false);
+                }
+            }
+        }
+        let duration = self.config.read().notch.notifications.toast_duration_secs;
+        crate::native_notifications::set_toast_duration(duration);
 
         // Nothing on this window animates on a clock of its own: egui asks for
         // its own frames while a cross-fade or the page slide is running, and

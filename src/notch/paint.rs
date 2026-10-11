@@ -2188,18 +2188,13 @@ impl Painter {
                 theme::fade(self.pal.text_lo, alpha * 0.8),
             );
         } else {
-            // Draw list of recent notifications (up to 3 items)
-            let item_h = 38.0;
-            let max_items = 3.min(store.items.len());
+            // Shared responsive row geometry keeps all four recent entries
+            // inside the expanded panel and aligned with click hit-testing.
+            let max_items = crate::notch::geom::notification_row_count(body).min(store.items.len());
 
             for (i, item) in store.items.iter().take(max_items).enumerate() {
-                let iy = list_top + (i as f32) * (item_h + 6.0);
-                let item_rect = D2D_RECT_F {
-                    left: body.left,
-                    top: iy,
-                    right: body.right,
-                    bottom: iy + item_h,
-                };
+                let item_rect = crate::notch::geom::notification_item_rect(body, i);
+                let item_h = item_rect.bottom - item_rect.top;
 
                 // Card background well
                 self.fill_rrect(t, item_rect, 8.0, theme::fade(self.pal.well, alpha * 0.75));
@@ -2216,9 +2211,9 @@ impl Painter {
 
                 let pill_rect = D2D_RECT_F {
                     left: item_rect.left + 8.0,
-                    top: item_rect.top + 7.0,
+                    top: item_rect.top + ((item_h - 14.0) * 0.5).max(1.0),
                     right: item_rect.left + 82.0,
-                    bottom: item_rect.top + 21.0,
+                    bottom: item_rect.top + ((item_h - 14.0) * 0.5).max(1.0) + 14.0,
                 };
                 self.fill_rrect(t, pill_rect, 4.0, theme::fade(app_color, alpha * 0.18));
                 self.stroke_rrect(t, pill_rect, 4.0, 1.0, theme::fade(app_color, alpha * 0.5));
@@ -2239,28 +2234,30 @@ impl Painter {
                 // Time string
                 self.label(
                     t,
-                    family,
+                    crate::fonts::GEIST_MONO,
                     &item.time_str,
-                    theme::SIZE_LABEL - 2.0,
+                    9.0,
                     DWRITE_FONT_WEIGHT_MEDIUM,
                     0.0,
-                    70.0,
+                    64.0,
                     item_rect.right - 64.0,
-                    item_rect.top + 8.0,
+                    item_rect.top + (item_h - 11.0) * 0.5,
                     theme::fade(self.pal.text_lo, alpha * 0.7),
                 );
 
                 // Notification Title
+                let text_left = item_rect.left + 90.0;
+                let text_width = (item_rect.right - text_left - 70.0).max(20.0);
                 self.label(
                     t,
                     family,
                     &item.title,
-                    theme::SIZE_PILL - 1.0,
+                    theme::SIZE_LABEL,
                     DWRITE_FONT_WEIGHT_BOLD,
                     0.0,
-                    item_rect.right - item_rect.left - 165.0,
-                    item_rect.left + 90.0,
-                    item_rect.top + 6.0,
+                    text_width,
+                    text_left,
+                    item_rect.top + 3.5,
                     theme::fade(self.pal.text_hi, alpha),
                 );
 
@@ -2269,12 +2266,12 @@ impl Painter {
                     t,
                     family,
                     &item.body,
-                    theme::SIZE_LABEL - 0.5,
+                    9.5,
                     DWRITE_FONT_WEIGHT_MEDIUM,
                     0.0,
-                    item_rect.right - item_rect.left - 100.0,
-                    item_rect.left + 90.0,
-                    item_rect.top + 20.0,
+                    text_width,
+                    text_left,
+                    item_rect.top + item_h - 12.0,
                     theme::fade(self.pal.text_mid, alpha * 0.9),
                 );
 

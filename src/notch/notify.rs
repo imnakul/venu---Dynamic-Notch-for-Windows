@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,11 @@ static NEXT_NOTIF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of historical notifications to keep in memory.
 const MAX_NOTIFICATIONS: usize = 50;
+/// Windows history stays deliberately small; the notch shows the latest four.
+const MAX_NATIVE_NOTIFICATIONS: usize = 4;
+/// Keep dismissal tombstones longer than the bounded OS snapshot so visible
+/// rows cannot reappear after a local clear/dismiss.
+const MAX_DISMISSED_NATIVE_KEYS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +54,20 @@ pub struct Notification {
     pub timestamp_secs: u64,
     pub time_str: String,
     pub read: bool,
+    /// Stable source key for an OS toast. Webhook entries have no source key.
+    #[serde(default)]
+    pub source_key: Option<String>,
+}
+
+/// A bounded, already-sanitized snapshot row from Windows Notification Center.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeNotification {
+    pub source_key: String,
+    pub app: String,
+    pub title: String,
+    pub body: String,
+    pub timestamp_secs: u64,
+    pub time_str: String,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +85,9 @@ pub struct NotificationCenter {
     /// whether the frame on screen is still the right one, which is cheaper
     /// and more exact than diffing the list itself.
     revision: u64,
+    /// Local dismissals suppress unchanged OS snapshots without deleting the
+    /// notification from Windows. It is capped to keep the session bounded.
+    dismissed_native_keys: VecDeque<String>,
 }
 
 static NOTIFICATION_STORE: parking_lot::RwLock<Option<Arc<RwLock<NotificationCenter>>>> =
@@ -140,6 +163,7 @@ impl NotificationCenter {
             timestamp_secs,
             time_str,
             read: false,
+            source_key: None,
         };
 
         // Insert at head of history
@@ -189,7 +213,24 @@ impl NotificationCenter {
         }
     }
 
+    pub fn mark_read(&mut self, id: u64) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            if !item.read {
+                item.read = true;
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
+    }
+
     pub fn clear_all(&mut self) {
+        let native_keys = self
+            .items
+            .iter()
+            .filter_map(|item| item.source_key.clone())
+            .collect::<Vec<_>>();
+        for key in native_keys {
+            self.remember_native_dismissal(&key);
+        }
         self.revision += 1;
         self.items.clear();
         self.active_toast = None;
@@ -206,12 +247,229 @@ impl NotificationCenter {
     #[allow(dead_code)]
     pub fn dismiss_item(&mut self, id: u64) {
         self.revision += 1;
+        let source_key = self
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| item.source_key.clone());
+        if let Some(key) = source_key {
+            self.remember_native_dismissal(&key);
+        }
         if let Some(toast) = &self.active_toast {
             if toast.notification.id == id {
                 self.active_toast = None;
             }
         }
         self.items.retain(|i| i.id != id);
+    }
+
+    /// Merge the current Windows toast snapshot into the session history.
+    /// Snapshot removals are ignored so dismissing a toast in Windows does not
+    /// erase its local history row. Only genuinely new rows can create one
+    /// active notch toast, so a burst of OS events stays visually quiet.
+    pub fn sync_native_snapshot(
+        &mut self,
+        mut incoming: Vec<NativeNotification>,
+        duration: f32,
+        allow_toast: bool,
+    ) {
+        incoming.sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
+        incoming.truncate(MAX_NATIVE_NOTIFICATIONS);
+
+        let mut newest_added = None;
+        let mut changed = false;
+        for native in incoming {
+            if self
+                .dismissed_native_keys
+                .iter()
+                .any(|key| key == &native.source_key)
+            {
+                continue;
+            }
+
+            if let Some(existing) = self
+                .items
+                .iter_mut()
+                .find(|item| item.source_key.as_deref() == Some(native.source_key.as_str()))
+            {
+                if existing.app != native.app
+                    || existing.title != native.title
+                    || existing.body != native.body
+                    || existing.timestamp_secs != native.timestamp_secs
+                    || existing.time_str != native.time_str
+                {
+                    existing.app = native.app;
+                    existing.title = native.title;
+                    existing.body = native.body;
+                    existing.timestamp_secs = native.timestamp_secs;
+                    existing.time_str = native.time_str;
+                    changed = true;
+                }
+                continue;
+            }
+
+            let item = Notification {
+                id: NEXT_NOTIF_ID.fetch_add(1, Ordering::SeqCst),
+                app: native.app,
+                title: native.title,
+                body: native.body,
+                level: NotificationLevel::Info,
+                timestamp_secs: native.timestamp_secs,
+                time_str: native.time_str,
+                read: false,
+                source_key: Some(native.source_key),
+            };
+            if newest_added
+                .as_ref()
+                .is_none_or(|latest: &Notification| item.timestamp_secs > latest.timestamp_secs)
+            {
+                newest_added = Some(item.clone());
+            }
+            self.items.push(item);
+            changed = true;
+        }
+
+        if !changed {
+            return;
+        }
+
+        self.items
+            .sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
+        let mut native_kept = 0;
+        self.items.retain(|item| {
+            if item.source_key.is_some() {
+                native_kept += 1;
+                native_kept <= MAX_NATIVE_NOTIFICATIONS
+            } else {
+                true
+            }
+        });
+        self.items.truncate(MAX_NOTIFICATIONS);
+        self.revision = self.revision.wrapping_add(1);
+
+        if allow_toast {
+            if let Some(notification) = newest_added {
+                let dur = if duration > 0.5 { duration } else { 4.5 };
+                self.active_toast = Some(ToastAlert {
+                    notification,
+                    duration: dur,
+                    remaining: dur,
+                });
+            }
+        }
+    }
+
+    fn remember_native_dismissal(&mut self, key: &str) {
+        if self.dismissed_native_keys.iter().any(|seen| seen == key) {
+            return;
+        }
+        self.dismissed_native_keys.push_back(key.to_owned());
+        while self.dismissed_native_keys.len() > MAX_DISMISSED_NATIVE_KEYS {
+            self.dismissed_native_keys.pop_front();
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_history_tests {
+    use super::{NativeNotification, NotificationCenter};
+
+    fn native(key: &str, timestamp: u64, title: &str) -> NativeNotification {
+        NativeNotification {
+            source_key: key.to_owned(),
+            app: "Messages".to_owned(),
+            title: title.to_owned(),
+            body: "Preview".to_owned(),
+            timestamp_secs: timestamp,
+            time_str: "10:30 AM".to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_snapshot_seeds_silently_and_keeps_only_four_latest() {
+        let mut center = NotificationCenter::default();
+        center.sync_native_snapshot(
+            (1..=5)
+                .map(|n| native(&format!("app:{n}"), n, &format!("item {n}")))
+                .collect(),
+            4.5,
+            false,
+        );
+
+        assert_eq!(center.items.len(), 4);
+        assert_eq!(center.items[0].title, "item 5");
+        assert_eq!(center.items[3].title, "item 2");
+        assert!(center.active_toast.is_none());
+    }
+
+    #[test]
+    fn native_notifications_are_not_filtered_by_webhook_app_rules() {
+        let mut center = NotificationCenter::default();
+        center.sync_native_snapshot(
+            vec![native("unlisted-app:1", 1, "from any app")],
+            4.5,
+            false,
+        );
+
+        assert_eq!(center.items.len(), 1);
+        assert_eq!(center.items[0].app, "Messages");
+    }
+
+    #[test]
+    fn repeated_snapshot_updates_in_place_and_new_event_toasts_once() {
+        let mut center = NotificationCenter::default();
+        center.sync_native_snapshot(vec![native("app:7", 7, "old")], 4.5, false);
+        let original_id = center.items[0].id;
+
+        center.sync_native_snapshot(vec![native("app:7", 8, "updated")], 4.5, true);
+        assert_eq!(center.items.len(), 1);
+        assert_eq!(center.items[0].id, original_id);
+        assert_eq!(center.items[0].title, "updated");
+        assert!(
+            center.active_toast.is_none(),
+            "updates should not create a duplicate toast"
+        );
+
+        center.sync_native_snapshot(vec![native("app:8", 9, "new")], 4.5, true);
+        assert_eq!(center.items[0].title, "new");
+        assert_eq!(
+            center.active_toast.as_ref().unwrap().notification.title,
+            "new"
+        );
+    }
+
+    #[test]
+    fn operating_system_removal_keeps_local_history_and_dismissal_suppresses_resurrection() {
+        let mut center = NotificationCenter::default();
+        center.sync_native_snapshot(vec![native("app:1", 1, "kept")], 4.5, false);
+        let id = center.items[0].id;
+
+        center.sync_native_snapshot(Vec::new(), 4.5, false);
+        assert_eq!(center.items[0].id, id);
+
+        center.dismiss_item(id);
+        center.sync_native_snapshot(vec![native("app:1", 1, "kept")], 4.5, false);
+        assert!(center.items.is_empty());
+    }
+
+    #[test]
+    fn clear_all_suppresses_all_current_native_rows_but_not_future_rows() {
+        let mut center = NotificationCenter::default();
+        center.sync_native_snapshot(
+            vec![native("app:1", 1, "one"), native("app:2", 2, "two")],
+            4.5,
+            false,
+        );
+        center.clear_all();
+        center.sync_native_snapshot(
+            vec![native("app:1", 1, "one"), native("app:2", 2, "two")],
+            4.5,
+            false,
+        );
+        assert!(center.items.is_empty());
+
+        center.sync_native_snapshot(vec![native("app:3", 3, "future")], 4.5, false);
+        assert_eq!(center.items[0].title, "future");
     }
 }
 
