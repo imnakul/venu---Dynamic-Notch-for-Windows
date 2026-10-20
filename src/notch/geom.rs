@@ -1,22 +1,60 @@
 //! The notch silhouette.
 //!
-//! One path builder covers both resting states. While the notch is fused to
-//! the top bezel it grows *outward* at the very top through a pair of concave
-//! shoulders, so the dark slab dissolves into the black bezel instead of
-//! ending in two hard corners. As it detaches or expands, those shoulders
-//! shrink to nothing and the top corners round off into a floating panel.
+//! One outline covers every resting state. While the notch is fused to the
+//! top bezel it grows *outward* at the very top through a pair of concave
+//! shoulders, so the slab melts into the black bezel instead of ending in two
+//! hard corners — collapsed and expanded alike. Detached, the shoulders are
+//! gone and the top corners round off into a floating panel.
+//!
+//! Every corner, convex or concave, is a continuous-curvature cubic rather
+//! than a circular arc. A circle meeting a straight edge jumps from zero
+//! curvature to `1/r` in one pixel, and the eye reads that jump as a kink —
+//! most visibly where a shoulder turns into the side wall. The cubic eases
+//! in from the straight edge instead, the way Apple's own hardware corners
+//! do, at the same visual depth as the circle it replaces.
 
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F,
+    D2D1_BEZIER_SEGMENT, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D_POINT_2F, D2D_RECT_F,
 };
-use windows::Win32::Graphics::Direct2D::{
-    ID2D1Factory, ID2D1PathGeometry, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL,
-    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-};
+use windows::Win32::Graphics::Direct2D::{ID2D1Factory, ID2D1PathGeometry};
 
-/// Anything below this is treated as a hard corner; feeding Direct2D a
-/// degenerate arc produces artefacts on some drivers.
+/// Anything below this is treated as a hard corner.
 const MIN_RADIUS: f32 = 0.5;
+
+/// How far along each edge a smoothed corner starts, as a multiple of the
+/// circular radius it stands in for. Together with [`CORNER_PULL`] this puts
+/// the curve's midpoint at the same depth as the circle's (0.29 r), so
+/// existing radii keep their visual size.
+const CORNER_REACH: f32 = 1.5;
+
+/// How far each control point is pulled from the curve's end toward the
+/// corner. Close to 1 means curvature starts near zero at both ends, which is
+/// what makes the corner continuous with its edges.
+const CORNER_PULL: f32 = 0.82;
+
+/// Samples per corner when the outline is flattened for the glow effects.
+const CORNER_SAMPLES: usize = 14;
+
+type Point = (f32, f32);
+
+/// One piece of the rim, ending at the point it carries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Segment {
+    Line(Point),
+    Cubic(Point, Point, Point),
+}
+
+/// The left, bottom and right edges of the silhouette as one open run, from
+/// the top-left tip, down, across and back up to the top-right tip. The top
+/// edge — fused to the bezel, or the panel's own top — closes it.
+///
+/// Fixed-size on purpose: built several times a frame, so no allocation.
+/// Absent corners are zero-length lines, which Direct2D draws as nothing.
+struct Rim {
+    start: Point,
+    segments: [Segment; 7],
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NotchShape {
@@ -26,7 +64,8 @@ pub struct NotchShape {
     pub bottom: f32,
     pub radius_top: f32,
     pub radius_bottom: f32,
-    /// Concave shoulder radius. Zero for a plain rounded rectangle.
+    /// How far each concave shoulder reaches out along the bezel and down the
+    /// side wall. Zero for a free-floating panel.
     pub flare: f32,
 }
 
@@ -37,6 +76,12 @@ impl NotchShape {
 
     pub fn height(&self) -> f32 {
         (self.bottom - self.top).max(0.0)
+    }
+
+    /// Whether the top edge is fused to the bezel. A fused top is never
+    /// stroked or lit: it is the screen edge, not an edge of the panel.
+    pub fn fused(&self) -> bool {
+        self.flare > MIN_RADIUS
     }
 
     /// Inset every edge, used for the inner sheen ring and shadow rings.
@@ -67,9 +112,10 @@ impl NotchShape {
 
     /// Cheap hit test used for hover and for `WM_NCHITTEST`.
     ///
-    /// Deliberately ignores the flare: the shoulders only *add* area at the
-    /// very top, where the cursor is already inside the main body, so treating
-    /// the shape as a rounded rectangle is both correct enough and branch-free.
+    /// Deliberately ignores the flare and treats the smoothed corners as
+    /// circles: the shoulders only *add* area at the very top, where the
+    /// cursor is already inside the main body, and the corner curves differ
+    /// from their circles by well under a pixel of hover slop.
     pub fn contains(&self, x: f32, y: f32) -> bool {
         if x < self.left || x > self.right || y < self.top || y > self.bottom {
             return false;
@@ -103,134 +149,170 @@ impl NotchShape {
         true
     }
 
-    /// Build the filled path. Traversed clockwise in Direct2D's y-down space.
-    pub fn build(&self, factory: &ID2D1Factory) -> windows::core::Result<ID2D1PathGeometry> {
-        let w = self.width();
+    /// The rim, with every corner's reach clamped so neighbouring curves can
+    /// never overlap however small the shape gets mid-animation.
+    fn rim(&self) -> Rim {
+        let (l, t, r, b) = (self.left, self.top, self.right, self.bottom);
+        let half_w = self.width() * 0.5;
         let h = self.height();
 
-        let (l, t, r, b) = (self.left, self.top, self.right, self.bottom);
+        // What the top corners take out of each side wall: the shoulder's
+        // reach when fused, a rounded corner's when floating.
+        let flare = self.flare.clamp(0.0, h * 0.5);
+        let fused = flare > MIN_RADIUS;
+        let top_reach = if fused {
+            flare
+        } else {
+            (self.radius_top * CORNER_REACH).clamp(0.0, half_w.min(h * 0.5))
+        };
 
-        // Radii can never exceed half the shorter side, or the arcs overlap.
-        let limit = (w.min(h) * 0.5).max(0.0);
-        let rt = self.radius_top.clamp(0.0, limit);
-        let rb = self.radius_bottom.clamp(0.0, limit);
-        let flare = self.flare.clamp(0.0, (h * 0.5).max(0.0));
-        let flared = flare > MIN_RADIUS;
+        // The bottom corners get whatever height the top ones left over, and
+        // may run wider than they are tall when the slab is short.
+        let bottom_reach = self.radius_bottom.max(0.0) * CORNER_REACH;
+        let bx = bottom_reach.min(half_w);
+        let by = bottom_reach.min((h - top_reach).max(0.0));
 
+        let (start, top_left, top_right) = if fused {
+            (
+                (l - flare, t),
+                corner((l - flare, t), (l, t), (l, t + flare)),
+                corner((r, t + flare), (r, t), (r + flare, t)),
+            )
+        } else {
+            (
+                (l + top_reach, t),
+                corner((l + top_reach, t), (l, t), (l, t + top_reach)),
+                corner((r, t + top_reach), (r, t), (r - top_reach, t)),
+            )
+        };
+
+        Rim {
+            start,
+            segments: [
+                top_left,
+                Segment::Line((l, b - by)),
+                corner((l, b - by), (l, b), (l + bx, b)),
+                Segment::Line((r - bx, b)),
+                corner((r - bx, b), (r, b), (r, b - by)),
+                Segment::Line((r, t + top_reach)),
+                top_right,
+            ],
+        }
+    }
+
+    /// Build the filled silhouette.
+    pub fn build(&self, factory: &ID2D1Factory) -> windows::core::Result<ID2D1PathGeometry> {
+        self.build_outline(factory, true)
+    }
+
+    /// Build the outline for a hairline or sheen. A fused top is left open:
+    /// stroking it would draw a line along the very edge of the screen.
+    pub fn build_edge(&self, factory: &ID2D1Factory) -> windows::core::Result<ID2D1PathGeometry> {
+        self.build_outline(factory, !self.fused())
+    }
+
+    fn build_outline(
+        &self,
+        factory: &ID2D1Factory,
+        closed: bool,
+    ) -> windows::core::Result<ID2D1PathGeometry> {
+        let rim = self.rim();
         let geometry = unsafe { factory.CreatePathGeometry()? };
         let sink = unsafe { geometry.Open()? };
 
         unsafe {
-            let start = if flared {
-                D2D_POINT_2F { x: l - flare, y: t }
+            let begin = if closed {
+                D2D1_FIGURE_BEGIN_FILLED
             } else {
-                D2D_POINT_2F { x: l + rt, y: t }
+                D2D1_FIGURE_BEGIN_HOLLOW
             };
-            sink.BeginFigure(start, D2D1_FIGURE_BEGIN_FILLED);
-
-            // --- top edge, left to right -----------------------------------
-            if flared {
-                sink.AddLine(D2D_POINT_2F { x: r + flare, y: t });
-                // Concave right shoulder: curves back inward as it descends.
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: r, y: t + flare },
-                    size: D2D_SIZE_F {
-                        width: flare,
-                        height: flare,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-            } else {
-                sink.AddLine(D2D_POINT_2F { x: r - rt, y: t });
-                if rt > MIN_RADIUS {
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F { x: r, y: t + rt },
-                        size: D2D_SIZE_F {
-                            width: rt,
-                            height: rt,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                } else {
-                    sink.AddLine(D2D_POINT_2F { x: r, y: t });
+            sink.BeginFigure(pt(rim.start), begin);
+            for segment in rim.segments {
+                match segment {
+                    Segment::Line(to) => sink.AddLine(pt(to)),
+                    Segment::Cubic(c1, c2, to) => sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                        point1: pt(c1),
+                        point2: pt(c2),
+                        point3: pt(to),
+                    }),
                 }
             }
-
-            // --- right edge, bottom-right corner ---------------------------
-            sink.AddLine(D2D_POINT_2F { x: r, y: b - rb });
-            if rb > MIN_RADIUS {
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: r - rb, y: b },
-                    size: D2D_SIZE_F {
-                        width: rb,
-                        height: rb,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
+            // Closing draws the top edge straight back across to the start.
+            sink.EndFigure(if closed {
+                D2D1_FIGURE_END_CLOSED
             } else {
-                sink.AddLine(D2D_POINT_2F { x: r, y: b });
-            }
-
-            // --- bottom edge, bottom-left corner ---------------------------
-            sink.AddLine(D2D_POINT_2F { x: l + rb, y: b });
-            if rb > MIN_RADIUS {
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: l, y: b - rb },
-                    size: D2D_SIZE_F {
-                        width: rb,
-                        height: rb,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-            } else {
-                sink.AddLine(D2D_POINT_2F { x: l, y: b });
-            }
-
-            // --- left edge, back to the start ------------------------------
-            if flared {
-                sink.AddLine(D2D_POINT_2F { x: l, y: t + flare });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: l - flare, y: t },
-                    size: D2D_SIZE_F {
-                        width: flare,
-                        height: flare,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-            } else {
-                sink.AddLine(D2D_POINT_2F { x: l, y: t + rt });
-                if rt > MIN_RADIUS {
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F { x: l + rt, y: t },
-                        size: D2D_SIZE_F {
-                            width: rt,
-                            height: rt,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                } else {
-                    sink.AddLine(D2D_POINT_2F { x: l, y: t });
-                }
-            }
-
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                D2D1_FIGURE_END_OPEN
+            });
             sink.Close()?;
         }
 
         Ok(geometry)
     }
+
+    /// The rim flattened into points, for the glow effects that walk the
+    /// outline by length or colour it segment by segment. Built from the same
+    /// [`Rim`] as the fill, so the glow can never drift off the silhouette.
+    pub fn rim_points(&self) -> Vec<Point> {
+        let rim = self.rim();
+        let mut points = Vec::with_capacity(2 + rim.segments.len() * CORNER_SAMPLES);
+        points.push(rim.start);
+        let mut from = rim.start;
+
+        for segment in rim.segments {
+            match segment {
+                Segment::Line(to) => {
+                    // Long straight runs are split too, so the per-segment
+                    // colour cycling stays as fine on the edges as it is
+                    // round the corners.
+                    let length = (to.0 - from.0).hypot(to.1 - from.1);
+                    let steps = (length / 6.0).ceil().max(1.0) as usize;
+                    for i in 1..=steps {
+                        let f = i as f32 / steps as f32;
+                        points.push((from.0 + (to.0 - from.0) * f, from.1 + (to.1 - from.1) * f));
+                    }
+                    from = to;
+                }
+                Segment::Cubic(c1, c2, to) => {
+                    for i in 1..=CORNER_SAMPLES {
+                        points.push(cubic_at(from, c1, c2, to, i as f32 / CORNER_SAMPLES as f32));
+                    }
+                    from = to;
+                }
+            }
+        }
+
+        points
+    }
+}
+
+/// A smoothed corner from `from` (the previous segment's end) round `apex` to
+/// `to`. Collapses to a line when there is no room for a curve.
+fn corner(from: Point, apex: Point, to: Point) -> Segment {
+    let reach_in = (apex.0 - from.0).abs() + (apex.1 - from.1).abs();
+    let reach_out = (apex.0 - to.0).abs() + (apex.1 - to.1).abs();
+    if reach_in <= MIN_RADIUS || reach_out <= MIN_RADIUS {
+        return Segment::Line(to);
+    }
+    let pull = |p: Point| {
+        (
+            p.0 + (apex.0 - p.0) * CORNER_PULL,
+            p.1 + (apex.1 - p.1) * CORNER_PULL,
+        )
+    };
+    Segment::Cubic(pull(from), pull(to), to)
+}
+
+fn cubic_at(p0: Point, p1: Point, p2: Point, p3: Point, t: f32) -> Point {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    (
+        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+    )
+}
+
+fn pt((x, y): Point) -> D2D_POINT_2F {
+    D2D_POINT_2F { x, y }
 }
 
 /// Content rectangle for a slide's body, derived from its panel. Shared by
@@ -304,5 +386,89 @@ pub fn notification_dismiss_button(body: D2D_RECT_F) -> D2D_RECT_F {
         top: body.bottom - 22.0,
         right: body.right,
         bottom: body.bottom + 2.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fused(width: f32, height: f32, flare: f32, radius_bottom: f32) -> NotchShape {
+        NotchShape {
+            left: 100.0,
+            top: 0.0,
+            right: 100.0 + width,
+            bottom: height,
+            radius_top: 0.0,
+            radius_bottom,
+            flare,
+        }
+    }
+
+    #[test]
+    fn fused_rim_runs_tip_to_tip_inside_its_bounds() {
+        let shape = fused(188.0, 34.0, 16.0, 17.0);
+        let points = shape.rim_points();
+
+        assert_eq!(points.first(), Some(&(84.0, 0.0)));
+        assert_eq!(points.last(), Some(&(304.0, 0.0)));
+        for &(x, y) in &points {
+            assert!((84.0..=304.0).contains(&x), "x {x} escapes the shoulders");
+            assert!((0.0..=34.0).contains(&y), "y {y} escapes the slab");
+        }
+    }
+
+    #[test]
+    fn corners_never_overlap_on_a_short_slab() {
+        // Shoulders and bottom corners both want more height than there is.
+        let shape = fused(120.0, 20.0, 16.0, 20.0);
+        let points = shape.rim_points();
+
+        // The left wall only ever descends and the right only ever climbs.
+        let bottom_at = points
+            .iter()
+            .position(|p| p.1 >= 20.0 - 1e-3)
+            .expect("rim reaches the bottom");
+        assert!(points[..=bottom_at]
+            .windows(2)
+            .all(|w| w[1].1 >= w[0].1 - 1e-3));
+        let last_bottom = points.len()
+            - 1
+            - points
+                .iter()
+                .rev()
+                .position(|p| p.1 >= 20.0 - 1e-3)
+                .unwrap();
+        assert!(points[last_bottom..]
+            .windows(2)
+            .all(|w| w[1].1 <= w[0].1 + 1e-3));
+    }
+
+    #[test]
+    fn smoothed_corner_matches_the_depth_of_its_circle() {
+        // Midpoint of a corner cubic, measured from the apex along each axis,
+        // should sit where a circle of the same radius puts it: r(1 - 1/sqrt 2).
+        let r = 20.0;
+        let reach = r * CORNER_REACH;
+        let Segment::Cubic(c1, c2, to) = corner((0.0, reach), (0.0, 0.0), (reach, 0.0)) else {
+            panic!("expected a curve");
+        };
+        let mid = cubic_at((0.0, reach), c1, c2, to, 0.5);
+        let circle = r * (1.0 - std::f32::consts::FRAC_1_SQRT_2);
+        assert!((mid.0 - circle).abs() < 0.2, "{} vs {circle}", mid.0);
+        assert!((mid.1 - circle).abs() < 0.2, "{} vs {circle}", mid.1);
+    }
+
+    #[test]
+    fn detached_rim_starts_after_its_top_corner() {
+        let shape = NotchShape {
+            radius_top: 10.0,
+            flare: 0.0,
+            ..fused(200.0, 60.0, 0.0, 10.0)
+        };
+        assert!(!shape.fused());
+        let points = shape.rim_points();
+        assert_eq!(points.first(), Some(&(115.0, 0.0)));
+        assert_eq!(points.last(), Some(&(285.0, 0.0)));
     }
 }

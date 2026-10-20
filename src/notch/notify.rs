@@ -253,6 +253,13 @@ pub struct UsagePayload {
 static USAGE_STORE: parking_lot::RwLock<Option<Arc<RwLock<UsageSnapshot>>>> =
     parking_lot::RwLock::new(None);
 
+/// Bumped on every `/usage` post, so the notch repaints when one lands.
+static USAGE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub fn usage_revision() -> u64 {
+    USAGE_REVISION.load(Ordering::Acquire)
+}
+
 pub fn usage_store() -> Arc<RwLock<UsageSnapshot>> {
     let read = USAGE_STORE.read();
     if let Some(store) = read.as_ref() {
@@ -331,6 +338,7 @@ fn handle_webhook_client(
                         rate_7d_resets_at: payload.rate_7d_resets_at,
                         updated_at_secs: epoch,
                     };
+                    USAGE_REVISION.fetch_add(1, Ordering::AcqRel);
 
                     let resp_body = r#"{"status":"ok","delivered":true}"#;
                     let resp = format!(

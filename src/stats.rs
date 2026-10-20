@@ -26,6 +26,11 @@ use crate::stats_math::{
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const DEMAND_LEASE: Duration = Duration::from_secs(2);
+/// The GPU counter is a wildcard over every engine of every process, which
+/// PDH re-expands on each collection — by far the most expensive read here.
+/// It is collected on every second worker tick; the utilization it reports is
+/// averaged over that whole window anyway, so nothing is lost but latency.
+const GPU_SAMPLE_EVERY: u32 = 2;
 const GPU_COUNTER: &[u8] = b"\\GPU Engine(*)\\Utilization Percentage\0";
 
 #[derive(Debug, Clone, Default)]
@@ -178,6 +183,8 @@ struct GpuQuery {
     // windows 0.58 exposes PDH handles as isize, not named handle wrappers.
     query: isize,
     counter: isize,
+    /// Reused across samples; the instance list runs to hundreds of entries.
+    buffer: Vec<usize>,
 }
 
 impl GpuQuery {
@@ -198,7 +205,11 @@ impl GpuQuery {
             // Percentage counters need two samples. The first value is read on
             // the next one-second worker tick, not during painting.
             let _ = PdhCollectQueryData(query);
-            Some(Self { query, counter })
+            Some(Self {
+                query,
+                counter,
+                buffer: Vec::new(),
+            })
         }
     }
 
@@ -225,8 +236,9 @@ impl GpuQuery {
             // byte buffer. usize gives it enough alignment for the item array.
             let words =
                 (bytes as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
-            let mut buffer = vec![0usize; words];
-            let items = buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_A;
+            self.buffer.clear();
+            self.buffer.resize(words, 0);
+            let items = self.buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_A;
             let status = PdhGetFormattedCounterArrayA(
                 self.counter,
                 PDH_FMT_DOUBLE,
@@ -239,25 +251,17 @@ impl GpuQuery {
             }
 
             let slice = std::slice::from_raw_parts(items, count as usize);
-            let instances: Vec<(String, f64)> = slice
-                .iter()
-                .filter_map(|item| {
-                    // 0 = valid data, 1 = new data. Ignore stale/error entries.
-                    if item.FmtValue.CStatus > 1 || item.szName.is_null() {
-                        return None;
-                    }
-                    let name = CStr::from_ptr(item.szName.0 as *const i8)
-                        .to_string_lossy()
-                        .into_owned();
-                    let value = item.FmtValue.Anonymous.doubleValue;
-                    Some((name, value))
-                })
-                .collect();
-            busiest_gpu_engine(
-                instances
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), *value)),
-            )
+            // Names are borrowed straight out of the PDH buffer rather than
+            // copied: instance names are ASCII, and one that is not could not
+            // be parsed as an engine anyway.
+            busiest_gpu_engine(slice.iter().filter_map(|item| {
+                // 0 = valid data, 1 = new data. Ignore stale/error entries.
+                if item.FmtValue.CStatus > 1 || item.szName.is_null() {
+                    return None;
+                }
+                let name = CStr::from_ptr(item.szName.0 as *const i8).to_str().ok()?;
+                Some((name, item.FmtValue.Anonymous.doubleValue))
+            }))
         }
     }
 }
@@ -275,6 +279,8 @@ struct Sampler {
     previous_cpu: Option<CpuTimes>,
     gpu: Option<GpuQuery>,
     gpu_attempted: bool,
+    /// Worker ticks since the GPU counter was last collected.
+    gpu_age: u32,
     snapshot: StatsSnapshot,
 }
 
@@ -291,6 +297,7 @@ impl Sampler {
             previous_cpu: None,
             gpu: None,
             gpu_attempted: false,
+            gpu_age: 0,
             snapshot: StatsSnapshot {
                 revision,
                 ..StatsSnapshot::default()
@@ -308,8 +315,14 @@ impl Sampler {
         if !self.gpu_attempted {
             self.gpu_attempted = true;
             self.gpu = GpuQuery::new();
+            // Due on the very next tick, so the first reading is no slower.
+            self.gpu_age = GPU_SAMPLE_EVERY - 1;
         } else {
-            self.snapshot.gpu_pct = self.gpu.as_mut().and_then(GpuQuery::sample);
+            self.gpu_age += 1;
+            if self.gpu_age >= GPU_SAMPLE_EVERY {
+                self.gpu_age = 0;
+                self.snapshot.gpu_pct = self.gpu.as_mut().and_then(GpuQuery::sample);
+            }
         }
     }
 

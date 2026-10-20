@@ -181,8 +181,11 @@ pub const PILL_GUTTER: f32 = 14.0;
 pub const SPLIT_RATIO: f32 = 0.44;
 /// Corner radius of the expanded panel.
 pub const RADIUS_EXPANDED: f32 = 26.0;
-/// Concave shoulder radius while fused to the bezel.
-pub const FLARE: f32 = 13.0;
+/// How far the concave shoulders reach along the bezel and down the side
+/// walls while fused to it, collapsed and fully open. Reach, not radius: the
+/// smoothed curve reads like a circle of about two thirds of this.
+pub const FLARE: f32 = 16.0;
+pub const FLARE_EXPANDED: f32 = 24.0;
 
 /// Straight RGBA to the premultiplied colour a layered-window render target
 /// needs. Every brush in the notch goes through here.

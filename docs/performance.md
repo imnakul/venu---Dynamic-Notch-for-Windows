@@ -23,9 +23,25 @@ repaints, but three paths still cause unnecessary work:
 These fixes do not remove the work needed for visible animation. Moving text,
 notification glows and FlashScreen still animate. The notch's ambient pulse and
 glass backdrop still repaint at roughly 10 fps, and each such frame still does
-Direct2D drawing and a layered-window blit. A collapsed pulse-free slide also
-repaints on the one-second clock key, even if that slide does not show a clock.
+Direct2D drawing and a layered-window blit. A collapsed pulse-free slide used to
+repaint on the one-second clock key even when it showed no clock; the clock key
+now only counts while a Clock slide is visible (see below).
 Those are further optimization candidates if profiling shows they dominate.
+
+## Follow-up: brushes, clock key, GPU counter
+
+- Every fill and stroke used to create its own `ID2D1SolidColorBrush`, a few
+  hundred COM objects per painted frame. The painter now keeps one per render
+  target and recolours it between draw calls.
+- `FrameKey::clock` is zero unless a Clock slide is on screen, so a collapsed
+  Status, Media or Notifications pill no longer repaints every second. The
+  Usage slide had been relying on that repaint to show `/usage` posts, so it
+  now has its own revision counter in the key.
+- The `GPU Engine(*)` PDH wildcard is collected every other second instead of
+  every second, into a reused buffer, without copying each instance name.
+  CPU and RAM still sample every second.
+
+Not measured yet; use the procedure below.
 
 ## Validation
 

@@ -6,7 +6,7 @@
 //! the contents rise into it a beat later, which is what stops the panel from
 //! looking like a texture being stretched.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use windows::core::{Interface, PCWSTR};
 use windows::Foundation::Numerics::Matrix3x2;
@@ -127,6 +127,13 @@ pub struct Painter {
     /// `&mut self` methods and threading a flag back out of every one of them
     /// would be noise.
     motion: Cell<Motion>,
+    /// The one solid-colour brush every fill and stroke goes through,
+    /// recoloured per call, rather than a new COM object for each of the few
+    /// hundred draw calls in a frame.
+    solid: RefCell<Option<ID2D1SolidColorBrush>>,
+    /// Surface generation the cached brush belongs to; it dies with its
+    /// render target like every other device resource.
+    solid_generation: u64,
 }
 
 /// Local time, read once per frame.
@@ -215,6 +222,8 @@ impl Painter {
             media_art: None,
             media_art_failed: None,
             motion: Cell::new(Motion::Still),
+            solid: RefCell::new(None),
+            solid_generation: 0,
         })
     }
 
@@ -253,7 +262,17 @@ impl Painter {
         t: &ID2D1DCRenderTarget,
         color: Rgba,
     ) -> windows::core::Result<ID2D1SolidColorBrush> {
-        unsafe { t.CreateSolidColorBrush(&theme::premul(color), None) }
+        // Direct2D takes the colour at each draw call, so recolouring between
+        // calls is safe as long as no caller holds two at once. None does:
+        // each draws with its brush before it asks for the next one.
+        let color = theme::premul(color);
+        if let Some(brush) = self.solid.borrow().as_ref() {
+            unsafe { brush.SetColor(&color) };
+            return Ok(brush.clone());
+        }
+        let brush = unsafe { t.CreateSolidColorBrush(&color, None)? };
+        *self.solid.borrow_mut() = Some(brush.clone());
+        Ok(brush)
     }
 
     fn fill_rrect(&self, t: &ID2D1DCRenderTarget, rect: D2D_RECT_F, radius: f32, color: Rgba) {
@@ -499,6 +518,10 @@ impl Painter {
         let t = t.clone();
 
         // Device resources die with their target.
+        if self.solid_generation != generation {
+            self.solid_generation = generation;
+            *self.solid.get_mut() = None;
+        }
         if let Some(img) = &self.image {
             if img.generation != generation {
                 self.image = None;
@@ -539,17 +562,20 @@ impl Painter {
                 unsafe { t.FillGeometry(&geometry, &fill, None) };
             }
             // Hairline edge, then a brighter specular lip across the top third.
-            if let Ok(edge) = self.brush(&t, self.pal.edge) {
-                unsafe { t.DrawGeometry(&geometry, &edge, 1.0, None) };
+            // Neither runs along a fused top: that edge is the screen's.
+            if let Ok(outline) = shape.build_edge(&factory) {
+                if let Ok(edge) = self.brush(&t, self.pal.edge) {
+                    unsafe { t.DrawGeometry(&outline, &edge, 1.0, None) };
+                }
             }
-            if let Ok(inner) = shape.inset(0.9).build(&factory) {
+            if let Ok(inner) = shape.inset(0.9).build_edge(&factory) {
                 if let Ok(sheen) = self.brush(&t, self.pal.sheen) {
                     self.clip(
                         &t,
                         D2D_RECT_F {
-                            left: shape.left - theme::FLARE,
+                            left: shape.left - shape.flare,
                             top: shape.top,
-                            right: shape.right + theme::FLARE,
+                            right: shape.right + shape.flare,
                             bottom: shape.top + shape.height() * 0.42,
                         },
                     );
@@ -682,7 +708,7 @@ impl Painter {
             }
 
             crate::config::NotificationGlowStyle::RgbBorderMoving => {
-                let path_points = sample_notch_perimeter(shape, 88);
+                let path_points = shape.rim_points();
                 let len = path_points.len();
                 if len >= 2 {
                     for i in 0..len - 1 {
@@ -724,7 +750,7 @@ impl Painter {
             }
 
             crate::config::NotificationGlowStyle::WavyRgbMoving => {
-                let path_points = sample_notch_perimeter(shape, 88);
+                let path_points = shape.rim_points();
                 let len = path_points.len();
                 if len >= 2 {
                     for i in 0..len - 1 {
@@ -1033,9 +1059,16 @@ impl Painter {
             if alpha <= 0.002 {
                 continue;
             }
+            // A fused slab's shadow starts below its shoulders; otherwise it
+            // fills the concave curves and smudges the very line they draw.
+            let top = if shape.fused() {
+                shape.top + shape.flare
+            } else {
+                shape.top - grow * 0.35
+            };
             let rect = D2D_RECT_F {
                 left: shape.left - grow,
-                top: shape.top - grow * 0.35,
+                top,
                 right: shape.right + grow,
                 // Shadow pools below the slab, as if lit from above.
                 bottom: shape.bottom + grow * 1.25,
@@ -3407,132 +3440,18 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgba {
     [r1 + m, g1 + m, b1 + m, 1.0]
 }
 
-/// Builds a smooth continuous Direct2D PathGeometry tracing the 3-sided outer border
-/// (left down, bottom-left curve, bottom across, bottom-right curve, right up)
-/// for any drain progress in [0.0, 1.0], returning the geometry and the leading tip coordinate.
-/// A quarter-circle corner arc, oriented so `point_at(0.0)` sits nearer the
-/// top of the shape and `point_at(1.0)` sits where the straight edge begins
-/// — the direction the 3-sided border is traced in, whether the corner is a
-/// concave bezel shoulder or a convex rounded corner.
-#[derive(Clone, Copy)]
-struct ArcCorner {
-    center: (f32, f32),
-    radius: f32,
-    theta_start: f32,
-    theta_end: f32,
-}
-
-impl ArcCorner {
-    fn point_at(&self, frac: f32) -> (f32, f32) {
-        let theta = self.theta_start - frac.clamp(0.0, 1.0) * (self.theta_start - self.theta_end);
-        (
-            self.center.0 + self.radius * theta.cos(),
-            self.center.1 + self.radius * theta.sin(),
-        )
-    }
-
-    fn start(&self) -> (f32, f32) {
-        self.point_at(0.0)
-    }
-
-    fn end(&self) -> (f32, f32) {
-        self.point_at(1.0)
-    }
-}
-
-/// The four corner arcs of the 3-sided border (top-left, bottom-left,
-/// bottom-right, top-right), matching `NotchShape::build`'s own corner
-/// geometry exactly — concave shoulder while fused to the bezel, rounded
-/// corner while detached, or `None` for a hard corner — so the glow border
-/// always hugs the real silhouette instead of cutting across the shoulder.
-fn notch_corners(
-    shape: &NotchShape,
-) -> (
-    Option<ArcCorner>,
-    Option<ArcCorner>,
-    Option<ArcCorner>,
-    Option<ArcCorner>,
-) {
-    use std::f32::consts::{FRAC_PI_2, PI};
-    let (l, t, r, b) = (shape.left, shape.top, shape.right, shape.bottom);
-    let limit = (shape.width().min(shape.height()) * 0.5).max(0.0);
-    let rt = shape.radius_top.clamp(0.0, limit);
-    let rb = shape.radius_bottom.clamp(0.0, limit);
-    let flare = shape.flare.clamp(0.0, (shape.height() * 0.5).max(0.0));
-
-    let top_left = if flare > 0.5 {
-        Some(ArcCorner {
-            center: (l, t),
-            radius: flare,
-            theta_start: PI,
-            theta_end: FRAC_PI_2,
-        })
-    } else if rt > 0.5 {
-        Some(ArcCorner {
-            center: (l + rt, t + rt),
-            radius: rt,
-            theta_start: PI + FRAC_PI_2,
-            theta_end: PI,
-        })
-    } else {
-        None
-    };
-
-    let top_right = if flare > 0.5 {
-        Some(ArcCorner {
-            center: (r, t),
-            radius: flare,
-            theta_start: FRAC_PI_2,
-            theta_end: 0.0,
-        })
-    } else if rt > 0.5 {
-        Some(ArcCorner {
-            center: (r - rt, t + rt),
-            radius: rt,
-            theta_start: 2.0 * PI,
-            theta_end: PI + FRAC_PI_2,
-        })
-    } else {
-        None
-    };
-
-    let bottom_left = if rb > 0.5 {
-        Some(ArcCorner {
-            center: (l + rb, b - rb),
-            radius: rb,
-            theta_start: PI,
-            theta_end: FRAC_PI_2,
-        })
-    } else {
-        None
-    };
-
-    let bottom_right = if rb > 0.5 {
-        Some(ArcCorner {
-            center: (r - rb, b - rb),
-            radius: rb,
-            theta_start: FRAC_PI_2,
-            theta_end: 0.0,
-        })
-    } else {
-        None
-    };
-
-    (top_left, bottom_left, bottom_right, top_right)
-}
-
 /// Builds a Direct2D path tracing the 3-sided outer border (left, bottom,
 /// right — the top is fused to the bezel or is the panel's own top edge, so
 /// it never gets a glow) for any drain progress in `[0.0, 1.0]`, returning
 /// the geometry and the leading tip coordinate. Walks the same perimeter
-/// samples `sample_notch_perimeter` produces as a polyline, so the two stay
+/// points `NotchShape::rim_points` produces as a polyline, so the two stay
 /// in sync and neither needs to reason about Direct2D arc sweep directions.
 fn build_3sided_border_geometry(
     factory: &ID2D1Factory,
     shape: &NotchShape,
     drain_fraction: f32,
 ) -> windows::core::Result<(ID2D1PathGeometry, (f32, f32))> {
-    let points = sample_notch_perimeter(shape, 0);
+    let points = shape.rim_points();
 
     let geometry = unsafe { factory.CreatePathGeometry()? };
     let sink = unsafe { geometry.Open()? };
@@ -3587,84 +3506,4 @@ fn build_3sided_border_geometry(
     }
 
     Ok((geometry, current_pt))
-}
-
-/// Sample points along the 3-sided outer border (left, bottom, right) of the
-/// notch, from the tip where the left edge meets the top — whether that's a
-/// concave bezel shoulder, a rounded corner, or a hard corner — all the way
-/// around to the matching tip on the right. Mirrors `NotchShape::build`'s
-/// corner geometry so the glow always hugs the real silhouette.
-fn sample_notch_perimeter(shape: &NotchShape, _step_count: usize) -> Vec<(f32, f32)> {
-    let (top_left, bottom_left, bottom_right, top_right) = notch_corners(shape);
-    let (l, t, r, b) = (shape.left, shape.top, shape.right, shape.bottom);
-
-    let corner_steps = 14;
-    let straight_steps = 18;
-    let bottom_steps = 36;
-
-    let sample_arc = |path: &mut Vec<(f32, f32)>, c: &ArcCorner| {
-        for i in 0..=corner_steps {
-            let f = i as f32 / corner_steps as f32;
-            path.push(c.point_at(f));
-        }
-    };
-
-    let mut path: Vec<(f32, f32)> = Vec::with_capacity(160);
-
-    // 1. Top-left shoulder / rounded corner / hard corner.
-    match &top_left {
-        Some(c) => sample_arc(&mut path, c),
-        None => path.push((l, t)),
-    }
-
-    // 2. Left edge straight down.
-    let left_from = top_left.map(|c| c.end()).unwrap_or((l, t));
-    let left_to = bottom_left.map(|c| c.start()).unwrap_or((l, b));
-    for i in 0..=straight_steps {
-        let f = i as f32 / straight_steps as f32;
-        path.push((
-            left_from.0 + (left_to.0 - left_from.0) * f,
-            left_from.1 + (left_to.1 - left_from.1) * f,
-        ));
-    }
-
-    // 3. Bottom-left corner.
-    if let Some(c) = &bottom_left {
-        sample_arc(&mut path, c);
-    }
-
-    // 4. Bottom edge across.
-    let bottom_from = bottom_left.map(|c| c.end()).unwrap_or((l, b));
-    let bottom_to = bottom_right.map(|c| c.start()).unwrap_or((r, b));
-    for i in 0..=bottom_steps {
-        let f = i as f32 / bottom_steps as f32;
-        path.push((
-            bottom_from.0 + (bottom_to.0 - bottom_from.0) * f,
-            bottom_from.1,
-        ));
-    }
-
-    // 5. Bottom-right corner.
-    if let Some(c) = &bottom_right {
-        sample_arc(&mut path, c);
-    }
-
-    // 6. Right edge straight up.
-    let right_from = bottom_right.map(|c| c.end()).unwrap_or((r, b));
-    let right_to = top_right.map(|c| c.start()).unwrap_or((r, t));
-    for i in 0..=straight_steps {
-        let f = i as f32 / straight_steps as f32;
-        path.push((
-            right_from.0 + (right_to.0 - right_from.0) * f,
-            right_from.1 + (right_to.1 - right_from.1) * f,
-        ));
-    }
-
-    // 7. Top-right shoulder / rounded corner / hard corner.
-    match &top_right {
-        Some(c) => sample_arc(&mut path, c),
-        None => path.push((r, t)),
-    }
-
-    path
 }

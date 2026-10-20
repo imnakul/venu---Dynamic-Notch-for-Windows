@@ -292,12 +292,15 @@ struct FrameKey {
     click_through_flash: f32,
     selected_notification: Option<u64>,
     capture_excluded: bool,
-    /// Local time, to the second.
+    /// Local time, to the second, while a Clock slide is on screen; zero
+    /// otherwise.
     clock: u64,
     /// Bumped by the media poller when what is playing actually changes.
     media: u64,
     /// Bumped by the notification centre on every change to it.
     notifications: u64,
+    /// Bumped by the `/usage` webhook.
+    usage: u64,
     /// Sample revision only while the Stats slide is active, so system
     /// telemetry does not create background work for unrelated slides.
     stats: u64,
@@ -540,18 +543,16 @@ impl NotchWindow {
         let collapsed_radius = (base_h * 0.5).min(20.0);
         let radius_bottom = lerp(collapsed_radius, theme::RADIUS_EXPANDED, t);
 
-        // Fused to the bezel: square top with concave shoulders. Detached or
-        // opening: the shoulders retract and the top corners round off.
+        // Fused to the bezel: square top with concave shoulders, open or shut.
+        // The shoulders grow with the panel so they stay in proportion;
+        // rounding the top corners off instead would leave two slivers of
+        // desktop between the panel and the screen edge. Detached: a plain
+        // floating panel rounded on all four corners.
         let attached = cfg.notch.offset_y <= 0;
-        let flare = if attached {
-            theme::FLARE * (1.0 - t).powf(1.6)
+        let (flare, radius_top) = if attached {
+            (lerp(theme::FLARE, theme::FLARE_EXPANDED, t), 0.0)
         } else {
-            0.0
-        };
-        let radius_top = if attached {
-            lerp(0.0, theme::RADIUS_EXPANDED, t)
-        } else {
-            radius_bottom
+            (0.0, radius_bottom)
         };
 
         NotchShape {
@@ -576,7 +577,10 @@ impl NotchWindow {
     /// open panel into every screenshot, even while the notch sat collapsed.
     fn visible_rect(&self, shape: &NotchShape) -> RECT {
         // +2 for the rounding either side of the fractional shape edges, with safety margin for neon bloom.
-        let reach = (theme::shadow_spread(self.state.expand.value) * 1.25 + 2.0).max(18.0);
+        // The shoulders stick out past the sides by their own reach.
+        let reach = (theme::shadow_spread(self.state.expand.value) * 1.25 + 2.0)
+            .max(shape.flare + 2.0)
+            .max(18.0);
 
         let left = (shape.left - reach).floor().max(0.0) as i32;
         let top = (shape.top - reach).floor().max(0.0) as i32;
@@ -816,23 +820,32 @@ impl NotchWindow {
         let expand = self.state.expand.value;
         let collapsed_visible = 1.0 - smoothstep(0.02, 0.30, expand) > 0.004;
         let expanded_alpha = smoothstep(0.42, 0.96, expand);
-        let expanded_visible = expanded_alpha > 0.004
-            && slides.iter().enumerate().any(|(index, slide)| {
-                *slide == SlideKind::Stats
-                    && (index as f32 - position).abs() <= 1.05
-                    && expanded_alpha
-                        * (1.0 - (index as f32 - position).abs())
-                            .clamp(0.0, 1.0)
-                            .powf(1.4)
-                        > 0.006
-            });
-        let collapsed_stats_visible = collapsed_visible
-            && slides.get(self.state.active) == Some(&SlideKind::Stats)
+        // Whether a slide of this kind contributes pixels to the open
+        // carousel, matching the painter's own fade so neither side guesses.
+        let expanded_shows = |kind: SlideKind| {
+            expanded_alpha > 0.004
+                && slides.iter().enumerate().any(|(index, slide)| {
+                    *slide == kind
+                        && (index as f32 - position).abs() <= 1.05
+                        && expanded_alpha
+                            * (1.0 - (index as f32 - position).abs())
+                                .clamp(0.0, 1.0)
+                                .powf(1.4)
+                            > 0.006
+                })
+        };
+        let collapsed_shows =
+            |kind: SlideKind| collapsed_visible && slides.get(self.state.active) == Some(&kind);
+
+        let collapsed_stats_visible = collapsed_shows(SlideKind::Stats)
             && crate::notch::notify::global_store()
                 .read()
                 .active_toast
                 .is_none();
-        let stats_visible = collapsed_stats_visible || expanded_visible;
+        let stats_visible = collapsed_stats_visible || expanded_shows(SlideKind::Stats);
+        // Only the Clock slide reads the time. Keying every frame on it
+        // repainted a collapsed notch once a second whatever it was showing.
+        let clock_visible = collapsed_shows(SlideKind::Clock) || expanded_shows(SlideKind::Clock);
         if stats_visible {
             crate::stats::request_sampling();
         }
@@ -859,9 +872,10 @@ impl NotchWindow {
             click_through_flash: self.state.click_through_flash,
             selected_notification: self.state.selected_notification_id,
             capture_excluded: self.capture_excluded,
-            clock: clock_key(),
+            clock: if clock_visible { clock_key() } else { 0 },
             media: self.painter.media.revision(),
             notifications: crate::notch::notify::global_store().read().revision(),
+            usage: crate::notch::notify::usage_revision(),
             stats: stats_revision,
         }
     }
