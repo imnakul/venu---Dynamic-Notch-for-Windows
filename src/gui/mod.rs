@@ -1316,7 +1316,7 @@ impl SettingsApp {
                 });
 
                 ui.add_space(16.0);
-                let column_rects = ui.columns(3, |columns| {
+                ui.columns(3, |columns| {
                     for (column, (label, value, hint)) in columns.iter_mut().zip(metrics) {
                         column.label(
                             RichText::new(label)
@@ -1355,23 +1355,7 @@ impl SettingsApp {
                             );
                         }
                     }
-                    columns
-                        .iter()
-                        .map(|column| column.max_rect())
-                        .collect::<Vec<_>>()
                 });
-                for index in 0..column_rects.len().saturating_sub(1) {
-                    let left = column_rects[index];
-                    let right = column_rects[index + 1];
-                    let x = (left.right() + right.left()) * 0.5;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(x, left.top() + 4.0),
-                            egui::pos2(x, left.bottom() - 4.0),
-                        ],
-                        Stroke::new(1.0_f32, theme::divider()),
-                    );
-                }
 
                 ui.add_space(13.0);
                 ui.separator();
@@ -3466,42 +3450,99 @@ impl SettingsApp {
         cfg: &mut AppConfig,
         changed: &mut bool,
     ) {
-        Self::row_stacked(ui, "Image", Some("PNG, JPG, BMP, GIF or WebP."), |ui| {
-            // Buttons first, in right-to-left, so the path field gets exactly
-            // the width that is actually left over. Subtracting a guessed
-            // button width is what pushed controls off the panel before.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(cfg.wallpaper.has_image(), egui::Button::new("Clear"))
-                    .clicked()
-                {
-                    cfg.wallpaper.path.clear();
-                    *changed = true;
-                }
-                if ui.button("Browse...").clicked() {
-                    if let Some(picked) =
-                        filedlg::pick_image(&cfg.wallpaper.path, "Choose a wallpaper")
-                    {
-                        cfg.wallpaper.path = picked;
-                        // A new picture invalidates the old framing.
-                        cfg.wallpaper.focus_x = 0.5;
-                        cfg.wallpaper.focus_y = 0.5;
-                        cfg.wallpaper.zoom = 1.0;
-                        *changed = true;
+        let panel_w = if cfg.wallpaper.panel_width > 0 {
+            cfg.wallpaper.panel_width
+        } else {
+            cfg.notch.expanded_width
+        } as f32;
+        let panel_h = if cfg.wallpaper.panel_height > 0 {
+            cfg.wallpaper.panel_height
+        } else {
+            cfg.notch.expanded_height
+        } as f32;
+
+        Self::row_stacked(
+            ui,
+            "Image",
+            Some(
+                "PNG, JPG, BMP, GIF or WebP. Drag the preview to choose which part the open \
+                 notch shows.",
+            ),
+            |ui| {
+                let wp = &mut cfg.wallpaper;
+                let has_image = wp.has_image();
+                ui.horizontal(|ui| {
+                    let label = if has_image {
+                        "Change image..."
+                    } else {
+                        "Browse for an image..."
+                    };
+                    let browse = egui::Button::new(RichText::new(label).color(theme::on_accent()))
+                        .fill(theme::accent());
+                    if ui.add(browse).clicked() {
+                        if let Some(picked) = filedlg::pick_image(&wp.path, "Choose a wallpaper") {
+                            wp.path = picked;
+                            // A new picture invalidates the old framing.
+                            wp.focus_x = 0.5;
+                            wp.focus_y = 0.5;
+                            wp.zoom = 1.0;
+                            *changed = true;
+                        }
                     }
-                }
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut cfg.wallpaper.path)
-                            .desired_width(ui.available_width())
-                            .hint_text("C:\\Users\\...\\reminder.jpg"),
-                    )
-                    .changed()
-                {
+                    if has_image {
+                        if ui.button("Remove").clicked() {
+                            wp.path.clear();
+                            *changed = true;
+                        }
+                        let name = std::path::Path::new(&wp.path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| wp.path.clone());
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(name)
+                                    .font(egui::FontId::monospace(11.0))
+                                    .color(theme::text_tertiary()),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(wp.path.as_str());
+                    }
+                });
+
+                ui.add_space(12.0);
+                if wallpaper::preview(
+                    ui,
+                    cache,
+                    wp,
+                    panel_w / panel_h.max(1.0),
+                    "No image yet. Browse for one to see it framed here.",
+                ) {
                     *changed = true;
                 }
-            });
-        });
+
+                if has_image {
+                    ui.add_space(10.0);
+                    *changed |= Self::slider_line(
+                        ui,
+                        "Zoom",
+                        egui::Slider::new(&mut wp.zoom, 1.0..=4.0)
+                            .fixed_decimals(2)
+                            .suffix("x"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add_space(SLIDER_LABEL_WIDTH);
+                        if ui.small_button("Reset framing").clicked() {
+                            wp.focus_x = 0.5;
+                            wp.focus_y = 0.5;
+                            wp.zoom = 1.0;
+                            *changed = true;
+                        }
+                    });
+                }
+            },
+        );
 
         Self::row_stacked(
             ui,
@@ -3516,59 +3557,6 @@ impl SettingsApp {
                     900,
                     changed,
                 );
-            },
-        );
-
-        let panel_w = if cfg.wallpaper.panel_width > 0 {
-            cfg.wallpaper.panel_width
-        } else {
-            cfg.notch.expanded_width
-        } as f32;
-        let panel_h = if cfg.wallpaper.panel_height > 0 {
-            cfg.wallpaper.panel_height
-        } else {
-            cfg.notch.expanded_height
-        } as f32;
-
-        Self::row_stacked(
-            ui,
-            "Framing",
-            Some("Drag to reposition. This is exactly what the open notch will show."),
-            |ui| {
-                if wallpaper::preview(
-                    ui,
-                    cache,
-                    &mut cfg.wallpaper,
-                    panel_w / panel_h.max(1.0),
-                    "Choose an image to see it framed here",
-                ) {
-                    *changed = true;
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Zoom")
-                            .size(12.0)
-                            .color(theme::text_secondary()),
-                    );
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut cfg.wallpaper.zoom, 1.0..=4.0)
-                                .fixed_decimals(2)
-                                .suffix("x"),
-                        )
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                    if ui.small_button("Reset").clicked() {
-                        cfg.wallpaper.focus_x = 0.5;
-                        cfg.wallpaper.focus_y = 0.5;
-                        cfg.wallpaper.zoom = 1.0;
-                        *changed = true;
-                    }
-                });
             },
         );
 

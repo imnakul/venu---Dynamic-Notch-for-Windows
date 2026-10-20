@@ -111,7 +111,7 @@ pub fn preview(
 
     // The preview is the panel, at panel aspect, as wide as the column allows.
     let avail_w = ui.available_width().max(80.0);
-    let width = avail_w.min(520.0);
+    let width = avail_w;
     let height = (width / panel_aspect.max(0.2)).clamp(80.0, 320.0);
 
     let (rect, response) =
