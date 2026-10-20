@@ -155,6 +155,9 @@ pub struct SettingsWindowConfig {
     pub glass: f32,
     /// Keep the window above others, like a floating palette.
     pub pinned: bool,
+    /// The one saturated colour in the window: switches, tabs, the selected
+    /// page, slider fills.
+    pub accent: [f32; 4],
 }
 
 impl SettingsWindowConfig {
@@ -167,6 +170,7 @@ impl Default for SettingsWindowConfig {
         Self {
             glass: 0.6,
             pinned: true,
+            accent: [0.463, 0.580, 0.980, 1.0],
         }
     }
 }

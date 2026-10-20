@@ -94,6 +94,100 @@ pub const WINDOW_SIZE: [f32; 2] = [940.0, 640.0];
 
 const SIDEBAR_WIDTH: f32 = 224.0;
 
+/// The label column of a [`SettingsApp::slider_line`]. Fixed, so every slider
+/// on a page starts at the same x whatever its label says.
+const SLIDER_LABEL_WIDTH: f32 = 72.0;
+
+/// Room left beside a slider for its value readout.
+const SLIDER_VALUE_WIDTH: f32 = 84.0;
+
+/// Width of a slider's value box. Fixed, so a page's sliders end on the same
+/// edge as its dropdowns and colour buttons.
+const SLIDER_VALUE_BOX: f32 = 76.0;
+
+/// Accents offered as one-click swatches. Anything else is one click further,
+/// in the full picker beside them.
+const ACCENT_PRESETS: [[f32; 4]; 8] = [
+    [0.463, 0.580, 0.980, 1.0], // periwinkle, the default
+    [0.220, 0.741, 0.973, 1.0], // cyan, the logo's
+    [0.204, 0.827, 0.600, 1.0], // mint
+    [0.639, 0.902, 0.208, 1.0], // lime
+    [0.984, 0.749, 0.141, 1.0], // amber
+    [0.976, 0.451, 0.086, 1.0], // orange
+    [0.957, 0.247, 0.369, 1.0], // rose
+    [0.659, 0.333, 0.969, 1.0], // violet
+];
+
+/// On/off switches in place of egui's checkboxes: a pill track that fills
+/// with the accent, and a round knob that slides across. Named so a call site
+/// reads like the checkbox it replaced.
+trait ToggleExt {
+    fn toggle(&mut self, on: &mut bool, label: impl Into<egui::WidgetText>) -> egui::Response;
+}
+
+impl ToggleExt for egui::Ui {
+    fn toggle(&mut self, on: &mut bool, label: impl Into<egui::WidgetText>) -> egui::Response {
+        let label: egui::WidgetText = label.into();
+        let track = Vec2::new(32.0, 18.0);
+        let galley = (!label.is_empty()).then(|| {
+            label.into_galley(
+                self,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Body,
+            )
+        });
+        let text_width = galley.as_ref().map_or(0.0, |g| g.size().x + 10.0);
+        let size = Vec2::new(track.x + text_width, track.y.max(20.0));
+        let (rect, mut response) = self.allocate_exact_size(size, Sense::click());
+        if response.clicked() {
+            *on = !*on;
+            response.mark_changed();
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, self.is_enabled(), *on, "")
+        });
+
+        let t = self.ctx().animate_bool_with_time(response.id, *on, 0.16);
+        let hover = response.hovered() && self.is_enabled();
+        let fade = if self.is_enabled() { 1.0 } else { 0.4 };
+        let track_rect = Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - track.y * 0.5),
+            track,
+        );
+        let off = if hover {
+            Color32::from_white_alpha(46)
+        } else {
+            Color32::from_white_alpha(32)
+        };
+        self.painter().rect_filled(
+            track_rect,
+            Rounding::same(track.y * 0.5),
+            lerp_color(off, theme::accent(), t).gamma_multiply(fade),
+        );
+        let radius = track.y * 0.5 - 2.5;
+        let x = egui::lerp(
+            (track_rect.left() + radius + 2.5)..=(track_rect.right() - radius - 2.5),
+            t,
+        );
+        self.painter().circle_filled(
+            egui::pos2(x, track_rect.center().y),
+            radius,
+            Color32::WHITE.gamma_multiply(fade),
+        );
+
+        if let Some(galley) = galley {
+            let pos = egui::pos2(
+                track_rect.right() + 10.0,
+                rect.center().y - galley.size().y * 0.5,
+            );
+            self.painter()
+                .galley(pos, galley, theme::text_primary().gamma_multiply(fade));
+        }
+        response
+    }
+}
+
 /// Rounding of the window's own corners, which Windows 11 applies; the hairline
 /// frame is drawn to match.
 const WINDOW_ROUNDING: f32 = 8.0;
@@ -478,6 +572,9 @@ impl SettingsApp {
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
         style.spacing.slider_width = 240.0;
         style.spacing.combo_width = 180.0;
+        // Numbers read in Geist Mono, so a column of values lines up digit for
+        // digit and a value that changes does not jitter its neighbours.
+        style.drag_value_text_style = egui::TextStyle::Monospace;
         // Nothing here is text to copy, and selectable labels would swallow
         // the drags that move the window by its title bar.
         style.interaction.selectable_labels = false;
@@ -503,7 +600,7 @@ impl SettingsApp {
     fn section_title(ui: &mut egui::Ui, title: &str) {
         ui.label(
             RichText::new(title)
-                .size(10.5)
+                .font(egui::FontId::monospace(10.5))
                 .color(theme::text_tertiary())
                 .strong(),
         );
@@ -534,8 +631,63 @@ impl SettingsApp {
             ui.label(RichText::new(h).size(11.0).color(theme::text_secondary()));
         }
         ui.add_space(8.0);
-        add_contents(ui);
+        ui.scope(|ui| {
+            // A slider under a heading runs the full width of the column, so
+            // the sliders on a page share both their edges.
+            ui.spacing_mut().interact_size.x = SLIDER_VALUE_BOX;
+            ui.spacing_mut().slider_width = (ui.available_width() - SLIDER_VALUE_WIDTH).max(160.0);
+            add_contents(ui);
+        });
         ui.add_space(18.0);
+    }
+
+    /// A round swatch for the accent chooser, ringed when it is the one in use.
+    fn accent_dot(ui: &mut egui::Ui, rgba: [f32; 4], picked: bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+        let color = Color32::from_rgb(
+            (rgba[0] * 255.0).round() as u8,
+            (rgba[1] * 255.0).round() as u8,
+            (rgba[2] * 255.0).round() as u8,
+        );
+        let ring = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("ring"), picked, 0.16);
+        let hover =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.1);
+        let center = rect.center();
+        // The swatch shrinks inside its ring when picked, so the ring reads as
+        // a setting rather than an outline.
+        ui.painter()
+            .circle_filled(center, 10.0 - 2.5 * ring + hover * 1.0, color);
+        if ring > 0.01 {
+            ui.painter().circle_stroke(
+                center,
+                12.0,
+                Stroke::new(1.6, Color32::WHITE.gamma_multiply(ring)),
+            );
+        }
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// One labelled slider on its own line: a short label in a fixed column,
+    /// then the slider filling the rest. Returns whether the value changed.
+    fn slider_line(ui: &mut egui::Ui, label: &str, slider: egui::Slider<'_>) -> bool {
+        ui.horizontal(|ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(SLIDER_LABEL_WIDTH, 20.0), Sense::hover());
+            ui.painter().text(
+                rect.left_center(),
+                Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                theme::text_secondary(),
+            );
+            ui.spacing_mut().interact_size.x = SLIDER_VALUE_BOX;
+            ui.spacing_mut().slider_width = (ui.available_width() - SLIDER_VALUE_WIDTH).max(120.0);
+            ui.add(slider).changed()
+        })
+        .inner
     }
 
     fn row_inline(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -771,7 +923,7 @@ impl SettingsApp {
                     ui.add_space(12.0);
                     ui.label(
                         RichText::new(page.group.label())
-                            .size(9.5)
+                            .font(egui::FontId::monospace(9.5))
                             .color(theme::text_tertiary())
                             .strong(),
                     );
@@ -887,8 +1039,7 @@ impl SettingsApp {
                             selected,
                             0.16,
                         );
-                        let color =
-                            lerp_color(theme::text_secondary(), theme::text_primary(), tone);
+                        let color = lerp_color(theme::text_secondary(), theme::on_accent(), tone);
                         ui.painter().text(
                             rect.center(),
                             Align2::CENTER_CENTER,
@@ -920,11 +1071,7 @@ impl SettingsApp {
                     );
                     ui.painter().set(
                         pill,
-                        egui::Shape::rect_filled(
-                            moved,
-                            Rounding::same(7.0),
-                            theme::surface_active(),
-                        ),
+                        egui::Shape::rect_filled(moved, Rounding::same(7.0), theme::accent()),
                     );
                 }
             });
@@ -1274,7 +1421,7 @@ impl SettingsApp {
         Self::section_title(ui, "SHOW IN THE NOTCH");
         let mut include_stats = cx.cfg.notch.slides.contains(&SlideKind::Stats);
         if ui
-            .checkbox(&mut include_stats, "Include Stats in the notch carousel")
+            .toggle(&mut include_stats, "Include Stats in the notch carousel")
             .changed()
         {
             cx.cfg.notch.set_stats_enabled(include_stats);
@@ -1283,7 +1430,7 @@ impl SettingsApp {
         let mut default_stats =
             cx.cfg.notch.default_collapsed == crate::config::CollapsedMode::Stats;
         if ui
-            .checkbox(&mut default_stats, "Rest on Stats when the notch closes")
+            .toggle(&mut default_stats, "Rest on Stats when the notch closes")
             .changed()
         {
             cx.cfg.notch.set_stats_default(default_stats);
@@ -1299,8 +1446,35 @@ impl SettingsApp {
     }
 
     fn tab_prefs_window(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "GLASS");
         let win = &mut cx.cfg.settings_window;
+
+        Self::section_title(ui, "ACCENT");
+        Self::row_stacked(
+            ui,
+            "Accent colour",
+            Some("Used for switches, tabs, sliders and the selected page."),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    for preset in ACCENT_PRESETS {
+                        if Self::accent_dot(ui, preset, win.accent == preset).clicked() {
+                            win.accent = preset;
+                            *cx.changed = true;
+                        }
+                    }
+                    ui.add_space(6.0);
+                    if color_picker::color_picker_button(ui, "Custom accent", &mut win.accent)
+                        .changed()
+                    {
+                        win.accent[3] = 1.0;
+                        *cx.changed = true;
+                    }
+                });
+            },
+        );
+
+        Self::divider(ui);
+        Self::section_title(ui, "GLASS");
         Self::row_stacked(
             ui,
             "Glass strength",
@@ -1313,7 +1487,11 @@ impl SettingsApp {
                 let mut pct = (win.glass * 100.0).round();
                 let floor = (crate::config::SettingsWindowConfig::MIN_GLASS * 100.0).round();
                 if ui
-                    .add(egui::Slider::new(&mut pct, floor..=100.0).suffix("%"))
+                    .add(
+                        egui::Slider::new(&mut pct, floor..=100.0)
+                            .fixed_decimals(0)
+                            .suffix("%"),
+                    )
                     .changed()
                 {
                     win.glass = pct / 100.0;
@@ -1326,7 +1504,7 @@ impl SettingsApp {
         Self::section_title(ui, "WINDOW");
         Self::row_inline(ui, "Float above other windows", |ui| {
             if ui
-                .checkbox(&mut win.pinned, "")
+                .toggle(&mut win.pinned, "")
                 .on_hover_text("Also on the pin button at the top of every page")
                 .changed()
             {
@@ -1362,7 +1540,7 @@ impl SettingsApp {
             |ui| {
                 let mut enabled = cx.cfg.launch_on_startup;
                 let check = ui
-                    .checkbox(&mut enabled, "Start with Windows")
+                    .toggle(&mut enabled, "Start with Windows")
                     .on_hover_text("Registers venu.exe under the per-user Run key");
                 if check.changed() {
                     let result = if enabled {
@@ -1501,27 +1679,32 @@ impl SettingsApp {
                 (cfg.colors.text_color[3] * 255.0) as u8,
             );
 
-            Frame::default()
-                .fill(bg_color)
-                .rounding(Rounding::same(6.0))
-                .inner_margin(Margin::symmetric(14.0, 6.0))
-                .show(ui, |ui| {
-                    ui.set_clip_rect(ui.max_rect());
-                    let spacing_str = " ".repeat(cfg.phrase_spacing as usize);
-                    let display_text =
-                        format!("{}{}{}{}", cfg.text, spacing_str, cfg.text, spacing_str);
+            // Painted rather than laid out: a label in a strip this short gets
+            // wrapped or clipped to a sliver, and the preview is only useful
+            // if the line reads as one line.
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+            ui.painter()
+                .rect_filled(rect, Rounding::same(6.0), bg_color);
 
-                    let mut text_rt = RichText::new(&display_text)
-                        .size(cfg.font.size.clamp(13.0, 22.0))
-                        .color(fg_color);
-                    if cfg.font.bold {
-                        text_rt = text_rt.strong();
-                    }
-                    if cfg.font.italic {
-                        text_rt = text_rt.italics();
-                    }
-                    ui.label(text_rt);
-                });
+            let spacing_str = " ".repeat(cfg.phrase_spacing as usize);
+            let display_text = format!("{}{}{}", cfg.text, spacing_str, cfg.text);
+            let mut text_rt = RichText::new(display_text)
+                .size(cfg.font.size.clamp(12.0, 18.0))
+                .color(fg_color);
+            if cfg.font.italic {
+                text_rt = text_rt.italics();
+            }
+            let galley = egui::WidgetText::from(text_rt).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Body,
+            );
+            let pos = egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y * 0.5);
+            ui.painter()
+                .with_clip_rect(rect.shrink2(Vec2::new(8.0, 0.0)))
+                .galley(pos, galley, fg_color);
         });
     }
 
@@ -1668,41 +1851,22 @@ impl SettingsApp {
             "Type Size",
             Some("Zero follows the built-in size for each state."),
             |ui| {
+                *changed |= Self::slider_line(
+                    ui,
+                    "Panel",
+                    egui::Slider::new(&mut cfg.marquee.font_size, 0.0..=120.0)
+                        .step_by(0.5)
+                        .custom_formatter(|v, _| Self::size_text(v)),
+                );
+                *changed |= Self::slider_line(
+                    ui,
+                    "Pill",
+                    egui::Slider::new(&mut cfg.marquee.pill_font_size, 0.0..=64.0)
+                        .step_by(0.5)
+                        .custom_formatter(|v, _| Self::size_text(v)),
+                );
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Panel")
-                            .size(12.0)
-                            .color(theme::text_secondary()),
-                    );
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut cfg.marquee.font_size)
-                                .range(0.0..=120.0)
-                                .speed(0.5)
-                                .custom_formatter(|v, _| Self::size_text(v)),
-                        )
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new("Pill")
-                            .size(12.0)
-                            .color(theme::text_secondary()),
-                    );
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut cfg.marquee.pill_font_size)
-                                .range(0.0..=64.0)
-                                .speed(0.5)
-                                .custom_formatter(|v, _| Self::size_text(v)),
-                        )
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                    ui.add_space(12.0);
+                    ui.add_space(SLIDER_LABEL_WIDTH);
                     if ui.small_button("Reset all").clicked() {
                         cfg.marquee = Default::default();
                         *changed = true;
@@ -1730,7 +1894,7 @@ impl SettingsApp {
     fn sec_edge_master(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "MASTER SWITCH");
         if ui
-            .checkbox(&mut cfg.overlay_enabled, "Show the edge marquee")
+            .toggle(&mut cfg.overlay_enabled, "Show the edge marquee")
             .changed()
         {
             *changed = true;
@@ -1746,18 +1910,18 @@ impl SettingsApp {
                 .num_columns(2)
                 .spacing([24.0, 10.0])
                 .show(ui, |ui| {
-                    if ui.checkbox(&mut cfg.edges.top, "Top").changed() {
+                    if ui.toggle(&mut cfg.edges.top, "Top").changed() {
                         *changed = true;
                     }
-                    if ui.checkbox(&mut cfg.edges.right, "Right").changed() {
+                    if ui.toggle(&mut cfg.edges.right, "Right").changed() {
                         *changed = true;
                     }
                     ui.end_row();
 
-                    if ui.checkbox(&mut cfg.edges.bottom, "Bottom").changed() {
+                    if ui.toggle(&mut cfg.edges.bottom, "Bottom").changed() {
                         *changed = true;
                     }
-                    if ui.checkbox(&mut cfg.edges.left, "Left").changed() {
+                    if ui.toggle(&mut cfg.edges.left, "Left").changed() {
                         *changed = true;
                     }
                     ui.end_row();
@@ -1784,58 +1948,16 @@ impl SettingsApp {
         );
         ui.add_space(10.0);
 
-        egui::Grid::new("padding_grid")
-            .num_columns(4)
-            .spacing([12.0, 10.0])
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Top")
-                        .size(12.0)
-                        .color(theme::text_secondary()),
-                );
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.padding.top).range(0..=800))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.label(
-                    RichText::new("Right")
-                        .size(12.0)
-                        .color(theme::text_secondary()),
-                );
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.padding.right).range(0..=800))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.end_row();
-
-                ui.label(
-                    RichText::new("Bottom")
-                        .size(12.0)
-                        .color(theme::text_secondary()),
-                );
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.padding.bottom).range(0..=800))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.label(
-                    RichText::new("Left")
-                        .size(12.0)
-                        .color(theme::text_secondary()),
-                );
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.padding.left).range(0..=800))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.end_row();
-            });
+        let pad = &mut cfg.padding;
+        for (label, value) in [
+            ("Top", &mut pad.top),
+            ("Right", &mut pad.right),
+            ("Bottom", &mut pad.bottom),
+            ("Left", &mut pad.left),
+        ] {
+            *changed |=
+                Self::slider_line(ui, label, egui::Slider::new(value, 0..=800).suffix(" px"));
+        }
     }
 
     fn sec_edge_type(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
@@ -1877,11 +1999,11 @@ impl SettingsApp {
         });
 
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut cfg.font.bold, "Bold").changed() {
+            if ui.toggle(&mut cfg.font.bold, "Bold").changed() {
                 *changed = true;
             }
             ui.add_space(16.0);
-            if ui.checkbox(&mut cfg.font.italic, "Italic").changed() {
+            if ui.toggle(&mut cfg.font.italic, "Italic").changed() {
                 *changed = true;
             }
         });
@@ -1922,7 +2044,7 @@ impl SettingsApp {
         });
 
         Self::row_inline(ui, "Reverse Direction", |ui| {
-            if ui.checkbox(&mut cfg.animation.reverse, "").changed() {
+            if ui.toggle(&mut cfg.animation.reverse, "").changed() {
                 *changed = true;
             }
         });
@@ -1933,7 +2055,7 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Always On Top", |ui| {
             if ui
-                .checkbox(&mut cfg.always_on_top, "")
+                .toggle(&mut cfg.always_on_top, "")
                 .on_hover_text("Keep the text border above all open windows")
                 .changed()
             {
@@ -1943,7 +2065,7 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Click-Through Mode", |ui| {
             if ui
-                .checkbox(&mut cfg.click_through, "")
+                .toggle(&mut cfg.click_through, "")
                 .on_hover_text("Allow mouse clicks to pass through the text border")
                 .changed()
             {
@@ -1955,7 +2077,7 @@ impl SettingsApp {
     fn sec_flash_master(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "MASTER SWITCH");
         if ui
-            .checkbox(&mut cfg.flash.enabled, "Show FlashScreen reminders")
+            .toggle(&mut cfg.flash.enabled, "Show FlashScreen reminders")
             .changed()
         {
             *changed = true;
@@ -2258,11 +2380,11 @@ impl SettingsApp {
         );
 
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut cfg.flash.font.bold, "Bold").changed() {
+            if ui.toggle(&mut cfg.flash.font.bold, "Bold").changed() {
                 *changed = true;
             }
             ui.add_space(16.0);
-            if ui.checkbox(&mut cfg.flash.font.italic, "Italic").changed() {
+            if ui.toggle(&mut cfg.flash.font.italic, "Italic").changed() {
                 *changed = true;
             }
         });
@@ -2343,7 +2465,7 @@ impl SettingsApp {
                     }
                     ui.add_space(14.0);
                     if ui
-                        .checkbox(&mut cfg.flash.shine, "Shine sweep")
+                        .toggle(&mut cfg.flash.shine, "Shine sweep")
                         .on_hover_text(
                             "After the text has appeared, a single wave crosses it from the \
                              left end to the right, roughly at reading pace. The Shine speed \
@@ -2540,7 +2662,7 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Always On Top", |ui| {
             if ui
-                .checkbox(&mut cfg.flash.always_on_top, "")
+                .toggle(&mut cfg.flash.always_on_top, "")
                 .on_hover_text("Keep the flash above all open windows")
                 .changed()
             {
@@ -2550,7 +2672,7 @@ impl SettingsApp {
 
         Self::row_inline(ui, "Click-Through Mode", |ui| {
             if ui
-                .checkbox(&mut cfg.flash.click_through, "")
+                .toggle(&mut cfg.flash.click_through, "")
                 .on_hover_text("Let clicks pass through the flash to whatever is underneath")
                 .changed()
             {
@@ -2561,21 +2683,21 @@ impl SettingsApp {
 
     fn sec_notch_basics(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         if ui
-            .checkbox(&mut cfg.notch.enabled, "Show the notch")
+            .toggle(&mut cfg.notch.enabled, "Show the notch")
             .changed()
         {
             *changed = true;
         }
         ui.add_space(6.0);
         if ui
-            .checkbox(&mut cfg.notch.always_on_top, "Keep above other windows")
+            .toggle(&mut cfg.notch.always_on_top, "Keep above other windows")
             .changed()
         {
             *changed = true;
         }
         ui.add_space(6.0);
         if ui
-            .checkbox(&mut cfg.notch.click_through, "Let clicks pass through")
+            .toggle(&mut cfg.notch.click_through, "Let clicks pass through")
             .on_hover_text(
                 "Clicks go to the window underneath instead of the notch. \
                  Hovering and the scroll wheel still work.",
@@ -2597,7 +2719,7 @@ impl SettingsApp {
         );
         ui.add_space(6.0);
         if ui
-            .checkbox(
+            .toggle(
                 &mut cfg.notch.scroll_to_switch,
                 "Scroll wheel changes slides",
             )
@@ -2636,7 +2758,7 @@ impl SettingsApp {
         Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
 
         if ui
-            .checkbox(
+            .toggle(
                 &mut cfg.notch.notifications.enabled,
                 "Enable Dynamic Notch notifications",
             )
@@ -2969,44 +3091,31 @@ impl SettingsApp {
     fn sec_notch_size(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "SIZE");
 
+        let n = &mut cfg.notch;
         Self::row_stacked(ui, "Collapsed", Some("The resting pill."), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("W").size(12.0).color(theme::text_secondary()));
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.notch.collapsed_width).range(60..=900))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.add_space(10.0);
-                ui.label(RichText::new("H").size(12.0).color(theme::text_secondary()));
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.notch.collapsed_height).range(18..=120))
-                    .changed()
-                {
-                    *changed = true;
-                }
-            });
+            *changed |= Self::slider_line(
+                ui,
+                "Width",
+                egui::Slider::new(&mut n.collapsed_width, 60..=900).suffix(" px"),
+            );
+            *changed |= Self::slider_line(
+                ui,
+                "Height",
+                egui::Slider::new(&mut n.collapsed_height, 18..=120).suffix(" px"),
+            );
         });
 
         Self::row_stacked(ui, "Expanded", Some("The panel it opens into."), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("W").size(12.0).color(theme::text_secondary()));
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.notch.expanded_width).range(320..=2200))
-                    .changed()
-                {
-                    *changed = true;
-                }
-                ui.add_space(10.0);
-                ui.label(RichText::new("H").size(12.0).color(theme::text_secondary()));
-                if ui
-                    .add(egui::DragValue::new(&mut cfg.notch.expanded_height).range(120..=900))
-                    .changed()
-                {
-                    *changed = true;
-                }
-            });
+            *changed |= Self::slider_line(
+                ui,
+                "Width",
+                egui::Slider::new(&mut n.expanded_width, 320..=2200).suffix(" px"),
+            );
+            *changed |= Self::slider_line(
+                ui,
+                "Height",
+                egui::Slider::new(&mut n.expanded_height, 120..=900).suffix(" px"),
+            );
         });
     }
 
@@ -3071,23 +3180,16 @@ impl SettingsApp {
             "Offset",
             Some("Y of 0 fuses the notch to the bezel; anything higher lets it float."),
             |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("X").size(12.0).color(theme::text_secondary()));
-                    if ui
-                        .add(egui::DragValue::new(&mut cfg.notch.offset_x).range(-2000..=2000))
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Y").size(12.0).color(theme::text_secondary()));
-                    if ui
-                        .add(egui::DragValue::new(&mut cfg.notch.offset_y).range(0..=1200))
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                });
+                *changed |= Self::slider_line(
+                    ui,
+                    "Sideways",
+                    egui::Slider::new(&mut cfg.notch.offset_x, -2000..=2000).suffix(" px"),
+                );
+                *changed |= Self::slider_line(
+                    ui,
+                    "Down",
+                    egui::Slider::new(&mut cfg.notch.offset_y, 0..=1200).suffix(" px"),
+                );
             },
         );
     }
@@ -3145,7 +3247,7 @@ impl SettingsApp {
         });
 
         if ui
-            .checkbox(&mut cfg.notch.clock_24h, "24-hour clock")
+            .toggle(&mut cfg.notch.clock_24h, "24-hour clock")
             .changed()
         {
             *changed = true;
@@ -3316,7 +3418,7 @@ impl SettingsApp {
         let mut remove: Option<usize> = None;
         for (i, item) in cfg.status.items.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                if ui.checkbox(&mut item.done, "").changed() {
+                if ui.toggle(&mut item.done, "").changed() {
                     *changed = true;
                 }
                 // Right-to-left so the button claims its own width first and
@@ -3514,33 +3616,18 @@ impl SettingsApp {
         max_h: u32,
         changed: &mut bool,
     ) {
+        *changed |= Self::slider_line(
+            ui,
+            "Width",
+            egui::Slider::new(width, 0..=max_w).custom_formatter(|v, _| Self::size_text(v)),
+        );
+        *changed |= Self::slider_line(
+            ui,
+            "Height",
+            egui::Slider::new(height, 0..=max_h).custom_formatter(|v, _| Self::size_text(v)),
+        );
         ui.horizontal(|ui| {
-            ui.label(RichText::new("W").size(12.0).color(theme::text_secondary()));
-            if ui
-                .add(
-                    egui::DragValue::new(width)
-                        .range(0..=max_w)
-                        .speed(2.0)
-                        .custom_formatter(|v, _| Self::size_text(v)),
-                )
-                .changed()
-            {
-                *changed = true;
-            }
-            ui.add_space(10.0);
-            ui.label(RichText::new("H").size(12.0).color(theme::text_secondary()));
-            if ui
-                .add(
-                    egui::DragValue::new(height)
-                        .range(0..=max_h)
-                        .speed(2.0)
-                        .custom_formatter(|v, _| Self::size_text(v)),
-                )
-                .changed()
-            {
-                *changed = true;
-            }
-            ui.add_space(12.0);
+            ui.add_space(SLIDER_LABEL_WIDTH);
             if ui.small_button("Match notch").clicked() {
                 *width = 0;
                 *height = 0;
@@ -3618,6 +3705,7 @@ impl eframe::App for SettingsApp {
         let palette = theme::Palette::glass(
             cfg_guard.settings_window.glass,
             self.blurred.unwrap_or(true),
+            cfg_guard.settings_window.accent,
         );
         theme::set(palette);
         if self.palette != Some(palette) {
@@ -3665,7 +3753,7 @@ impl eframe::App for SettingsApp {
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new(concat!("Venu ", env!("CARGO_PKG_VERSION")))
-                                .size(10.0)
+                                .font(egui::FontId::monospace(10.0))
                                 .color(theme::text_tertiary()),
                         );
                     });

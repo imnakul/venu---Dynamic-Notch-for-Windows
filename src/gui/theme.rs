@@ -54,8 +54,13 @@ impl Palette {
     /// The palette for a glass strength from 0 (clearest) to 1 (solid).
     ///
     /// `blurred` is false when Windows refused the blur. The desktop would
-    /// then show through sharp, so the glass is made solid instead.
-    pub fn glass(strength: f32, blurred: bool) -> Palette {
+    /// then show through sharp, so the glass is made solid instead. `accent`
+    /// is the user's colour, as straight RGBA.
+    pub fn glass(strength: f32, blurred: bool, accent: [f32; 4]) -> Palette {
+        let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let rgb = [byte(accent[0]), byte(accent[1]), byte(accent[2])];
+        // Dark type on a light accent, light type on a dark one.
+        let luma = 0.2126 * accent[0] + 0.7152 * accent[1] + 0.0722 * accent[2];
         let s = if blurred {
             strength.clamp(0.0, 1.0)
         } else {
@@ -80,9 +85,13 @@ impl Palette {
             // can be bright.
             text_secondary: Color32::from_rgb(178, 178, 190),
             text_tertiary: Color32::from_rgb(128, 128, 142),
-            accent: Color32::from_rgb(118, 148, 250),
-            accent_wash: tint([118, 148, 250], 0.20),
-            on_accent: Color32::from_rgb(10, 10, 14),
+            accent: Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+            accent_wash: tint(rgb, 0.22),
+            on_accent: if luma > 0.55 {
+                Color32::from_rgb(10, 10, 14)
+            } else {
+                Color32::WHITE
+            },
         }
     }
 }
@@ -91,7 +100,7 @@ thread_local! {
     /// The palette the accessors below report. Set once per frame, before any
     /// of the UI is built. Thread-local because eframe only ever builds the UI
     /// on one thread, and this avoids a lock on something read this often.
-    static CURRENT: Cell<Palette> = Cell::new(Palette::glass(0.6, true));
+    static CURRENT: Cell<Palette> = Cell::new(Palette::glass(0.6, true, [0.463, 0.580, 0.980, 1.0]));
 }
 
 /// Install the palette for this frame.
@@ -125,7 +134,7 @@ pub fn apply_style(ctx: &egui::Context, pal: Palette) {
     v.faint_bg_color = pal.surface;
     v.override_text_color = Some(pal.text_primary);
     v.hyperlink_color = pal.accent;
-    v.selection.bg_fill = pal.accent.gamma_multiply(0.85);
+    v.selection.bg_fill = pal.accent;
     v.selection.stroke = Stroke::new(1.0, pal.on_accent);
     v.slider_trailing_fill = true;
 
