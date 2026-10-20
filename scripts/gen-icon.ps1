@@ -1,51 +1,54 @@
-# Generates assets\venu.ico - the same procedural mark the app draws for its
-# window and tray icons (create_app_icon_data in src\main.rs), rasterised at
-# 256x256 and packed as a single PNG-compressed ICO entry.
+# Generates assets\venu.ico from assets\icon.png, the Venu logo (the same
+# transparent cut-out the website uses as its favicon).
 #
-# Run once from the repo root:  powershell -File scripts\gen-icon.ps1
+# The ICO carries one PNG-compressed entry per size Windows asks for — taskbar,
+# title bar, tray, Explorer at every DPI — each resampled from the 512px source
+# rather than leaving Windows to shrink the 256px one on the fly, which is what
+# makes small icons look soft.
+#
+# Run from the repo root after changing the logo:
+#   powershell -File scripts\gen-icon.ps1
 Add-Type -AssemblyName System.Drawing
 
-$grid = 32
-$scale = 8
-$size = $grid * $scale
+$root = Split-Path $PSScriptRoot -Parent
+$source = [System.Drawing.Image]::FromFile((Join-Path $root "assets\icon.png"))
+$sizes = 16, 20, 24, 32, 40, 48, 64, 96, 128, 256
 
-$bmp = New-Object System.Drawing.Bitmap($size, $size)
-$g = [System.Drawing.Graphics]::FromImage($bmp)
+$entries = foreach ($size in $sizes) {
+    $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+    $g.Clear([System.Drawing.Color]::Transparent)
+    $g.DrawImage($source, 0, 0, $size, $size)
+    $g.Dispose()
 
-$cyan = [System.Drawing.Color]::FromArgb(255, 56, 189, 248)
-$silver = [System.Drawing.Color]::FromArgb(255, 230, 230, 230)
-
-for ($y = 0; $y -lt $grid; $y++) {
-    for ($x = 0; $x -lt $grid; $x++) {
-        $isStroke = (($x -ge 4 -and $x -le 27 -and ($y -eq 4 -or $y -eq 5 -or $y -eq 26 -or $y -eq 27)) -or
-                     ($y -ge 4 -and $y -le 27 -and ($x -eq 4 -or $x -eq 5 -or $x -eq 26 -or $x -eq 27)))
-        if (-not $isStroke) { continue }
-
-        $isCorner = (($x -le 8 -or $x -ge 23) -and ($y -le 8 -or $y -ge 23))
-        $brush = New-Object System.Drawing.SolidBrush($(if ($isCorner) { $cyan } else { $silver }))
-        $g.FillRectangle($brush, $x * $scale, $y * $scale, $scale, $scale)
-        $brush.Dispose()
-    }
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    [pscustomobject]@{ Size = $size; Png = $ms.ToArray() }
 }
-$g.Dispose()
+$source.Dispose()
 
-# Encode the bitmap as PNG and wrap it in the ICO container:
-# ICONDIR (6 bytes) + one ICONDIRENTRY (16 bytes) + payload.
-$ms = New-Object System.IO.MemoryStream
-$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$png = $ms.ToArray()
-$bmp.Dispose()
-
+# ICONDIR (6 bytes), one ICONDIRENTRY (16 bytes) per size, then the payloads.
 $out = New-Object System.IO.MemoryStream
 $w = New-Object System.IO.BinaryWriter($out)
-$w.Write([UInt16]0); $w.Write([UInt16]1); $w.Write([UInt16]1)  # reserved, type=icon, count
-$w.Write([byte]0); $w.Write([byte]0)                           # 256x256 is written as 0
-$w.Write([byte]0); $w.Write([byte]0)                           # colours, reserved
-$w.Write([UInt16]1); $w.Write([UInt16]32)                      # planes, bpp
-$w.Write([UInt32]$png.Length); $w.Write([UInt32]22)            # payload size, payload offset
-$w.Write($png)
+$w.Write([UInt16]0); $w.Write([UInt16]1); $w.Write([UInt16]$entries.Count)  # reserved, type=icon, count
+
+$offset = 6 + 16 * $entries.Count
+foreach ($e in $entries) {
+    $dim = if ($e.Size -ge 256) { 0 } else { $e.Size }                   # 256 is written as 0
+    $w.Write([byte]$dim); $w.Write([byte]$dim)
+    $w.Write([byte]0); $w.Write([byte]0)                                 # colours, reserved
+    $w.Write([UInt16]1); $w.Write([UInt16]32)                            # planes, bpp
+    $w.Write([UInt32]$e.Png.Length); $w.Write([UInt32]$offset)           # payload size, offset
+    $offset += $e.Png.Length
+}
+foreach ($e in $entries) { $w.Write($e.Png) }
 $w.Flush()
 
-$dest = Join-Path (Split-Path $PSScriptRoot -Parent) "assets\venu.ico"
+$dest = Join-Path $root "assets\venu.ico"
 [System.IO.File]::WriteAllBytes($dest, $out.ToArray())
-Write-Host ("Wrote {0} ({1} bytes, 256x256 PNG entry)" -f $dest, $out.Length)
+Write-Host ("Wrote {0} ({1} bytes, sizes {2})" -f $dest, $out.Length, ($sizes -join ", "))

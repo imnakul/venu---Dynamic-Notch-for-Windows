@@ -44,47 +44,22 @@ use notch::NotchManager;
 use overlay::OverlayManager;
 use tray::SystemTray;
 
+/// The Venu logo, for the Settings window title bar and taskbar button.
+///
+/// Decoded from the same PNG that `scripts/gen-icon.ps1` builds the exe icon
+/// from, and scaled to 64px: large enough for the taskbar at 200% scaling,
+/// small enough not to hand winit a megabyte of pixels it would shrink anyway.
 fn create_app_icon_data() -> Option<egui::IconData> {
-    let width = 32;
-    let height = 32;
-    let mut rgba = vec![0u8; width * height * 4];
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) * 4;
-            let is_stroke = (x >= 4 && x <= 27 && (y == 4 || y == 5 || y == 26 || y == 27))
-                || (y >= 4 && y <= 27 && (x == 4 || x == 5 || x == 26 || x == 27));
-
-            let is_corner = (x <= 8 || x >= 23) && (y <= 8 || y >= 23);
-
-            if is_stroke {
-                if is_corner {
-                    // Cyan Accent Corners
-                    rgba[idx] = 56; // R
-                    rgba[idx + 1] = 189; // G
-                    rgba[idx + 2] = 248; // B
-                    rgba[idx + 3] = 255; // A
-                } else {
-                    // Minimal Crisp Silver Outline Stroke
-                    rgba[idx] = 230; // R
-                    rgba[idx + 1] = 230; // G
-                    rgba[idx + 2] = 230; // B
-                    rgba[idx + 3] = 255; // A
-                }
-            } else {
-                // Fully transparent interior
-                rgba[idx] = 0;
-                rgba[idx + 1] = 0;
-                rgba[idx + 2] = 0;
-                rgba[idx + 3] = 0;
-            }
-        }
-    }
-
+    const SIZE: u32 = 64;
+    let logo = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?;
+    let rgba = logo
+        .resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
+        .into_rgba8()
+        .into_raw();
     Some(egui::IconData {
         rgba,
-        width: width as u32,
-        height: height as u32,
+        width: SIZE,
+        height: SIZE,
     })
 }
 

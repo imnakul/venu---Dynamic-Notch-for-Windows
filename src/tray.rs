@@ -1,21 +1,18 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS,
-};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, FindWindowW, GetCursorPos, GetWindowLongPtrW, PostMessageW,
-    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu,
-    GWLP_USERDATA, HICON, ICONINFO, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, FindWindowW, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, LoadImageW,
+    PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    TrackPopupMenu, GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_STRING, SM_CXSMICON,
+    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
 };
 
 const WM_TRAY_ICON: u32 = WM_USER + 101;
@@ -55,92 +52,23 @@ pub struct SystemTray {
 unsafe impl Send for SystemTray {}
 unsafe impl Sync for SystemTray {}
 
+/// The Venu logo from the icon resource `build.rs` embeds in the exe (id 1),
+/// loaded at the shell's small-icon size so the tray picks the matching
+/// entry from `assets/venu.ico` at any display scaling instead of
+/// shrinking a large one.
 fn create_app_icon() -> windows::core::Result<HICON> {
-    let width: i32 = 32;
-    let height: i32 = 32;
-
+    const APP_ICON_ID: usize = 1;
     unsafe {
-        let mem_dc = CreateCompatibleDC(None);
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height, // Top-down DIB
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hcolor = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
-
-        if !bits.is_null() {
-            let pixel_slice =
-                std::slice::from_raw_parts_mut(bits as *mut u8, (width * height * 4) as usize);
-
-            for y in 0..height {
-                for x in 0..width {
-                    let idx = ((y * width + x) * 4) as usize;
-
-                    // Minimal, professional outline frame shape (2px stroke line)
-                    let is_stroke = (x >= 4 && x <= 27 && (y == 4 || y == 5 || y == 26 || y == 27))
-                        || (y >= 4 && y <= 27 && (x == 4 || x == 5 || x == 26 || x == 27));
-
-                    let is_corner = (x <= 8 || x >= 23) && (y <= 8 || y >= 23);
-
-                    if is_stroke {
-                        if is_corner {
-                            // Electric Cyan Accent Corners
-                            pixel_slice[idx] = 248; // B
-                            pixel_slice[idx + 1] = 189; // G
-                            pixel_slice[idx + 2] = 56; // R
-                            pixel_slice[idx + 3] = 255; // A
-                        } else {
-                            // Minimal Crisp Silver Outline Stroke
-                            pixel_slice[idx] = 230; // B
-                            pixel_slice[idx + 1] = 230; // G
-                            pixel_slice[idx + 2] = 230; // R
-                            pixel_slice[idx + 3] = 255; // A
-                        }
-                    } else {
-                        // Fully transparent interior
-                        pixel_slice[idx] = 0;
-                        pixel_slice[idx + 1] = 0;
-                        pixel_slice[idx + 2] = 0;
-                        pixel_slice[idx + 3] = 0;
-                    }
-                }
-            }
-        }
-
-        // Mask bitmap
-        let hmask = CreateDIBSection(
-            mem_dc,
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut std::ptr::null_mut(),
-            None,
-            0,
+        let instance = GetModuleHandleW(None)?;
+        let icon = LoadImageW(
+            instance,
+            PCWSTR(APP_ICON_ID as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
         )?;
-
-        let icon_info = ICONINFO {
-            fIcon: windows::Win32::Foundation::BOOL(1),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: hmask,
-            hbmColor: hcolor,
-        };
-
-        let hicon = CreateIconIndirect(&icon_info)?;
-
-        let _ = DeleteObject(hcolor);
-        let _ = DeleteObject(hmask);
-        let _ = DeleteDC(mem_dc);
-
-        Ok(hicon)
+        Ok(HICON(icon.0))
     }
 }
 
