@@ -70,7 +70,7 @@ pub struct NotchState {
     effect_wait: f32,
     /// What the schedule was last armed for, so picking another effect or
     /// pressing Preview starts a run immediately.
-    effect_armed: (BorderEffect, u32),
+    effect_armed: (BorderEffect, u32, bool),
 }
 
 impl NotchState {
@@ -100,6 +100,7 @@ impl NotchState {
             effect_armed: (
                 cfg.notch.border_effect.effect,
                 cfg.notch.border_effect.preview,
+                cfg.notch.border_effect.continuous,
             ),
         }
     }
@@ -108,7 +109,7 @@ impl NotchState {
     /// subtraction a tick; nothing is painted.
     fn tick_border_effect(&mut self, cfg: &AppConfig, dt: f32) {
         let fx = &cfg.notch.border_effect;
-        let armed = (fx.effect, fx.preview);
+        let armed = (fx.effect, fx.preview, fx.continuous);
         if armed != self.effect_armed {
             self.effect_armed = armed;
             self.effect_time = None;
@@ -121,7 +122,11 @@ impl NotchState {
 
         if let Some(time) = self.effect_time {
             let time = time + dt;
-            if time >= fx.duration_secs {
+            if fx.continuous {
+                // Wrap rather than stop; every effect starts and ends in the
+                // same place, so the seam does not show.
+                self.effect_time = Some(time % fx.duration_secs.max(0.1));
+            } else if time >= fx.duration_secs {
                 self.effect_time = None;
                 self.effect_wait =
                     fx.interval_secs.max(BorderEffectConfig::MIN_INTERVAL_SECS) as f32;
@@ -517,6 +522,19 @@ mod tests {
         cfg.notch.border_effect.preview += 1;
         run_for(&mut state, &cfg, EFFECT_FIRST_RUN + 0.05);
         assert!(state.effect_time.is_some());
+    }
+
+    #[test]
+    fn continuous_effect_loops_without_a_break() {
+        let mut cfg = effect_cfg(BorderEffect::Rainbow);
+        cfg.notch.border_effect.continuous = true;
+        let mut state = NotchState::new(&cfg);
+        run_for(&mut state, &cfg, EFFECT_FIRST_RUN + 0.05);
+        for _ in 0..20 {
+            run_for(&mut state, &cfg, 0.37);
+            let p = state.effect_progress(&cfg).expect("never stops");
+            assert!((0.0..1.0).contains(&p));
+        }
     }
 
     #[test]

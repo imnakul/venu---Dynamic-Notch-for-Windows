@@ -1,36 +1,31 @@
-//! The settings window's palette, and the machinery that lets it change.
+//! The settings window's palette.
+//!
+//! The window is glass: Windows blurs whatever is behind it (see
+//! [`super::glass`]) and every surface here is a translucent tint laid over
+//! that blur. One number — the user's glass strength — decides how much of
+//! the desktop shows through, and the whole palette is derived from it.
 //!
 //! Every colour in the settings UI comes from here rather than from a constant
-//! at the call site, which is what makes light mode possible at all: swap the
-//! [`Palette`] and the whole window follows. The accessors are free functions
-//! reading a thread-local, so a call site stays as short as a constant was.
-//!
-//! Because a `Palette` is nothing but `Color32`s, two of them can be blended.
-//! That is deliberate — switching theme cross-fades over a fifth of a second
-//! instead of snapping, which is the difference between the window changing
-//! and the window looking like it broke.
+//! at the call site. The accessors are free functions reading a thread-local,
+//! so a call site stays as short as a constant was.
 
 use std::cell::Cell;
 
-use eframe::egui::{self, Color32, Rounding, Stroke};
-
-use crate::config::UiTheme;
+use eframe::egui::{self, Color32, Rounding, Shadow, Stroke};
 
 /// Every tone the settings window is allowed to use.
 ///
-/// Kept flat and `Copy` on purpose: it is read dozens of times per frame and
-/// interpolated once, so an allocation anywhere in here would be a mistake.
+/// Kept flat and `Copy` on purpose: it is read dozens of times per frame, so
+/// an allocation anywhere in here would be a mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// True for the dark end of the blend. Only used to tell egui which set of
-    /// built-in defaults to start from.
-    pub dark: bool,
     /// The content area behind the pages.
     pub bg: Color32,
-    /// The navigation rail. A shade apart from `bg` so the two read as
-    /// separate planes rather than one wide field.
+    /// The navigation rail. A shade deeper than `bg` so the two read as
+    /// separate panes of the same glass.
     pub sidebar: Color32,
-    /// Controls: fields, buttons, cards.
+    /// Controls: fields, buttons, cards. A white film rather than a colour,
+    /// so it stays glass whatever is behind it.
     pub surface: Color32,
     /// The same, under the cursor.
     pub surface_hover: Color32,
@@ -38,6 +33,9 @@ pub struct Palette {
     pub surface_active: Color32,
     /// Hairlines and control outlines.
     pub divider: Color32,
+    /// Popups and menus. Nearly opaque: a list floating over glass over a
+    /// busy desktop is unreadable otherwise.
+    pub popup: Color32,
     /// Body copy and control labels.
     pub text_primary: Color32,
     /// Supporting copy.
@@ -46,81 +44,45 @@ pub struct Palette {
     pub text_tertiary: Color32,
     /// The one saturated colour in the window.
     pub accent: Color32,
-    /// A wash of the accent, for the selected navigation row.
+    /// A wash of the accent, for the selected navigation row and tab.
     pub accent_wash: Color32,
     /// Type that sits on top of a filled accent.
     pub on_accent: Color32,
 }
 
-/// Near-black, with a blue-leaning grey ladder so the greys never look muddy
-/// next to the accent.
-pub const DARK: Palette = Palette {
-    dark: true,
-    bg: Color32::from_rgb(16, 16, 20),
-    sidebar: Color32::from_rgb(10, 10, 13),
-    surface: Color32::from_rgb(24, 24, 30),
-    surface_hover: Color32::from_rgb(32, 32, 39),
-    surface_active: Color32::from_rgb(40, 40, 48),
-    divider: Color32::from_rgb(40, 40, 48),
-    text_primary: Color32::from_rgb(240, 240, 243),
-    text_secondary: Color32::from_rgb(150, 150, 160),
-    text_tertiary: Color32::from_rgb(104, 104, 116),
-    accent: Color32::from_rgb(110, 141, 249),
-    accent_wash: Color32::from_rgb(31, 34, 56),
-    on_accent: Color32::from_rgb(10, 10, 14),
-};
-
-/// Paper rather than pure white for the rail, so the content area is the
-/// brightest thing on screen and the eye lands there first.
-pub const LIGHT: Palette = Palette {
-    dark: false,
-    bg: Color32::from_rgb(255, 255, 255),
-    sidebar: Color32::from_rgb(244, 244, 247),
-    surface: Color32::from_rgb(247, 247, 250),
-    surface_hover: Color32::from_rgb(238, 238, 243),
-    surface_active: Color32::from_rgb(228, 228, 236),
-    divider: Color32::from_rgb(226, 226, 233),
-    text_primary: Color32::from_rgb(22, 22, 27),
-    text_secondary: Color32::from_rgb(96, 96, 108),
-    text_tertiary: Color32::from_rgb(140, 140, 152),
-    accent: Color32::from_rgb(59, 92, 224),
-    accent_wash: Color32::from_rgb(232, 236, 253),
-    on_accent: Color32::from_rgb(255, 255, 255),
-};
-
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let f = |x: u8, y: u8| {
-        (x as f32 + (y as f32 - x as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Color32::from_rgba_premultiplied(
-        f(a.r(), b.r()),
-        f(a.g(), b.g()),
-        f(a.b(), b.b()),
-        f(a.a(), b.a()),
-    )
-}
-
 impl Palette {
-    /// Blend two palettes. `t` of 0 is `a`, 1 is `b`.
-    pub fn lerp(a: Palette, b: Palette, t: f32) -> Palette {
+    /// The palette for a glass strength from 0 (clearest) to 1 (solid).
+    ///
+    /// `blurred` is false when Windows refused the blur. The desktop would
+    /// then show through sharp, so the glass is made solid instead.
+    pub fn glass(strength: f32, blurred: bool) -> Palette {
+        let s = if blurred {
+            strength.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let tint = |rgb: [u8; 3], alpha: f32| {
+            Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], (alpha * 255.0).round() as u8)
+        };
+        let film = |alpha: f32| Color32::from_white_alpha((alpha * 255.0).round() as u8);
+
+        let bg = 0.28 + 0.70 * s;
         Palette {
-            // Past the midpoint the blend is closer to `b`, and egui's own
-            // defaults should follow it rather than lag behind.
-            dark: if t < 0.5 { a.dark } else { b.dark },
-            bg: mix(a.bg, b.bg, t),
-            sidebar: mix(a.sidebar, b.sidebar, t),
-            surface: mix(a.surface, b.surface, t),
-            surface_hover: mix(a.surface_hover, b.surface_hover, t),
-            surface_active: mix(a.surface_active, b.surface_active, t),
-            divider: mix(a.divider, b.divider, t),
-            text_primary: mix(a.text_primary, b.text_primary, t),
-            text_secondary: mix(a.text_secondary, b.text_secondary, t),
-            text_tertiary: mix(a.text_tertiary, b.text_tertiary, t),
-            accent: mix(a.accent, b.accent, t),
-            accent_wash: mix(a.accent_wash, b.accent_wash, t),
-            on_accent: mix(a.on_accent, b.on_accent, t),
+            bg: tint([16, 16, 22], bg),
+            sidebar: tint([9, 9, 13], (bg + 0.14).min(1.0)),
+            surface: film(0.06),
+            surface_hover: film(0.10),
+            surface_active: film(0.15),
+            divider: film(0.09),
+            popup: tint([22, 22, 29], 0.97),
+            text_primary: Color32::from_rgb(244, 244, 247),
+            // A touch brighter than on an opaque panel: the glass behind them
+            // can be bright.
+            text_secondary: Color32::from_rgb(178, 178, 190),
+            text_tertiary: Color32::from_rgb(128, 128, 142),
+            accent: Color32::from_rgb(118, 148, 250),
+            accent_wash: tint([118, 148, 250], 0.20),
+            on_accent: Color32::from_rgb(10, 10, 14),
         }
     }
 }
@@ -129,7 +91,7 @@ thread_local! {
     /// The palette the accessors below report. Set once per frame, before any
     /// of the UI is built. Thread-local because eframe only ever builds the UI
     /// on one thread, and this avoids a lock on something read this often.
-    static CURRENT: Cell<Palette> = const { Cell::new(DARK) };
+    static CURRENT: Cell<Palette> = Cell::new(Palette::glass(0.6, true));
 }
 
 /// Install the palette for this frame.
@@ -137,51 +99,49 @@ pub fn set(pal: Palette) {
     CURRENT.with(|c| c.set(pal));
 }
 
-/// Which end of the blend the user asked for, resolving `System` against what
-/// Windows reports. Falls back to dark, which is what this app has always been.
-pub fn resolve(want: UiTheme, ctx: &egui::Context) -> bool {
-    match want {
-        UiTheme::Dark => true,
-        UiTheme::Light => false,
-        UiTheme::System => ctx
-            .system_theme()
-            .map(|t| t == egui::Theme::Dark)
-            .unwrap_or(true),
-    }
-}
-
 /// Push the palette into egui's own style, so stock widgets — checkboxes,
 /// sliders, combo boxes, scroll bars — are painted from it too.
 ///
-/// Only called when the palette actually changes, which during a theme
-/// cross-fade is every frame and the rest of the time is never.
+/// Only called when the palette actually changes, which is while the glass
+/// slider is being dragged and never otherwise.
 pub fn apply_style(ctx: &egui::Context, pal: Palette) {
     let mut style = (*ctx.style()).clone();
     let v = &mut style.visuals;
 
-    v.dark_mode = pal.dark;
-    v.window_fill = pal.bg;
+    *v = egui::Visuals::dark();
+    v.window_fill = pal.popup;
     v.panel_fill = pal.bg;
-    v.extreme_bg_color = pal.surface;
+    v.window_stroke = Stroke::new(1.0, pal.divider);
+    v.window_rounding = Rounding::same(10.0);
+    v.menu_rounding = Rounding::same(10.0);
+    v.window_shadow = Shadow {
+        offset: egui::vec2(0.0, 8.0),
+        blur: 24.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(110),
+    };
+    v.popup_shadow = v.window_shadow;
+    v.extreme_bg_color = Color32::from_black_alpha(70);
     v.faint_bg_color = pal.surface;
     v.override_text_color = Some(pal.text_primary);
     v.hyperlink_color = pal.accent;
-    v.selection.bg_fill = pal.accent;
+    v.selection.bg_fill = pal.accent.gamma_multiply(0.85);
     v.selection.stroke = Stroke::new(1.0, pal.on_accent);
+    v.slider_trailing_fill = true;
 
     v.widgets.noninteractive.bg_fill = pal.surface;
     v.widgets.noninteractive.weak_bg_fill = pal.surface;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.divider);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text_secondary);
-    v.widgets.inactive.bg_fill = pal.surface;
+    v.widgets.inactive.bg_fill = pal.surface_hover;
     v.widgets.inactive.weak_bg_fill = pal.surface;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.divider);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text_primary);
-    v.widgets.hovered.bg_fill = pal.surface_hover;
+    v.widgets.hovered.bg_fill = pal.surface_active;
     v.widgets.hovered.weak_bg_fill = pal.surface_hover;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.accent.linear_multiply(0.55));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.accent.gamma_multiply(0.55));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text_primary);
-    v.widgets.active.bg_fill = pal.surface_active;
+    v.widgets.active.bg_fill = pal.accent;
     v.widgets.active.weak_bg_fill = pal.surface_active;
     v.widgets.active.bg_stroke = Stroke::new(1.0, pal.accent);
     v.widgets.active.fg_stroke = Stroke::new(1.0, pal.text_primary);

@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use crate::config::{
     AppConfig, BorderEffect, BorderEffectConfig, FlashAnim, FlashBackground, FlashContent,
-    FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem, UiTheme,
+    FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem,
 };
 
 mod color_picker;
 mod filedlg;
 mod font_setup;
+mod glass;
 mod theme;
 mod wallpaper;
 
@@ -86,17 +87,23 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
     font_setup::setup_custom_fonts(ctx);
 }
 
-/// The things this app actually is, from the user's point of view: the
-/// notch, the border marquee, the flash screen, and the app itself. Every
-/// page belongs to one.
-///
-/// Grouping is the whole point of the rail. A flat list of a dozen tabs makes
-/// the reader scan; short lists make them recognise.
+/// The settings window's fixed size, in points. Big enough that the longest
+/// tab needs only a short scroll, small enough to float beside the notch
+/// without covering what is being tuned.
+pub const WINDOW_SIZE: [f32; 2] = [940.0, 640.0];
+
+const SIDEBAR_WIDTH: f32 = 224.0;
+
+/// Rounding of the window's own corners, which Windows 11 applies; the hairline
+/// frame is drawn to match.
+const WINDOW_ROUNDING: f32 = 8.0;
+
+/// The parts of the app, from the user's point of view. Every page belongs to
+/// one, and the rail shows them as labelled groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
     Notch,
-    Marquee,
-    Flash,
+    Screen,
     App,
 }
 
@@ -104,27 +111,47 @@ impl Group {
     fn label(self) -> &'static str {
         match self {
             Group::Notch => "NOTCH",
-            Group::Marquee => "EDGE MARQUEE",
-            Group::Flash => "FLASH SCREEN",
+            Group::Screen => "ON SCREEN",
             Group::App => "APP",
         }
     }
 }
 
-/// Everything the shell needs to know about one page of settings.
+/// The glyph drawn beside a page in the rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Notch,
+    Palette,
+    Layers,
+    Bell,
+    Monitor,
+    Bolt,
+    Gear,
+}
+
+/// One tab of a page: a short set of controls with a single purpose.
+struct Tab {
+    title: &'static str,
+    /// What someone might type to find this tab, beyond its title: the names
+    /// of the controls on it, and what people tend to call them.
+    keywords: &'static str,
+    draw: fn(&mut egui::Ui, &mut PageCtx<'_>),
+}
+
+/// One entry in the rail.
 ///
-/// This is the scalability story: a new feature is one entry in [`PAGES`] and
-/// one function. Nothing else in this file has to learn about it — not the
-/// rail, not the header, not the transition, not the scroll area.
+/// This is the scalability story: a new feature is one entry in [`PAGES`], or
+/// one more tab on a page, and one function. Nothing else — not the rail, the
+/// tab bar, search or the transitions — has to learn about it.
 struct Page {
     group: Group,
-    /// Shown in the rail and as the page's own heading.
     title: &'static str,
     /// One line under the heading saying what this page is for. Worth writing
-    /// properly: it is the only chance to explain a setting before the user
-    /// has to guess from its name.
+    /// properly: it is the only chance to explain a page before the user has
+    /// to guess from its name.
     blurb: &'static str,
-    draw: fn(&mut egui::Ui, &mut PageCtx<'_>),
+    icon: Icon,
+    tabs: &'static [Tab],
 }
 
 /// Everything a page is allowed to touch. Passed as one struct so adding a
@@ -141,119 +168,239 @@ struct PageCtx<'a> {
 const PAGES: &[Page] = &[
     Page {
         group: Group::Notch,
-        title: "Overview",
+        title: "General",
         blurb: "A pill fused to the top of your screen. Hover it and it springs open; scroll \
-                inside to move between slides; it collapses onto whichever slide you left it on.",
-        draw: SettingsApp::page_notch_overview,
+                inside to move between slides.",
+        icon: Icon::Notch,
+        tabs: &[
+            Tab {
+                title: "Behaviour",
+                keywords: "show notch enable on off keep above always on top click through \
+                           pass scroll wheel switch slides default collapsed face rest",
+                draw: SettingsApp::tab_notch_behaviour,
+            },
+            Tab {
+                title: "Size",
+                keywords: "width height collapsed expanded pill panel dimensions",
+                draw: SettingsApp::tab_notch_size,
+            },
+            Tab {
+                title: "Position",
+                keywords: "monitor display screen align left centre center right offset \
+                           placement",
+                draw: SettingsApp::tab_notch_position,
+            },
+        ],
+    },
+    Page {
+        group: Group::Notch,
+        title: "Appearance",
+        blurb: "How the notch looks: its finish, colours and type, and the border effects it \
+                plays on its own.",
+        icon: Icon::Palette,
+        tabs: &[
+            Tab {
+                title: "Style",
+                keywords: "theme surface dark light frosted transparent blurred acrylic glass \
+                           accent panel colour color font typeface 24-hour clock collapse delay",
+                draw: SettingsApp::tab_notch_style,
+            },
+            Tab {
+                title: "Border effects",
+                keywords: "rainbow rgb glass reflection shine sweep breathe glow animation \
+                           interval continuous loop duration preview",
+                draw: SettingsApp::tab_notch_effects,
+            },
+        ],
     },
     Page {
         group: Group::Notch,
         title: "Slides",
-        blurb: "Which faces the notch carries, and the order the wheel walks through them.",
-        draw: SettingsApp::page_notch_slides,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Stats",
-        blurb: "Whole-PC activity for the notch and the rest of your system.",
-        draw: SettingsApp::page_app_stats,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Status",
-        blurb: "What you are working on right now. One line, plus a short list — not a notes \
-                app and not a backlog.",
-        draw: SettingsApp::page_notch_status,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Wallpaper",
-        blurb: "One image you want put back in front of you now and then. Drag the preview to \
-                choose which part of it the panel shows.",
-        draw: SettingsApp::page_notch_wallpaper,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Moving Text",
-        blurb: "How the notch sizes itself while it is showing the moving text. Everything here \
-                is an override — leave it on auto and the slide follows the notch's own settings.",
-        draw: SettingsApp::page_notch_marquee,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Size & Place",
-        blurb: "How large the notch is when shut and when open, and where on which screen it \
-                sits.",
-        draw: SettingsApp::page_notch_layout,
-    },
-    Page {
-        group: Group::Notch,
-        title: "Appearance",
-        blurb: "Finish, accent and type for the notch itself.",
-        draw: SettingsApp::page_notch_look,
+        blurb: "The faces the notch carries, the order the scroll wheel walks through them, \
+                and what each one shows.",
+        icon: Icon::Layers,
+        tabs: &[
+            Tab {
+                title: "Carousel",
+                keywords: "slides order add remove reorder deck faces media clock usage",
+                draw: SettingsApp::tab_slides_carousel,
+            },
+            Tab {
+                title: "Status",
+                keywords: "focus heading one line task list on deck todo checklist",
+                draw: SettingsApp::tab_slides_status,
+            },
+            Tab {
+                title: "Wallpaper",
+                keywords: "image picture photo caption crop",
+                draw: SettingsApp::tab_slides_wallpaper,
+            },
+            Tab {
+                title: "Moving text",
+                keywords: "marquee scrolling text size override",
+                draw: SettingsApp::tab_slides_marquee,
+            },
+            Tab {
+                title: "Stats",
+                keywords: "cpu ram memory gpu power battery system usage monitor",
+                draw: SettingsApp::page_app_stats,
+            },
+        ],
     },
     Page {
         group: Group::Notch,
         title: "Notifications",
-        blurb: "Dynamic Notification Center. Filter allowed apps like Antigravity, Codex & Claude, and customize live alert toasts.",
-        draw: SettingsApp::page_notch_notifications,
+        blurb: "Alerts from the apps you allow open the notch into a short-lived toast.",
+        icon: Icon::Bell,
+        tabs: &[
+            Tab {
+                title: "General",
+                keywords: "enable dynamic notifications alerts toast",
+                draw: SettingsApp::tab_notif_general,
+            },
+            Tab {
+                title: "Apps",
+                keywords: "allowed apps whitelist antigravity codex claude cursor terminal \
+                           vs code slack discord program colours colors badge",
+                draw: SettingsApp::tab_notif_apps,
+            },
+            Tab {
+                title: "Alerts",
+                keywords: "toast duration alert border animation glow drain",
+                draw: SettingsApp::tab_notif_alerts,
+            },
+            Tab {
+                title: "Integration",
+                keywords: "webhook server port http post test alert clear",
+                draw: SettingsApp::tab_notif_integration,
+            },
+        ],
     },
     Page {
-        group: Group::Marquee,
-        title: "Overview",
+        group: Group::Screen,
+        title: "Edge Marquee",
         blurb: "Strips of scrolling text pinned to the edges of the screen. Separate from the \
                 notch, and switched on and off separately.",
-        draw: SettingsApp::page_edge_overview,
+        icon: Icon::Monitor,
+        tabs: &[
+            Tab {
+                title: "General",
+                keywords: "show edge marquee enable edges top right bottom left strip \
+                           thickness clearance margins padding",
+                draw: SettingsApp::tab_edge_general,
+            },
+            Tab {
+                title: "Message",
+                keywords: "text message presets spacing repeat gap",
+                draw: SettingsApp::tab_edge_message,
+            },
+            Tab {
+                title: "Style",
+                keywords: "font family size bold italic text colour color background",
+                draw: SettingsApp::tab_edge_style,
+            },
+            Tab {
+                title: "Motion",
+                keywords: "scroll speed reverse direction always on top click through",
+                draw: SettingsApp::tab_edge_motion,
+            },
+        ],
     },
     Page {
-        group: Group::Marquee,
-        title: "Message",
-        blurb: "The words that scroll, and how far apart the repeats sit.",
-        draw: SettingsApp::page_edge_message,
-    },
-    Page {
-        group: Group::Marquee,
-        title: "Appearance",
-        blurb: "Type and colour for the strips.",
-        draw: SettingsApp::page_edge_look,
-    },
-    Page {
-        group: Group::Marquee,
-        title: "Motion",
-        blurb: "How fast the text travels, which way, and how the strips behave against other \
-                windows.",
-        draw: SettingsApp::page_edge_motion,
-    },
-    Page {
-        group: Group::Flash,
-        title: "FlashScreen",
-        blurb: "Every few minutes, for a few seconds, a line of text or an image appears in the \
-                middle of the screen — then leaves on its own. Nothing to dismiss, nothing to \
-                forget.",
-        draw: SettingsApp::page_flashscreen,
+        group: Group::Screen,
+        title: "Flash Screen",
+        blurb: "Every so often, a line of text or an image appears in the middle of the \
+                screen for a few seconds, then leaves on its own.",
+        icon: Icon::Bolt,
+        tabs: &[
+            Tab {
+                title: "General",
+                keywords: "enable flashscreen reminders schedule interval every duration \
+                           monitor always on top click through",
+                draw: SettingsApp::tab_flash_general,
+            },
+            Tab {
+                title: "Content",
+                keywords: "text image quote what appears message",
+                draw: SettingsApp::tab_flash_content,
+            },
+            Tab {
+                title: "Style",
+                keywords: "font type size bold italic colour color shine sweep background \
+                           backdrop dim",
+                draw: SettingsApp::tab_flash_style,
+            },
+            Tab {
+                title: "Animation",
+                keywords: "animation enter exit fade zoom slide speed",
+                draw: SettingsApp::tab_flash_animation,
+            },
+        ],
     },
     Page {
         group: Group::App,
         title: "Preferences",
-        blurb: "The settings window itself, and where your settings are kept.",
-        draw: SettingsApp::page_app_prefs,
+        blurb: "The settings window itself, starting with Windows, and where your settings \
+                are kept.",
+        icon: Icon::Gear,
+        tabs: &[
+            Tab {
+                title: "Window",
+                keywords: "glass blur transparency strength frosted opacity pin always on top \
+                           floating",
+                draw: SettingsApp::tab_prefs_window,
+            },
+            Tab {
+                title: "Startup",
+                keywords: "launch on startup sign in autostart boot",
+                draw: SettingsApp::tab_prefs_startup,
+            },
+            Tab {
+                title: "Storage",
+                keywords: "settings file path config json copy",
+                draw: SettingsApp::tab_prefs_storage,
+            },
+        ],
     },
 ];
+
+/// Every tab whose title, page or keywords contain all the words of `query`,
+/// as `(page, tab)` indices, in rail order.
+fn search(query: &str) -> Vec<(usize, usize)> {
+    let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (p, page) in PAGES.iter().enumerate() {
+        for (t, tab) in page.tabs.iter().enumerate() {
+            let hay = format!("{} {} {}", page.title, tab.title, tab.keywords).to_lowercase();
+            if terms.iter().all(|term| hay.contains(term.as_str())) {
+                hits.push((p, t));
+            }
+        }
+    }
+    hits
+}
 
 pub struct SettingsApp {
     config: Arc<RwLock<AppConfig>>,
     temp_text: String,
     /// Index into [`PAGES`].
     active: usize,
-    /// Runs 0 to 1 while a page slides in. Held at 1 the rest of the time, so
-    /// a settled window does no animation work at all.
+    /// The open tab of every page, so coming back to a page lands on the tab
+    /// it was left on.
+    tabs: Vec<usize>,
+    /// Runs 0 to 1 while content slides in. Held at 1 the rest of the time,
+    /// so a settled window does no animation work at all.
     slide: f32,
-    /// Which way the incoming page travels: down the rail is +1, up is -1.
-    /// Direction is what makes the movement mean something rather than just
-    /// being decoration.
-    slide_dir: f32,
+    /// Where incoming content travels from, as a unit direction. A new tab
+    /// comes in sideways, from the side it sits on in the tab bar; a new page
+    /// rises from below. Direction is what makes the movement a small map
+    /// rather than decoration.
+    slide_from: Vec2,
     /// The palette in force last frame. The style is only rebuilt when this
-    /// changes, which is during a theme cross-fade and never otherwise.
+    /// changes, which is while the glass slider moves and never otherwise.
     palette: Option<theme::Palette>,
     /// Decoded wallpaper, kept between frames so the preview does not re-read
     /// the file sixty times a second.
@@ -261,6 +408,12 @@ pub struct SettingsApp {
     /// Whether the window is on screen. Venu is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
+    /// The search box. Non-empty, the rail lists matching tabs instead.
+    query: String,
+    /// `None` until the window exists and the blur has been asked for; then
+    /// whether Windows agreed to it.
+    blurred: Option<bool>,
+    logo: Option<egui::TextureHandle>,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -299,6 +452,16 @@ fn flash_interval_text(v: f64) -> String {
     }
 }
 
+/// The logo for the rail, decoded once at a size that stays crisp at 200%.
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(include_bytes!("../../assets/icon.png")).ok()?;
+    let image = image
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let pixels = egui::ColorImage::from_rgba_unmultiplied([64, 64], image.as_raw());
+    Some(ctx.load_texture("venu_logo", pixels, egui::TextureOptions::LINEAR))
+}
+
 impl SettingsApp {
     /// `on_screen` is false when Venu was started into the tray, which is what
     /// the sign-in entry does.
@@ -311,9 +474,13 @@ impl SettingsApp {
         setup_custom_fonts(&cc.egui_ctx);
 
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals.window_rounding = Rounding::same(10.0);
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
+        style.spacing.slider_width = 240.0;
+        style.spacing.combo_width = 180.0;
+        // Nothing here is text to copy, and selectable labels would swallow
+        // the drags that move the window by its title bar.
+        style.interaction.selectable_labels = false;
         cc.egui_ctx.set_style(style);
 
         let current_text = config.read().text.clone();
@@ -321,18 +488,22 @@ impl SettingsApp {
             config,
             temp_text: current_text,
             active: 0,
+            tabs: vec![0; PAGES.len()],
             slide: 1.0,
-            slide_dir: 1.0,
+            slide_from: Vec2::ZERO,
             palette: None,
             preview: wallpaper::PreviewCache::new(),
             on_screen,
+            query: String::new(),
+            blurred: None,
+            logo: load_logo(&cc.egui_ctx),
         }
     }
 
     fn section_title(ui: &mut egui::Ui, title: &str) {
         ui.label(
             RichText::new(title)
-                .size(11.0)
+                .size(10.5)
                 .color(theme::text_tertiary())
                 .strong(),
         );
@@ -340,9 +511,15 @@ impl SettingsApp {
     }
 
     fn divider(ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(14.0);
+        ui.add_space(6.0);
+        let width = ui.available_width();
+        let (line, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), Sense::hover());
+        ui.painter().hline(
+            line.x_range(),
+            line.center().y,
+            Stroke::new(1.0, theme::divider()),
+        );
+        ui.add_space(16.0);
     }
 
     fn row_stacked(
@@ -371,181 +548,530 @@ impl SettingsApp {
         ui.add_space(12.0);
     }
 
-    /// The navigation rail.
-    ///
-    /// The selected row is painted as one pill that *slides* between rows
-    /// rather than being redrawn in place. That is why the pill's shape is
-    /// reserved before the loop and filled in after: its resting place is not
-    /// known until every row has been laid out, but it has to be painted
-    /// underneath the labels.
-    fn draw_nav(ui: &mut egui::Ui, active: &mut usize) {
-        let pill = ui.painter().add(egui::Shape::Noop);
-        let bar = ui.painter().add(egui::Shape::Noop);
-        let mut target: Option<Rect> = None;
+    // -- chrome ----------------------------------------------------------
 
-        let mut group: Option<Group> = None;
-        for (index, page) in PAGES.iter().enumerate() {
-            if group != Some(page.group) {
-                ui.add_space(if group.is_some() { 16.0 } else { 2.0 });
-                ui.label(
-                    RichText::new(page.group.label())
-                        .size(9.5)
-                        .color(theme::text_tertiary())
-                        .strong(),
-                );
-                ui.add_space(7.0);
-                group = Some(page.group);
-            }
-
-            let selected = *active == index;
-            let width = ui.available_width();
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
-
-            if selected {
-                target = Some(rect);
-            } else {
-                // A wash that fades rather than snaps. Nobody will notice it;
-                // they would notice its absence as the rail feeling brittle.
-                let hover = ui.ctx().animate_bool_with_time(
-                    response.id.with("hover"),
-                    response.hovered(),
-                    0.11,
-                );
-                if hover > 0.001 {
-                    ui.painter().rect_filled(
-                        rect,
-                        Rounding::same(8.0),
-                        theme::surface_hover().gamma_multiply(hover),
-                    );
-                }
-            }
-
-            // Press feedback. A row that does not move under the finger feels
-            // like it did not hear the click.
-            let sink = if response.is_pointer_button_down_on() {
-                1.0
-            } else {
-                0.0
-            };
-
-            let item_color = if selected {
-                theme::accent()
-            } else {
-                theme::text_secondary()
-            };
-
-            let icon_pos = rect.left_center() + Vec2::new(14.0 + sink, 0.0);
-            paint_sidebar_hugeicon(ui.painter(), page.group, page.title, icon_pos, item_color);
-
-            ui.painter().text(
-                rect.left_center() + Vec2::new(30.0 + sink, 0.0),
-                Align2::LEFT_CENTER,
-                page.title,
-                egui::FontId::proportional(13.0),
-                item_color,
-            );
-
-            if response.clicked() {
-                *active = index;
-            }
-
-            ui.add_space(1.0);
+    /// Logo and name at the top of the rail. Also a handle: the window has no
+    /// system title bar, so this and the page header are what move it.
+    fn draw_brand(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 36.0),
+            Sense::click_and_drag(),
+        );
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        if let Some(target) = target {
-            // Only the vertical position is animated: the rows are all the
-            // same width and height, so nothing else has anywhere to travel.
-            let y = ui
-                .ctx()
-                .animate_value_with_time(egui::Id::new("nav_pill"), target.top(), 0.18);
-            let moved = Rect::from_min_size(egui::pos2(target.left(), y), target.size());
-
-            ui.painter().set(
-                pill,
-                egui::Shape::rect_filled(moved, Rounding::same(8.0), theme::accent_wash()),
+        let mark = Rect::from_min_size(
+            rect.left_center() - Vec2::new(-4.0, 13.0),
+            Vec2::splat(26.0),
+        );
+        if let Some(logo) = logo {
+            ui.painter().image(
+                logo.id(),
+                mark,
+                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
             );
-            ui.painter().set(
-                bar,
+        }
+        let text_x = mark.right() + 10.0;
+        ui.painter().text(
+            egui::pos2(text_x, rect.center().y - 7.0),
+            Align2::LEFT_CENTER,
+            "Venu",
+            egui::FontId::proportional(14.5),
+            theme::text_primary(),
+        );
+        ui.painter().text(
+            egui::pos2(text_x, rect.center().y + 9.0),
+            Align2::LEFT_CENTER,
+            "Settings",
+            egui::FontId::proportional(11.0),
+            theme::text_tertiary(),
+        );
+    }
+
+    /// The search box. Typing filters the rail down to the tabs that match.
+    fn draw_search(ui: &mut egui::Ui, query: &mut String, id: egui::Id) {
+        let height = 32.0;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        let focused = ui.memory(|m| m.has_focus(id));
+        let ring = ui
+            .ctx()
+            .animate_bool_with_time(id.with("ring"), focused, 0.14);
+
+        ui.painter().rect(
+            rect,
+            Rounding::same(8.0),
+            Color32::from_black_alpha(45),
+            Stroke::new(
+                1.0,
+                lerp_color(
+                    Color32::from_white_alpha(12),
+                    theme::accent().gamma_multiply(0.8),
+                    ring,
+                ),
+            ),
+        );
+        paint_glyph(
+            ui.painter(),
+            Glyph::Search,
+            rect.left_center() + Vec2::new(14.0, 0.0),
+            theme::text_tertiary(),
+        );
+
+        let field = Rect::from_min_max(
+            rect.left_top() + Vec2::new(28.0, 0.0),
+            rect.right_bottom() - Vec2::new(if query.is_empty() { 8.0 } else { 28.0 }, 0.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(field)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        child.add(
+            egui::TextEdit::singleline(query)
+                .id(id)
+                .hint_text(RichText::new("Search settings").color(theme::text_tertiary()))
+                .frame(false)
+                .desired_width(field.width())
+                .font(egui::FontId::proportional(12.5))
+                .margin(Margin::symmetric(2.0, 0.0)),
+        );
+
+        if !query.is_empty() {
+            let clear = Rect::from_center_size(
+                rect.right_center() - Vec2::new(15.0, 0.0),
+                Vec2::splat(20.0),
+            );
+            let response = ui.interact(clear, id.with("clear"), Sense::click());
+            let tone = if response.hovered() {
+                theme::text_primary()
+            } else {
+                theme::text_tertiary()
+            };
+            paint_glyph(ui.painter(), Glyph::Close, clear.center(), tone);
+            if response.clicked() {
+                query.clear();
+            }
+        }
+    }
+
+    /// One row of the rail: icon, label, hover wash and press feedback.
+    /// Returns the row's rect and whether it was clicked. The selection pill
+    /// is not drawn here; it glides between rows and is painted by the caller.
+    fn rail_row(
+        ui: &mut egui::Ui,
+        icon: Option<Icon>,
+        label: &str,
+        detail: Option<&str>,
+        selected: bool,
+    ) -> (Rect, bool) {
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+
+        if !selected {
+            // A wash that fades rather than snaps. Nobody will notice it;
+            // they would notice its absence as the rail feeling brittle.
+            let hover = ui.ctx().animate_bool_with_time(
+                response.id.with("hover"),
+                response.hovered(),
+                0.11,
+            );
+            if hover > 0.001 {
+                ui.painter().rect_filled(
+                    rect,
+                    Rounding::same(8.0),
+                    theme::surface().gamma_multiply(hover),
+                );
+            }
+        }
+
+        // Press feedback. A row that does not move under the finger feels
+        // like it did not hear the click.
+        let sink = if response.is_pointer_button_down_on() {
+            1.0
+        } else {
+            0.0
+        };
+        let tone = if selected {
+            theme::text_primary()
+        } else {
+            theme::text_secondary()
+        };
+
+        let mut x = rect.left() + 12.0 + sink;
+        if let Some(icon) = icon {
+            let glyph_tone = if selected { theme::accent() } else { tone };
+            paint_icon(
+                ui.painter(),
+                icon,
+                egui::pos2(x + 2.0, rect.center().y),
+                glyph_tone,
+            );
+            x += 20.0;
+        }
+        let galley =
+            ui.painter()
+                .layout_no_wrap(label.to_owned(), egui::FontId::proportional(13.0), tone);
+        let label_width = galley.size().x;
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - galley.size().y * 0.5),
+            galley,
+            tone,
+        );
+        if let Some(detail) = detail {
+            ui.painter().text(
+                egui::pos2(x + label_width + 8.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                detail,
+                egui::FontId::proportional(11.0),
+                theme::text_tertiary(),
+            );
+        }
+
+        ui.add_space(1.0);
+        (rect, response.clicked())
+    }
+
+    /// Paint the rail's selection pill at `target`, gliding from wherever it
+    /// was. Only the vertical position moves: rows are all one size.
+    fn paint_rail_pill(ui: &egui::Ui, pill: egui::layers::ShapeIdx, target: Rect, key: &str) {
+        let y = ui
+            .ctx()
+            .animate_value_with_time(egui::Id::new(key), target.top(), 0.2);
+        let moved = Rect::from_min_size(egui::pos2(target.left(), y), target.size());
+        ui.painter().set(
+            pill,
+            egui::Shape::Vec(vec![
+                egui::Shape::rect_filled(moved, Rounding::same(8.0), theme::accent_wash()),
                 egui::Shape::rect_filled(
                     Rect::from_min_size(
-                        moved.left_top() + Vec2::new(0.0, 7.0),
-                        Vec2::new(2.5, moved.height() - 14.0),
+                        moved.left_top() + Vec2::new(0.0, 8.0),
+                        Vec2::new(2.5, moved.height() - 16.0),
                     ),
                     Rounding::same(2.0),
                     theme::accent(),
                 ),
-            );
+            ]),
+        );
+    }
+
+    /// The navigation rail: pages under their group headings.
+    fn draw_nav(ui: &mut egui::Ui, active: usize) -> Option<usize> {
+        let pill = ui.painter().add(egui::Shape::Noop);
+        let mut target = None;
+        let mut picked = None;
+
+        let mut group: Option<Group> = None;
+        for (index, page) in PAGES.iter().enumerate() {
+            if group != Some(page.group) {
+                ui.add_space(if group.is_some() { 14.0 } else { 0.0 });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(page.group.label())
+                            .size(9.5)
+                            .color(theme::text_tertiary())
+                            .strong(),
+                    );
+                });
+                ui.add_space(4.0);
+                group = Some(page.group);
+            }
+
+            let selected = active == index;
+            let (rect, clicked) = Self::rail_row(ui, Some(page.icon), page.title, None, selected);
+            if selected {
+                target = Some(rect);
+            }
+            if clicked {
+                picked = Some(index);
+            }
         }
+
+        if let Some(target) = target {
+            Self::paint_rail_pill(ui, pill, target, "nav_pill");
+        }
+        picked
     }
 
-    /// The heading every page opens with. Uniform on purpose: the reader
-    /// should be able to tell where they are without reading, by shape alone.
-    fn page_header(ui: &mut egui::Ui, page: &Page) {
-        ui.label(
-            RichText::new(page.title)
-                .size(19.0)
-                .color(theme::text_primary())
+    /// The rail while searching: one row per matching tab.
+    fn draw_results(ui: &mut egui::Ui, query: &str) -> Option<(usize, usize)> {
+        let hits = search(query);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(match hits.len() {
+                    0 => "NO RESULTS".to_owned(),
+                    1 => "1 RESULT".to_owned(),
+                    n => format!("{n} RESULTS"),
+                })
+                .size(9.5)
+                .color(theme::text_tertiary())
                 .strong(),
-        );
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new(page.blurb)
-                .size(11.5)
-                .color(theme::text_secondary()),
-        );
-        ui.add_space(6.0);
-        let rect = ui.max_rect();
-        let (line, _) = ui.allocate_exact_size(Vec2::new(rect.width(), 1.0), Sense::hover());
-        ui.painter().hline(
-            line.x_range(),
-            line.center().y,
-            Stroke::new(1.0, theme::divider()),
-        );
-        ui.add_space(18.0);
+            );
+        });
+        ui.add_space(4.0);
+
+        if hits.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Try a setting's name, like \"blur\", \"font\" or \"monitor\".")
+                        .size(11.0)
+                        .color(theme::text_secondary()),
+                );
+            });
+            return None;
+        }
+
+        let mut picked = None;
+        for (p, t) in hits {
+            let page = &PAGES[p];
+            let (_, clicked) = Self::rail_row(
+                ui,
+                Some(page.icon),
+                page.tabs[t].title,
+                Some(page.title),
+                false,
+            );
+            if clicked {
+                picked = Some((p, t));
+            }
+        }
+        picked
     }
 
-    // -- pages -----------------------------------------------------------
+    /// The tab bar: a segmented control whose highlight glides to the picked
+    /// tab, changing width on the way. Returns the tab clicked, if any.
+    fn draw_tabs(ui: &mut egui::Ui, page: usize, tabs: &[Tab], active: usize) -> Option<usize> {
+        let mut picked = None;
+        Frame::none()
+            .fill(Color32::from_black_alpha(45))
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(10)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::same(3.0))
+            .show(ui, |ui| {
+                let pill = ui.painter().add(egui::Shape::Noop);
+                let mut target = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (index, tab) in tabs.iter().enumerate() {
+                        let selected = index == active;
+                        let galley = ui.painter().layout_no_wrap(
+                            tab.title.to_owned(),
+                            egui::FontId::proportional(12.5),
+                            theme::text_primary(),
+                        );
+                        let size = Vec2::new(galley.size().x + 28.0, 28.0);
+                        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                        if selected {
+                            target = Some(rect);
+                        } else {
+                            let hover = ui.ctx().animate_bool_with_time(
+                                response.id.with("hover"),
+                                response.hovered(),
+                                0.11,
+                            );
+                            if hover > 0.001 {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    Rounding::same(7.0),
+                                    theme::surface().gamma_multiply(hover),
+                                );
+                            }
+                        }
+                        let tone = ui.ctx().animate_bool_with_time(
+                            response.id.with("lit"),
+                            selected,
+                            0.16,
+                        );
+                        let color =
+                            lerp_color(theme::text_secondary(), theme::text_primary(), tone);
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            tab.title,
+                            egui::FontId::proportional(12.5),
+                            color,
+                        );
+                        if response.clicked() && !selected {
+                            picked = Some(index);
+                        }
+                    }
+                });
+
+                if let Some(target) = target {
+                    // Position and width both travel, so the pill stretches
+                    // from one label to the next rather than jumping. Keyed
+                    // by page, so arriving on a page does not slide in from
+                    // where another page's pill was.
+                    let id = egui::Id::new(("tab_pill", page));
+                    let x = ui
+                        .ctx()
+                        .animate_value_with_time(id.with("x"), target.left(), 0.22);
+                    let w = ui
+                        .ctx()
+                        .animate_value_with_time(id.with("w"), target.width(), 0.22);
+                    let moved = Rect::from_min_size(
+                        egui::pos2(x, target.top()),
+                        Vec2::new(w, target.height()),
+                    );
+                    ui.painter().set(
+                        pill,
+                        egui::Shape::rect_filled(
+                            moved,
+                            Rounding::same(7.0),
+                            theme::surface_active(),
+                        ),
+                    );
+                }
+            });
+        picked
+    }
+
+    /// The page heading, which doubles as the window's title bar: it moves
+    /// the window and carries the pin, minimise and close buttons.
+    fn draw_title_bar(ui: &mut egui::Ui, page: &Page, pinned: &mut bool) -> TitleAction {
+        let (bar, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+        let drag = ui.interact(bar, egui::Id::new("title_drag"), Sense::click_and_drag());
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
+        ui.painter().text(
+            bar.left_center() + Vec2::new(0.0, 4.0),
+            Align2::LEFT_CENTER,
+            page.title,
+            egui::FontId::proportional(21.0),
+            theme::text_primary(),
+        );
+
+        let mut action = TitleAction::None;
+        let controls = [
+            (Glyph::Close, "Hide to tray"),
+            (Glyph::Minimize, "Minimise"),
+            (
+                Glyph::Pin,
+                if *pinned {
+                    "Floating above other windows — click to unpin"
+                } else {
+                    "Keep this window above others"
+                },
+            ),
+        ];
+        let mut right = bar.right() + 6.0;
+        for (glyph, tip) in controls {
+            let rect = Rect::from_min_size(
+                egui::pos2(right - 34.0, bar.center().y - 14.0),
+                Vec2::new(34.0, 28.0),
+            );
+            right -= 36.0;
+            let response = ui
+                .interact(rect, egui::Id::new(("title_btn", glyph)), Sense::click())
+                .on_hover_text(tip);
+            let hover =
+                ui.ctx()
+                    .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.1);
+            let wash = if glyph == Glyph::Close {
+                Color32::from_rgb(196, 43, 28)
+            } else {
+                theme::surface_active()
+            };
+            if hover > 0.001 {
+                ui.painter()
+                    .rect_filled(rect, Rounding::same(7.0), wash.gamma_multiply(hover));
+            }
+            let lit = glyph == Glyph::Pin && *pinned;
+            let tone = if lit {
+                theme::accent()
+            } else if hover > 0.5 {
+                theme::text_primary()
+            } else {
+                theme::text_secondary()
+            };
+            paint_glyph(ui.painter(), glyph, rect.center(), tone);
+
+            if response.clicked() {
+                action = match glyph {
+                    Glyph::Close => TitleAction::Hide,
+                    Glyph::Minimize => TitleAction::Minimize,
+                    _ => {
+                        *pinned = !*pinned;
+                        TitleAction::Pin
+                    }
+                };
+            }
+        }
+        action
+    }
+
+    // -- tabs --------------------------------------------------------------
     //
     // Each one is a thin arrangement of the sections below it. Keeping the
-    // sections separate from the pages is what lets a section be moved to a
-    // different page without touching its body.
+    // sections separate from the tabs is what lets a section move to another
+    // tab without touching its body.
 
-    fn page_notch_overview(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_notch_behaviour(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "BEHAVIOUR");
         Self::sec_notch_basics(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_slides(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_notch_size(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_size(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notch_position(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_place(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notch_style(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_look(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notch_effects(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_effects(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_slides_carousel(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "IN THE CAROUSEL");
         Self::sec_notch_deck(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_status(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_slides_status(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_status_now(ui, cx.cfg, cx.changed);
         Self::sec_status_deck(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_wallpaper(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_slides_wallpaper(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_wallpaper(ui, cx.preview, cx.cfg, cx.changed);
     }
 
-    fn page_notch_marquee(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_slides_marquee(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_notch_marquee(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_layout(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_size(ui, cx.cfg, cx.changed);
+    fn tab_notif_general(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notif_general(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notif_apps(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notif_apps(ui, cx.cfg, cx.changed);
         Self::divider(ui);
-        Self::sec_notch_place(ui, cx.cfg, cx.changed);
+        Self::sec_notif_colors(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_look(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_look(ui, cx.cfg, cx.changed);
+    fn tab_notif_alerts(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notif_alerts(ui, cx.cfg, cx.changed);
     }
 
-    fn page_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_notifications(ui, cx.cfg, cx.changed);
+    fn tab_notif_integration(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notif_integration(ui, cx.cfg, cx.changed);
     }
 
-    fn page_edge_overview(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_edge_general(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_edge_master(ui, cx.cfg, cx.changed);
         Self::divider(ui);
         Self::sec_edge_edges(ui, cx.cfg, cx.changed);
@@ -553,38 +1079,45 @@ impl SettingsApp {
         Self::sec_edge_margins(ui, cx.cfg, cx.changed);
     }
 
-    fn page_edge_message(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_edge_message(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_marquee_message(ui, cx.temp_text, cx.cfg, cx.changed);
     }
 
-    fn page_edge_look(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_edge_style(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_edge_type(ui, cx.cfg, cx.changed);
         Self::divider(ui);
         Self::sec_edge_color(ui, cx.cfg, cx.changed);
     }
 
-    fn page_edge_motion(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_edge_motion(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_edge_motion(ui, cx.cfg, cx.changed);
         Self::divider(ui);
         Self::sec_edge_window(ui, cx.cfg, cx.changed);
     }
 
-    fn page_flashscreen(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+    fn tab_flash_general(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_flash_master(ui, cx.cfg, cx.changed);
         Self::divider(ui);
         Self::sec_flash_schedule(ui, cx.cfg, cx.changed);
         Self::divider(ui);
-        Self::sec_flash_content(ui, cx.cfg, cx.changed);
-        if cx.cfg.flash.content != FlashContent::Image {
-            Self::divider(ui);
-            Self::sec_flash_type(ui, cx.cfg, cx.changed);
-        }
-        Self::divider(ui);
-        Self::sec_flash_backdrop(ui, cx.cfg, cx.changed);
-        Self::divider(ui);
-        Self::sec_flash_anim(ui, cx.cfg, cx.changed);
-        Self::divider(ui);
         Self::sec_flash_behavior(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_flash_content(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_flash_content(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_flash_style(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        // An image brings its own look; there is no type to set.
+        if cx.cfg.flash.content != FlashContent::Image {
+            Self::sec_flash_type(ui, cx.cfg, cx.changed);
+            Self::divider(ui);
+        }
+        Self::sec_flash_backdrop(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_flash_animation(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_flash_anim(ui, cx.cfg, cx.changed);
     }
 
     fn page_app_stats(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -765,27 +1298,58 @@ impl SettingsApp {
         );
     }
 
-    fn page_app_prefs(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "APPEARANCE");
-
+    fn tab_prefs_window(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "GLASS");
+        let win = &mut cx.cfg.settings_window;
         Self::row_stacked(
             ui,
-            "Window theme",
-            Some("System follows whatever Windows is set to."),
+            "Glass strength",
+            Some(
+                "How frosted this window is. Lower lets more of the blurred desktop show \
+                 through; higher is closer to a solid panel. Windows does the blurring, so it \
+                 costs nothing while the window sits still.",
+            ),
             |ui| {
-                ui.horizontal(|ui| {
-                    for option in UiTheme::ALL {
-                        let picked = cx.cfg.ui_theme == option;
-                        if Self::segment(ui, option.label(), picked).clicked() {
-                            cx.cfg.ui_theme = option;
-                            *cx.changed = true;
-                        }
-                    }
-                });
+                let mut pct = (win.glass * 100.0).round();
+                let floor = (crate::config::SettingsWindowConfig::MIN_GLASS * 100.0).round();
+                if ui
+                    .add(egui::Slider::new(&mut pct, floor..=100.0).suffix("%"))
+                    .changed()
+                {
+                    win.glass = pct / 100.0;
+                    *cx.changed = true;
+                }
             },
         );
 
         Self::divider(ui);
+        Self::section_title(ui, "WINDOW");
+        Self::row_inline(ui, "Float above other windows", |ui| {
+            if ui
+                .checkbox(&mut win.pinned, "")
+                .on_hover_text("Also on the pin button at the top of every page")
+                .changed()
+            {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::WindowLevel(if win.pinned {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    }));
+                *cx.changed = true;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Closing the window hides it to the tray; Venu keeps running. Press Ctrl+F \
+                 anywhere to search the settings.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+    }
+
+    fn tab_prefs_startup(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "STARTUP");
         Self::row_stacked(
             ui,
@@ -798,7 +1362,7 @@ impl SettingsApp {
             |ui| {
                 let mut enabled = cx.cfg.launch_on_startup;
                 let check = ui
-                    .checkbox(&mut enabled, "")
+                    .checkbox(&mut enabled, "Start with Windows")
                     .on_hover_text("Registers venu.exe under the per-user Run key");
                 if check.changed() {
                     let result = if enabled {
@@ -821,12 +1385,13 @@ impl SettingsApp {
                 }
             },
         );
+    }
 
-        Self::divider(ui);
+    fn tab_prefs_storage(ui: &mut egui::Ui, _cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "YOUR SETTINGS");
 
         ui.label(
-            RichText::new("Everything on these pages is saved here, as soon as you change it.")
+            RichText::new("Everything in this window is saved here, as soon as you change it.")
                 .size(11.0)
                 .color(theme::text_secondary()),
         );
@@ -2067,7 +2632,7 @@ impl SettingsApp {
         );
     }
 
-    fn sec_notch_notifications(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+    fn sec_notif_general(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
 
         if ui
@@ -2089,8 +2654,9 @@ impl SettingsApp {
             .size(11.0)
             .color(theme::text_secondary()),
         );
+    }
 
-        Self::divider(ui);
+    fn sec_notif_apps(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "ALLOWED APPS");
 
         ui.label(
@@ -2152,8 +2718,9 @@ impl SettingsApp {
             .size(11.0)
             .color(theme::text_tertiary()),
         );
+    }
 
-        Self::divider(ui);
+    fn sec_notif_alerts(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "ALERT SETTINGS");
 
         Self::row_inline(ui, "Toast duration", |ui| {
@@ -2198,9 +2765,10 @@ impl SettingsApp {
             .size(11.0)
             .color(theme::text_secondary()),
         );
+    }
 
-        Self::divider(ui);
-        Self::section_title(ui, "PROGRAM COLORS");
+    fn sec_notif_colors(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::section_title(ui, "APP COLOURS");
 
         ui.label(
             RichText::new("Custom glowing badge & border colors for each application:")
@@ -2238,8 +2806,9 @@ impl SettingsApp {
             });
             ui.add_space(2.0);
         }
+    }
 
-        Self::divider(ui);
+    fn sec_notif_integration(ui: &mut egui::Ui, cfg: &mut AppConfig, _changed: &mut bool) {
         Self::section_title(ui, "INTEGRATION & TEST");
 
         ui.horizontal(|ui| {
@@ -2596,8 +3165,9 @@ impl SettingsApp {
                 }
             },
         );
+    }
 
-        Self::divider(ui);
+    fn sec_notch_effects(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "BORDER EFFECTS");
 
         let fx = &mut cfg.notch.border_effect;
@@ -2623,8 +3193,34 @@ impl SettingsApp {
         if fx.effect != BorderEffect::Off {
             Self::row_stacked(
                 ui,
+                "Plays",
+                Some(if fx.continuous {
+                    "Loops without a break, drawn at 30 frames a second to keep it light."
+                } else {
+                    "Once per interval. The notch does no drawing at all in between."
+                }),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        for (continuous, label) in
+                            [(false, "On an interval"), (true, "Continuously")]
+                        {
+                            if Self::segment(ui, label, fx.continuous == continuous).clicked()
+                                && fx.continuous != continuous
+                            {
+                                fx.continuous = continuous;
+                                *changed = true;
+                            }
+                        }
+                    });
+                },
+            );
+        }
+
+        if fx.effect != BorderEffect::Off && !fx.continuous {
+            Self::row_stacked(
+                ui,
                 "Play every",
-                Some("Seconds between runs. The notch does no drawing at all in between."),
+                Some("Seconds from the end of one run to the start of the next."),
                 |ui| {
                     if ui
                         .add(
@@ -2642,10 +3238,18 @@ impl SettingsApp {
                     }
                 },
             );
-            Self::row_stacked(ui, "Duration", None, |ui| {
+        }
+
+        if fx.effect != BorderEffect::Off {
+            let (label, help) = if fx.continuous {
+                ("Loop length", "Seconds per lap. Longer is calmer.")
+            } else {
+                ("Duration", "How long one run lasts.")
+            };
+            Self::row_stacked(ui, label, Some(help), |ui| {
                 if ui
                     .add(
-                        egui::Slider::new(&mut fx.duration_secs, 0.8..=4.0)
+                        egui::Slider::new(&mut fx.duration_secs, 0.8..=8.0)
                             .step_by(0.1)
                             .suffix(" s"),
                     )
@@ -2962,11 +3566,33 @@ impl SettingsApp {
     }
 }
 
+/// What a click on the title bar's buttons asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleAction {
+    None,
+    Hide,
+    Minimize,
+    /// The pin was toggled; the new state is already in the config.
+    Pin,
+}
+
 impl eframe::App for SettingsApp {
+    /// The window is transparent so the blur behind it shows; every pixel of
+    /// colour comes from the panels' translucent fills.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if SETTINGS_HWND.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             unsafe {
                 let _ = find_settings_hwnd();
+            }
+        }
+        // The blur is asked for once, as soon as there is a window to blur.
+        if self.blurred.is_none() {
+            if let Some(hwnd) = unsafe { find_settings_hwnd() } {
+                self.blurred = Some(glass::apply(hwnd));
             }
         }
 
@@ -2988,110 +3614,106 @@ impl eframe::App for SettingsApp {
         let mut config_changed = false;
         let mut cfg_guard = self.config.write();
 
-        // -- theme -------------------------------------------------------
-        //
-        // Switching theme cross-fades rather than snapping. A fifth of a
-        // second is long enough to read as one surface changing colour and
-        // short enough that nobody waits for it.
-        let want_dark = theme::resolve(cfg_guard.ui_theme, ctx);
-        let blend = ctx.animate_bool_with_time(egui::Id::new("ui_theme"), want_dark, 0.22);
-        let palette = theme::Palette::lerp(theme::LIGHT, theme::DARK, blend);
+        // -- palette -----------------------------------------------------
+        let palette = theme::Palette::glass(
+            cfg_guard.settings_window.glass,
+            self.blurred.unwrap_or(true),
+        );
         theme::set(palette);
         if self.palette != Some(palette) {
             theme::apply_style(ctx, palette);
             self.palette = Some(palette);
         }
 
-        // -- page transition ---------------------------------------------
+        // -- keyboard ----------------------------------------------------
+        let search_id = egui::Id::new("settings_search");
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            ctx.memory_mut(|m| m.request_focus(search_id));
+        }
+        if !self.query.is_empty() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.query.clear();
+            ctx.memory_mut(|m| m.surrender_focus(search_id));
+        }
+
+        // -- transition --------------------------------------------------
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         if self.slide < 1.0 {
-            self.slide = (self.slide + dt / 0.2).min(1.0);
+            self.slide = (self.slide + dt / 0.22).min(1.0);
             ctx.request_repaint();
         }
         let travel = ease_out(self.slide);
+        let before = (self.active, self.tabs[self.active]);
 
-        egui::TopBottomPanel::top("header")
-            .frame(
-                Frame::default()
-                    .fill(theme::bg())
-                    .inner_margin(Margin::symmetric(24.0, 14.0)),
-            )
+        egui::SidePanel::left("nav")
+            .exact_width(SIDEBAR_WIDTH)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::none().fill(theme::sidebar()).inner_margin(Margin {
+                left: 12.0,
+                right: 12.0,
+                top: 12.0,
+                bottom: 10.0,
+            }))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                Self::draw_brand(ui, self.logo.as_ref());
+                ui.add_space(10.0);
+                Self::draw_search(ui, &mut self.query, search_id);
+                ui.add_space(14.0);
+
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
                         ui.label(
-                            RichText::new("Venu")
-                                .size(16.0)
-                                .color(theme::text_primary())
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new("Dynamic Notch for Windows")
-                                .size(11.0)
-                                .color(theme::text_secondary()),
+                            RichText::new(concat!("Venu ", env!("CARGO_PKG_VERSION")))
+                                .size(10.0)
+                                .color(theme::text_tertiary()),
                         );
                     });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .button(RichText::new("Hide to Tray").size(12.0))
-                            .on_hover_text("Hide the settings window to the system tray")
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                            self.on_screen = false;
-                        }
-
-                        ui.add_space(6.0);
-
-                        // The theme also lives on the Preferences page, which
-                        // is its proper home. It is repeated here because it
-                        // is the one setting people reach for out of habit
-                        // rather than intent, and hunting for it is friction.
-                        let next = match cfg_guard.ui_theme {
-                            UiTheme::System => UiTheme::Light,
-                            UiTheme::Light => UiTheme::Dark,
-                            UiTheme::Dark => UiTheme::System,
-                        };
-                        if ui
-                            .button(RichText::new(cfg_guard.ui_theme.label()).size(12.0))
-                            .on_hover_text(format!("Switch to {}", next.label().to_lowercase()))
-                            .clicked()
-                        {
-                            cfg_guard.ui_theme = next;
-                            config_changed = true;
-                        }
+                    ui.add_space(4.0);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        // The rail scrolls like the page beside it does, so
+                        // a long list of results is never out of reach.
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.query.trim().is_empty() {
+                                    if let Some(page) = Self::draw_nav(ui, self.active) {
+                                        self.active = page;
+                                    }
+                                } else if let Some((page, tab)) =
+                                    Self::draw_results(ui, &self.query)
+                                {
+                                    self.active = page;
+                                    self.tabs[page] = tab;
+                                    self.query.clear();
+                                }
+                            });
                     });
                 });
-
-                let rect = ui.max_rect();
-                ui.painter().hline(
-                    rect.x_range(),
-                    rect.bottom(),
-                    Stroke::new(1.0, theme::divider()),
-                );
             });
 
         // The preview strip only means anything on the edge-marquee pages, so
         // it is only there for them — and it grows and shrinks rather than
-        // appearing, which keeps the content below from jumping.
-        let wants_preview = PAGES[self.active].group == Group::Marquee;
+        // appearing, which keeps the content above it from jumping.
+        let wants_preview = PAGES[self.active].title == "Edge Marquee";
         let strip =
             ctx.animate_bool_with_time(egui::Id::new("preview_strip"), wants_preview, 0.18) * 52.0;
         if strip > 0.5 {
             egui::TopBottomPanel::bottom("preview")
                 .exact_height(strip)
+                .show_separator_line(false)
                 .frame(
-                    Frame::default()
+                    Frame::none()
                         .fill(theme::bg())
-                        .inner_margin(Margin::symmetric(24.0, 8.0)),
+                        .inner_margin(Margin::symmetric(28.0, 8.0)),
                 )
                 .show(ctx, |ui| {
                     ui.set_clip_rect(ui.max_rect());
                     let rect = ui.max_rect();
                     ui.painter().hline(
                         rect.x_range(),
-                        rect.top(),
+                        rect.top() - 8.0,
                         Stroke::new(1.0, theme::divider()),
                     );
                     ui.add_space(4.0);
@@ -3099,90 +3721,141 @@ impl eframe::App for SettingsApp {
                 });
         }
 
-        egui::SidePanel::left("nav")
-            .exact_width(186.0)
-            .resizable(false)
-            .frame(
-                Frame::default()
-                    .fill(theme::sidebar())
-                    .inner_margin(Margin::symmetric(12.0, 16.0)),
-            )
-            .show(ctx, |ui| {
-                let before = self.active;
-                // The rail carries one row per page, and there are more pages
-                // than fit a short window — so the rail scrolls like the page
-                // beside it does, and the last group is never out of reach.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        Self::draw_nav(ui, &mut self.active);
-                    });
-                if self.active != before {
-                    // Direction carries meaning: pages entering from the right
-                    // are further down the rail. Without it the movement is
-                    // decoration; with it, it is a small map.
-                    self.slide_dir = if self.active > before { 1.0 } else { -1.0 };
-                    self.slide = 0.0;
-                }
-            });
-
-        // Long lines are hard to read and right-aligned controls end up an
-        // arm's length from their labels, so the column is capped and centred
-        // however wide the window gets.
-        let column = 720.0;
-        let gutter = (((ctx.available_rect().width() - column) * 0.5).max(0.0) + 30.0).floor();
-        // The page slides in horizontally by moving its own margins. Doing it
-        // this way rather than by translating a layer keeps every widget's
-        // interaction rect where it is painted.
-        let shift = (1.0 - travel) * 24.0 * self.slide_dir;
-
         egui::CentralPanel::default()
-            .frame(Frame::default().fill(theme::bg()).inner_margin(Margin {
-                left: gutter + shift,
-                right: (gutter - shift).max(0.0),
-                top: 22.0,
-                bottom: 24.0,
+            .frame(Frame::none().fill(theme::bg()).inner_margin(Margin {
+                left: 28.0,
+                right: 12.0,
+                top: 8.0,
+                bottom: 0.0,
             }))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    // Without this the content column shrinks to its widest
-                    // widget, so right-aligned controls drift and rows jump
-                    // as pages change.
-                    .auto_shrink([false, false])
+                let page = &PAGES[self.active];
+
+                let mut pinned = cfg_guard.settings_window.pinned;
+                match Self::draw_title_bar(ui, page, &mut pinned) {
+                    TitleAction::None => {}
+                    TitleAction::Hide => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        self.on_screen = false;
+                    }
+                    TitleAction::Minimize => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    TitleAction::Pin => {
+                        cfg_guard.settings_window.pinned = pinned;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if pinned {
+                            egui::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::WindowLevel::Normal
+                        }));
+                        config_changed = true;
+                    }
+                }
+
+                ui.label(
+                    RichText::new(page.blurb)
+                        .size(11.5)
+                        .color(theme::text_secondary()),
+                );
+                ui.add_space(14.0);
+
+                if page.tabs.len() > 1 {
+                    if let Some(tab) =
+                        Self::draw_tabs(ui, self.active, page.tabs, self.tabs[self.active])
+                    {
+                        self.tabs[self.active] = tab;
+                    }
+                    ui.add_space(6.0);
+                }
+
+                // Content slides in by moving its own margins. Doing it this
+                // way rather than by translating a layer keeps every widget's
+                // interaction rect where it is painted.
+                let shift = self.slide_from * (1.0 - travel);
+                let tab = self.tabs[self.active];
+                Frame::none()
+                    .inner_margin(Margin {
+                        left: 16.0 + shift.x * 16.0,
+                        right: 16.0 - shift.x * 16.0,
+                        top: 12.0 + shift.y * 14.0,
+                        bottom: 0.0,
+                    })
+                    .outer_margin(Margin {
+                        left: -16.0,
+                        right: 0.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    })
                     .show(ui, |ui| {
-                        ui.multiply_opacity(travel);
+                        egui::ScrollArea::vertical()
+                            .id_salt(("page", self.active, tab))
+                            // Without this the content column shrinks to its
+                            // widest widget, so right-aligned controls drift
+                            // and rows jump as tabs change.
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.multiply_opacity(travel);
+                                // Room for the scroll bar, so it never sits
+                                // on top of a right-aligned control.
+                                ui.set_max_width(ui.available_width() - 14.0);
 
-                        let page = &PAGES[self.active];
-                        Self::page_header(ui, page);
-
-                        let mut cx = PageCtx {
-                            cfg: &mut cfg_guard,
-                            changed: &mut config_changed,
-                            temp_text: &mut self.temp_text,
-                            preview: &mut self.preview,
-                        };
-                        (page.draw)(ui, &mut cx);
+                                let mut cx = PageCtx {
+                                    cfg: &mut cfg_guard,
+                                    changed: &mut config_changed,
+                                    temp_text: &mut self.temp_text,
+                                    preview: &mut self.preview,
+                                };
+                                (page.tabs[tab].draw)(ui, &mut cx);
+                                ui.add_space(28.0);
+                            });
                     });
             });
+
+        let after = (self.active, self.tabs[self.active]);
+        if after != before {
+            self.slide = 0.0;
+            self.slide_from = if after.0 != before.0 {
+                Vec2::new(0.0, 1.0)
+            } else if after.1 > before.1 {
+                Vec2::new(1.0, 0.0)
+            } else {
+                Vec2::new(-1.0, 0.0)
+            };
+        }
+
+        // A hairline round the whole window and down the rail's edge. Glass
+        // over glass has no edge of its own, and without these the window
+        // dissolves into whatever is behind it.
+        let frame = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("window_frame"),
+        ));
+        let screen = ctx.screen_rect();
+        frame.vline(
+            screen.left() + SIDEBAR_WIDTH,
+            screen.y_range(),
+            Stroke::new(1.0, theme::divider()),
+        );
+        frame.rect_stroke(
+            screen.shrink(0.5),
+            Rounding::same(WINDOW_ROUNDING),
+            Stroke::new(1.0, Color32::from_white_alpha(30)),
+        );
 
         if config_changed {
             cfg_guard.save();
         }
 
         // Nothing on this window animates on a clock of its own: egui asks for
-        // its own frames while a cross-fade or the page slide is running, and
-        // the tray wakes the context directly when it wants the window back.
-        // What is left is the config the notch shares with it — an inline
-        // focus edit or the click-through chord can change it from the other
-        // thread — so while the window is on screen it re-reads that a few
-        // times a second, and while it is in the tray it does not run at all.
-        //
-        // This used to ask for a frame every 50ms unconditionally, which had
-        // the whole settings UI rebuilding, laying out and tessellating twenty
-        // times a second for the entire time Venu was running, hidden or not.
+        // its own frames while a transition is running, and the tray wakes the
+        // context directly when it wants the window back. What is left is the
+        // config the notch shares with it — an inline focus edit or the
+        // click-through chord can change it from the other thread — so while
+        // the window is on screen it re-reads that a few times a second, and
+        // while it is in the tray it does not run at all.
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        if self.on_screen && !minimized && PAGES[self.active].title == "Stats" {
+        let page = &PAGES[self.active];
+        if self.on_screen && !minimized && page.tabs[self.tabs[self.active]].title == "Stats" {
             crate::stats::request_sampling();
         }
         if self.on_screen && !minimized {
@@ -3196,288 +3869,107 @@ impl eframe::App for SettingsApp {
     }
 }
 
-/// Renders authentic Hugeicons stroke vector icons for each sidebar rail item.
-fn paint_sidebar_hugeicon(
-    painter: &egui::Painter,
-    group: Group,
-    title: &str,
-    center: egui::Pos2,
-    color: egui::Color32,
-) {
-    let stroke = egui::Stroke::new(1.35, color);
-    let (cx, cy) = (center.x, center.y);
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+        f(a.a(), b.a()),
+    )
+}
 
-    match (group, title) {
-        (Group::Notch, "Overview") => {
-            // Hugeicons: Notch Capsule Dashboard
-            let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 7.0));
-            painter.rect_stroke(rect, egui::Rounding::same(3.5), stroke);
-            painter.circle_filled(center, 1.2, color);
+/// Small line glyphs for the window's own controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Glyph {
+    Search,
+    Close,
+    Minimize,
+    Pin,
+}
+
+fn paint_glyph(painter: &egui::Painter, glyph: Glyph, center: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    let p = |x: f32, y: f32| center + Vec2::new(x, y);
+    match glyph {
+        Glyph::Search => {
+            painter.circle_stroke(p(-1.0, -1.0), 4.2, stroke);
+            painter.line_segment([p(2.2, 2.2), p(5.0, 5.0)], stroke);
         }
-        (Group::Notch, "Slides") => {
-            // Hugeicons: Layers / Stacked Cards
-            let r1 =
-                egui::Rect::from_center_size(center + egui::vec2(-1.5, -1.5), egui::vec2(9.5, 7.5));
-            let r2 =
-                egui::Rect::from_center_size(center + egui::vec2(1.5, 1.5), egui::vec2(9.5, 7.5));
-            painter.rect_stroke(r1, egui::Rounding::same(2.0), stroke);
-            painter.rect_stroke(r2, egui::Rounding::same(2.0), stroke);
+        Glyph::Close => {
+            painter.line_segment([p(-4.0, -4.0), p(4.0, 4.0)], stroke);
+            painter.line_segment([p(4.0, -4.0), p(-4.0, 4.0)], stroke);
         }
-        (Group::Notch, "Status") => {
-            // Hugeicons: Checklist Task
-            let rect = egui::Rect::from_center_size(center, egui::vec2(12.5, 12.5));
-            painter.rect_stroke(rect, egui::Rounding::same(3.0), stroke);
-            painter.line_segment(
-                [egui::pos2(cx - 3.2, cy), egui::pos2(cx - 1.0, cy + 2.2)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 1.0, cy + 2.2),
-                    egui::pos2(cx + 3.2, cy - 2.2),
-                ],
-                stroke,
-            );
+        Glyph::Minimize => {
+            painter.line_segment([p(-4.5, 0.5), p(4.5, 0.5)], stroke);
         }
-        (Group::Notch, "Wallpaper") => {
-            // Hugeicons: Photo Frame
-            let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 11.0));
-            painter.rect_stroke(rect, egui::Rounding::same(2.5), stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 4.2, cy + 2.8),
-                    egui::pos2(cx - 1.0, cy - 1.0),
-                ],
+        Glyph::Pin => {
+            // A push pin seen from the side: head, collar, needle.
+            painter.rect_stroke(
+                Rect::from_min_max(p(-2.6, -5.5), p(2.6, -0.8)),
+                Rounding::same(1.2),
                 stroke,
             );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 1.0, cy - 1.0),
-                    egui::pos2(cx + 2.0, cy + 2.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx + 1.0, cy + 1.0),
-                    egui::pos2(cx + 4.2, cy - 1.5),
-                ],
-                stroke,
-            );
-            painter.circle_filled(egui::pos2(cx + 2.5, cy - 2.5), 1.1, color);
+            painter.line_segment([p(-4.6, -0.8), p(4.6, -0.8)], stroke);
+            painter.line_segment([p(0.0, -0.8), p(0.0, 5.5)], stroke);
         }
-        (Group::Notch, "Moving Text") => {
-            // Hugeicons: Typographic 'T' with motion speed dashes
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 3.2, cy - 4.0),
-                    egui::pos2(cx + 3.2, cy - 4.0),
-                ],
-                stroke,
-            );
-            painter.line_segment([egui::pos2(cx, cy - 4.0), egui::pos2(cx, cy + 4.0)], stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 5.5, cy + 1.2),
-                    egui::pos2(cx - 2.5, cy + 1.2),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 6.5, cy - 1.5),
-                    egui::pos2(cx - 4.5, cy - 1.5),
-                ],
-                stroke,
-            );
+    }
+}
+
+/// The rail's page glyphs, drawn as strokes so they follow the palette.
+fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.35, color);
+    let (cx, cy) = (center.x, center.y);
+    let p = egui::pos2;
+
+    match icon {
+        Icon::Notch => {
+            // A capsule hanging from a bezel line.
+            painter.line_segment([p(cx - 7.0, cy - 4.5), p(cx + 7.0, cy - 4.5)], stroke);
+            let pill = Rect::from_center_size(p(cx, cy), egui::vec2(11.0, 6.5));
+            painter.rect_stroke(pill, Rounding::same(3.2), stroke);
         }
-        (Group::Notch, "Size & Place") => {
-            // Hugeicons: Maximize Frame Corner Brackets
-            let s = 5.0;
-            painter.line_segment(
-                [egui::pos2(cx - s, cy - s + 3.0), egui::pos2(cx - s, cy - s)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx - s, cy - s), egui::pos2(cx - s + 3.0, cy - s)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx + s, cy + s - 3.0), egui::pos2(cx + s, cy + s)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx + s, cy + s), egui::pos2(cx + s - 3.0, cy + s)],
-                stroke,
-            );
-            painter.circle_filled(center, 1.2, color);
-        }
-        (Group::Notch, "Appearance") => {
-            // Hugeicons: Paint Palette
+        Icon::Palette => {
             painter.circle_stroke(center, 5.5, stroke);
-            painter.circle_filled(egui::pos2(cx - 2.2, cy - 1.8), 1.1, color);
-            painter.circle_filled(egui::pos2(cx + 2.2, cy - 1.8), 1.1, color);
-            painter.circle_filled(egui::pos2(cx, cy + 2.2), 1.1, color);
+            painter.circle_filled(p(cx - 2.2, cy - 1.8), 1.1, color);
+            painter.circle_filled(p(cx + 2.2, cy - 1.8), 1.1, color);
+            painter.circle_filled(p(cx, cy + 2.2), 1.1, color);
         }
-        (Group::Notch, "Notifications") => {
-            // Hugeicons: Notification Bell
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 4.2, cy + 2.5),
-                    egui::pos2(cx + 4.2, cy + 2.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 3.2, cy + 2.5),
-                    egui::pos2(cx - 2.2, cy - 2.2),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx + 3.2, cy + 2.5),
-                    egui::pos2(cx + 2.2, cy - 2.2),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 2.2, cy - 2.2),
-                    egui::pos2(cx + 2.2, cy - 2.2),
-                ],
-                stroke,
-            );
-            painter.circle_filled(egui::pos2(cx, cy + 3.8), 1.1, color);
-            painter.circle_stroke(egui::pos2(cx, cy - 3.5), 0.9, stroke);
+        Icon::Layers => {
+            let r1 = Rect::from_center_size(center + egui::vec2(-1.5, -1.5), egui::vec2(9.5, 7.5));
+            let r2 = Rect::from_center_size(center + egui::vec2(1.5, 1.5), egui::vec2(9.5, 7.5));
+            painter.rect_stroke(r1, Rounding::same(2.0), stroke);
+            painter.rect_stroke(r2, Rounding::same(2.0), stroke);
         }
-        (Group::Marquee, "Overview") => {
-            // Hugeicons: Desktop Display Monitor
+        Icon::Bell => {
+            painter.line_segment([p(cx - 4.6, cy + 2.6), p(cx + 4.6, cy + 2.6)], stroke);
+            painter.line_segment([p(cx - 3.4, cy + 2.6), p(cx - 2.6, cy - 2.4)], stroke);
+            painter.line_segment([p(cx + 3.4, cy + 2.6), p(cx + 2.6, cy - 2.4)], stroke);
+            painter.line_segment([p(cx - 2.6, cy - 2.4), p(cx + 2.6, cy - 2.4)], stroke);
+            painter.circle_stroke(p(cx, cy - 3.9), 0.9, stroke);
+            painter.circle_filled(p(cx, cy + 4.3), 1.1, color);
+        }
+        Icon::Monitor => {
             let screen =
-                egui::Rect::from_center_size(center + egui::vec2(0.0, -1.2), egui::vec2(13.0, 9.0));
-            painter.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
-            painter.line_segment([egui::pos2(cx, cy + 3.3), egui::pos2(cx, cy + 5.2)], stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 2.8, cy + 5.2),
-                    egui::pos2(cx + 2.8, cy + 5.2),
-                ],
-                stroke,
-            );
+                Rect::from_center_size(center + egui::vec2(0.0, -1.2), egui::vec2(13.0, 9.0));
+            painter.rect_stroke(screen, Rounding::same(2.0), stroke);
+            painter.line_segment([p(cx, cy + 3.3), p(cx, cy + 5.2)], stroke);
+            painter.line_segment([p(cx - 2.8, cy + 5.2), p(cx + 2.8, cy + 5.2)], stroke);
         }
-        (Group::Marquee, "Message") => {
-            // Hugeicons: Chat Message Bubble
-            let bubble =
-                egui::Rect::from_center_size(center + egui::vec2(0.0, -0.8), egui::vec2(12.5, 9.5));
-            painter.rect_stroke(bubble, egui::Rounding::same(2.5), stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 3.2, cy - 0.8),
-                    egui::pos2(cx + 3.2, cy - 0.8),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 2.8, cy + 4.0),
-                    egui::pos2(cx - 1.0, cy + 5.8),
-                ],
-                stroke,
-            );
-        }
-        (Group::Marquee, "Appearance") => {
-            // Hugeicons: Paintbrush
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 3.8, cy + 3.8),
-                    egui::pos2(cx + 3.2, cy - 3.2),
-                ],
-                egui::Stroke::new(1.6, color),
-            );
-            painter.circle_filled(egui::pos2(cx - 3.8, cy + 3.8), 1.8, color);
-            painter.line_segment(
-                [
-                    egui::pos2(cx + 1.8, cy - 1.8),
-                    egui::pos2(cx + 4.2, cy - 4.2),
-                ],
-                stroke,
-            );
-        }
-        (Group::Marquee, "Motion") => {
-            // Hugeicons: Activity Wave
-            painter.line_segment([egui::pos2(cx - 5.5, cy), egui::pos2(cx - 2.8, cy)], stroke);
-            painter.line_segment(
-                [egui::pos2(cx - 2.8, cy), egui::pos2(cx - 1.0, cy - 4.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 1.0, cy - 4.0),
-                    egui::pos2(cx + 1.2, cy + 4.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx + 1.2, cy + 4.0), egui::pos2(cx + 3.0, cy)],
-                stroke,
-            );
-            painter.line_segment([egui::pos2(cx + 3.0, cy), egui::pos2(cx + 5.5, cy)], stroke);
-        }
-        (Group::Flash, "FlashScreen") => {
-            // Hugeicons: Flash bolt
+        Icon::Bolt => {
             let pts = [
-                egui::pos2(cx + 1.6, cy - 5.4),
-                egui::pos2(cx - 3.2, cy + 0.6),
-                egui::pos2(cx - 0.4, cy + 0.6),
-                egui::pos2(cx - 1.6, cy + 5.4),
-                egui::pos2(cx + 3.2, cy - 0.7),
-                egui::pos2(cx + 0.4, cy - 0.7),
+                p(cx + 1.6, cy - 5.4),
+                p(cx - 3.2, cy + 0.6),
+                p(cx - 0.4, cy + 0.6),
+                p(cx - 1.6, cy + 5.4),
+                p(cx + 3.2, cy - 0.7),
+                p(cx + 0.4, cy - 0.7),
             ];
             for i in 0..pts.len() {
                 painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
             }
         }
-        (Group::Notch, "Stats") => {
-            // Hugeicons: Analytics bars
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 5.2, cy + 4.8),
-                    egui::pos2(cx - 5.2, cy + 0.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 1.7, cy + 4.8),
-                    egui::pos2(cx - 1.7, cy - 3.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx + 1.8, cy + 4.8),
-                    egui::pos2(cx + 1.8, cy - 0.8),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx + 5.2, cy + 4.8),
-                    egui::pos2(cx + 5.2, cy - 5.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - 6.2, cy + 4.8),
-                    egui::pos2(cx + 6.2, cy + 4.8),
-                ],
-                stroke,
-            );
-        }
-        (Group::App, "Preferences") => {
-            // Hugeicons: Settings Gear
+        Icon::Gear => {
             painter.circle_stroke(center, 3.8, stroke);
             painter.circle_filled(center, 1.2, color);
             for i in 0..6 {
@@ -3486,9 +3978,6 @@ fn paint_sidebar_hugeicon(
                 let p2 = center + egui::vec2(angle.cos() * 5.8, angle.sin() * 5.8);
                 painter.line_segment([p1, p2], stroke);
             }
-        }
-        _ => {
-            painter.circle_stroke(center, 3.0, stroke);
         }
     }
 }

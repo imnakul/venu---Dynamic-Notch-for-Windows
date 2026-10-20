@@ -77,9 +77,16 @@ impl EffectPainter {
             BorderEffect::Rainbow => {
                 // A wrapping hue ramp, slid sideways under the stroke.
                 let period = (shape.width() * 0.8).max(120.0);
-                let x = shape.left - p * period * 1.5;
+                // Looping, it slides exactly one period per run and never
+                // fades, so one run hands over to the next without a seam.
+                let (travel, strength) = if fx.continuous {
+                    (1.0, 1.0)
+                } else {
+                    (1.5, envelope)
+                };
+                let x = shape.left - p * period * travel;
                 let axis = ((x, 0.0), (x + period, 0.0));
-                stroke(t, &stops, axis, rim, &[(6.0, 0.28), (1.8, 0.95)], envelope);
+                stroke(t, &stops, axis, rim, &[(6.0, 0.28), (1.8, 0.95)], strength);
             }
 
             BorderEffect::SweepRight | BorderEffect::SweepLeft | BorderEffect::SweepBounce => {

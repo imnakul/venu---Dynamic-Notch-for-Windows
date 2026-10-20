@@ -204,12 +204,24 @@ fn main() {
     // Normal launches start in the tray. `--startup` is still supplied by the
     // sign-in entry, and `--minimized` remains its quiet alias. `--settings`
     // explicitly opens the window and takes precedence over either quiet flag.
+    //
+    // A fixed-size floating panel rather than a document window: settings
+    // are a handful of short pages, and a window that can be maximised just
+    // spreads them thin. It draws its own title bar so the glass runs edge
+    // to edge.
+    let pinned = config.read().settings_window.pinned;
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
-        .with_inner_size([760.0, 600.0])
-        .with_min_inner_size([620.0, 480.0])
+        .with_inner_size(gui::WINDOW_SIZE)
+        .with_resizable(false)
+        .with_maximize_button(false)
+        .with_decorations(false)
+        .with_transparent(true)
         .with_visible(show_settings)
         .with_active(show_settings);
+    if pinned {
+        viewport_builder = viewport_builder.with_always_on_top();
+    }
 
     if let Some(icon) = create_app_icon_data() {
         viewport_builder = viewport_builder.with_icon(icon);
@@ -217,6 +229,7 @@ fn main() {
 
     let native_options = eframe::NativeOptions {
         viewport: viewport_builder,
+        centered: true,
         ..Default::default()
     };
 

@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::config::{AppConfig, NotchAlign, NotchTheme, SlideKind};
+use crate::config::{AppConfig, BorderEffectConfig, NotchAlign, NotchTheme, SlideKind};
 use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::backdrop;
 use crate::notch::geom::NotchShape;
@@ -303,7 +303,7 @@ struct FrameKey {
     usage: u64,
     /// Seconds into the running border effect. `None` between runs, so an
     /// effect costs nothing until it plays.
-    effect: Option<f32>,
+    effect: Option<u32>,
     /// Sample revision only while the Stats slide is active, so system
     /// telemetry does not create background work for unrelated slides.
     stats: u64,
@@ -879,7 +879,17 @@ impl NotchWindow {
             media: self.painter.media.revision(),
             notifications: crate::notch::notify::global_store().read().revision(),
             usage: crate::notch::notify::usage_revision(),
-            effect: self.state.effect_time,
+            effect: self.state.effect_time.map(|time| {
+                // A looping effect only moves the key at its capped rate, so
+                // frames in between are skipped like any unchanged frame.
+                let fx = &cfg.notch.border_effect;
+                let fps = if fx.continuous {
+                    BorderEffectConfig::CONTINUOUS_FPS
+                } else {
+                    60.0
+                };
+                (time * fps) as u32
+            }),
             stats: stats_revision,
         }
     }

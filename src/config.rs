@@ -145,26 +145,28 @@ impl NotchTheme {
     }
 }
 
-/// How the settings window is painted.
-///
-/// `System` follows whatever Windows reports for apps, so a machine set to
-/// switch at sunset takes the window with it. The other two pin it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum UiTheme {
-    #[default]
-    System,
-    Light,
-    Dark,
+/// How the settings window itself looks and sits. Nothing to do with the
+/// overlays — this is only the chrome around the controls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SettingsWindowConfig {
+    /// How frosted the glass is, 0 to 1. Low lets the blurred desktop show
+    /// through; high is close to a solid panel. Windows sets the blur itself.
+    pub glass: f32,
+    /// Keep the window above others, like a floating palette.
+    pub pinned: bool,
 }
 
-impl UiTheme {
-    pub const ALL: [UiTheme; 3] = [UiTheme::System, UiTheme::Light, UiTheme::Dark];
+impl SettingsWindowConfig {
+    /// Below this, light text over a bright desktop stops being legible.
+    pub const MIN_GLASS: f32 = 0.15;
+}
 
-    pub fn label(self) -> &'static str {
-        match self {
-            UiTheme::System => "System",
-            UiTheme::Light => "Light",
-            UiTheme::Dark => "Dark",
+impl Default for SettingsWindowConfig {
+    fn default() -> Self {
+        Self {
+            glass: 0.6,
+            pinned: true,
         }
     }
 }
@@ -357,6 +359,9 @@ pub struct BorderEffectConfig {
     /// How long one run lasts.
     pub duration_secs: f32,
     pub color: [f32; 4],
+    /// Loop the effect without a break instead of playing it on the
+    /// interval. Drawn at a capped frame rate, so it stays cheap.
+    pub continuous: bool,
     /// Bumped by the settings window to play the effect once, right now.
     /// Never saved: it only has to differ from the last value the notch saw.
     #[serde(skip)]
@@ -366,6 +371,10 @@ pub struct BorderEffectConfig {
 impl BorderEffectConfig {
     pub const MIN_INTERVAL_SECS: u32 = 5;
     pub const MAX_INTERVAL_SECS: u32 = 600;
+    /// Frames a second a looping effect is drawn at. Half the overlay's full
+    /// rate: the motion is slow enough that the difference does not show,
+    /// and it halves what a never-ending effect costs.
+    pub const CONTINUOUS_FPS: f32 = 30.0;
 }
 
 impl Default for BorderEffectConfig {
@@ -375,6 +384,7 @@ impl Default for BorderEffectConfig {
             interval_secs: 30,
             duration_secs: 1.8,
             color: [0.22, 0.74, 0.97, 1.0], // #38BDF8, the logo's cyan
+            continuous: false,
             preview: 0,
         }
     }
@@ -1059,10 +1069,9 @@ pub struct AppConfig {
     pub marquee: MarqueeConfig,
     #[serde(default)]
     pub flash: FlashConfig,
-    /// How the settings window itself is painted. Nothing to do with the
-    /// overlays — this is only the chrome around the controls.
+    /// The settings window's glass, and whether it floats above others.
     #[serde(default)]
-    pub ui_theme: UiTheme,
+    pub settings_window: SettingsWindowConfig,
     /// Whether Venu registers itself to start when Windows signs in. The
     /// registry side of this lives in `crate::autostart`; the entry is
     /// refreshed against this flag on every launch.
@@ -1094,7 +1103,7 @@ impl Default for AppConfig {
             wallpaper: WallpaperConfig::default(),
             marquee: MarqueeConfig::default(),
             flash: FlashConfig::default(),
-            ui_theme: UiTheme::default(),
+            settings_window: SettingsWindowConfig::default(),
             launch_on_startup: false,
         }
     }
