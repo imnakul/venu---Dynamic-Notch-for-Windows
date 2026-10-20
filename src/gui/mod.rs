@@ -6,8 +6,8 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use crate::config::{
-    AppConfig, FlashAnim, FlashBackground, FlashContent, FlashLayout, NotchAlign, NotchTheme,
-    SlideKind, StatusItem, UiTheme,
+    AppConfig, BorderEffect, BorderEffectConfig, FlashAnim, FlashBackground, FlashContent,
+    FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem, UiTheme,
 };
 
 mod color_picker;
@@ -2596,6 +2596,68 @@ impl SettingsApp {
                 }
             },
         );
+
+        Self::divider(ui);
+        Self::section_title(ui, "BORDER EFFECTS");
+
+        let fx = &mut cfg.notch.border_effect;
+        Self::row_inline(ui, "Effect", |ui| {
+            egui::ComboBox::from_id_salt("notch_border_effect")
+                .selected_text(fx.effect.label())
+                .show_ui(ui, |ui| {
+                    for effect in BorderEffect::ALL {
+                        if ui
+                            .selectable_value(&mut fx.effect, effect, effect.label())
+                            .clicked()
+                        {
+                            *changed = true;
+                        }
+                    }
+                });
+            if fx.effect != BorderEffect::Off && ui.button("Preview").clicked() {
+                fx.preview = fx.preview.wrapping_add(1);
+                *changed = true;
+            }
+        });
+
+        if fx.effect != BorderEffect::Off {
+            Self::row_stacked(
+                ui,
+                "Play every",
+                Some("Seconds between runs. The notch does no drawing at all in between."),
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut fx.interval_secs,
+                                BorderEffectConfig::MIN_INTERVAL_SECS
+                                    ..=BorderEffectConfig::MAX_INTERVAL_SECS,
+                            )
+                            .logarithmic(true)
+                            .suffix(" s"),
+                        )
+                        .changed()
+                    {
+                        *changed = true;
+                    }
+                },
+            );
+            Self::row_stacked(ui, "Duration", None, |ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut fx.duration_secs, 0.8..=4.0)
+                            .step_by(0.1)
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    *changed = true;
+                }
+            });
+            if fx.effect.uses_color() {
+                Self::color_row(ui, "Effect colour", &mut fx.color, changed);
+            }
+        }
     }
 
     fn sec_status_now(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {

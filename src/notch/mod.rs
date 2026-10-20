@@ -5,6 +5,7 @@
 //!
 //! * [`anim`]     — springs and easing, no Win32
 //! * [`backdrop`] — the desktop capture behind the frosted theme
+//! * [`effects`]  — the periodic border effects
 //! * [`state`]   — what is shown, how open it is, what is being typed
 //! * [`geom`]    — the silhouette and its path
 //! * [`hook`]    — the wheel hook, parked on its own thread
@@ -17,6 +18,7 @@
 
 pub mod anim;
 pub mod backdrop;
+pub mod effects;
 pub mod geom;
 pub mod hook;
 pub mod media;

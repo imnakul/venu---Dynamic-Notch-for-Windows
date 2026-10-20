@@ -301,6 +301,85 @@ impl NotificationGlowStyle {
     }
 }
 
+/// A short animation the notch plays on its own every so often, not tied to
+/// any notification. Everything but the glass shine runs along the rim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BorderEffect {
+    #[default]
+    Off,
+    Rainbow,
+    GlassShine,
+    SweepRight,
+    SweepLeft,
+    SweepBounce,
+    Breathe,
+}
+
+impl BorderEffect {
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Rainbow,
+        Self::GlassShine,
+        Self::SweepRight,
+        Self::SweepLeft,
+        Self::SweepBounce,
+        Self::Breathe,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Rainbow => "Rainbow border",
+            Self::GlassShine => "Glass reflection",
+            Self::SweepRight => "Colour sweep, left to right",
+            Self::SweepLeft => "Colour sweep, right to left",
+            Self::SweepBounce => "Colour sweep, there and back",
+            Self::Breathe => "Breathing glow",
+        }
+    }
+
+    /// Whether the effect is drawn in the configured colour. Rainbow brings
+    /// its own colours and the glass shine is always white.
+    pub fn uses_color(self) -> bool {
+        matches!(
+            self,
+            Self::SweepRight | Self::SweepLeft | Self::SweepBounce | Self::Breathe
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BorderEffectConfig {
+    pub effect: BorderEffect,
+    /// Seconds from the end of one run to the start of the next.
+    pub interval_secs: u32,
+    /// How long one run lasts.
+    pub duration_secs: f32,
+    pub color: [f32; 4],
+    /// Bumped by the settings window to play the effect once, right now.
+    /// Never saved: it only has to differ from the last value the notch saw.
+    #[serde(skip)]
+    pub preview: u32,
+}
+
+impl BorderEffectConfig {
+    pub const MIN_INTERVAL_SECS: u32 = 5;
+    pub const MAX_INTERVAL_SECS: u32 = 600;
+}
+
+impl Default for BorderEffectConfig {
+    fn default() -> Self {
+        Self {
+            effect: BorderEffect::Off,
+            interval_secs: 30,
+            duration_secs: 1.8,
+            color: [0.22, 0.74, 0.97, 1.0], // #38BDF8, the logo's cyan
+            preview: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
@@ -563,6 +642,8 @@ pub struct NotchConfig {
     pub default_collapsed: CollapsedMode,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub border_effect: BorderEffectConfig,
     pub accent: [f32; 4],
     pub surface: [f32; 4],
     #[serde(default = "default_theme")]
@@ -602,6 +683,7 @@ impl Default for NotchConfig {
             active_slide: 0,
             default_collapsed: CollapsedMode::LastActive,
             notifications: NotificationConfig::default(),
+            border_effect: BorderEffectConfig::default(),
             accent: [1.0, 0.604, 0.235, 1.0],     // ember
             surface: [0.031, 0.031, 0.043, 0.97], // obsidian
             theme: NotchTheme::Dark,

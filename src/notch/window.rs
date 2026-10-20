@@ -301,6 +301,9 @@ struct FrameKey {
     notifications: u64,
     /// Bumped by the `/usage` webhook.
     usage: u64,
+    /// Seconds into the running border effect. `None` between runs, so an
+    /// effect costs nothing until it plays.
+    effect: Option<f32>,
     /// Sample revision only while the Stats slide is active, so system
     /// telemetry does not create background work for unrelated slides.
     stats: u64,
@@ -876,6 +879,7 @@ impl NotchWindow {
             media: self.painter.media.revision(),
             notifications: crate::notch::notify::global_store().read().revision(),
             usage: crate::notch::notify::usage_revision(),
+            effect: self.state.effect_time,
             stats: stats_revision,
         }
     }

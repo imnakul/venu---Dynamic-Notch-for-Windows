@@ -134,6 +134,8 @@ pub struct Painter {
     /// Surface generation the cached brush belongs to; it dies with its
     /// render target like every other device resource.
     solid_generation: u64,
+    /// Gradients for the periodic border effects.
+    effects: crate::notch::effects::EffectPainter,
 }
 
 /// Local time, read once per frame.
@@ -224,6 +226,7 @@ impl Painter {
             motion: Cell::new(Motion::Still),
             solid: RefCell::new(None),
             solid_generation: 0,
+            effects: Default::default(),
         })
     }
 
@@ -563,10 +566,9 @@ impl Painter {
             }
             // Hairline edge, then a brighter specular lip across the top third.
             // Neither runs along a fused top: that edge is the screen's.
-            if let Ok(outline) = shape.build_edge(&factory) {
-                if let Ok(edge) = self.brush(&t, self.pal.edge) {
-                    unsafe { t.DrawGeometry(&outline, &edge, 1.0, None) };
-                }
+            let outline = shape.build_edge(&factory).ok();
+            if let (Some(outline), Ok(edge)) = (&outline, self.brush(&t, self.pal.edge)) {
+                unsafe { t.DrawGeometry(outline, &edge, 1.0, None) };
             }
             if let Ok(inner) = shape.inset(0.9).build_edge(&factory) {
                 if let Ok(sheen) = self.brush(&t, self.pal.sheen) {
@@ -581,6 +583,22 @@ impl Painter {
                     );
                     unsafe { t.DrawGeometry(&inner, &sheen, 1.4, None) };
                     self.unclip(&t);
+                }
+            }
+
+            // The periodic border effect, if one is mid-run. Above the glass,
+            // under the content, and never over a notification glow.
+            if let (Some(progress), Some(rim)) = (state.effect_progress(cfg), &outline) {
+                if state.toast_progress.value <= 0.01 {
+                    self.effects.paint(
+                        &t,
+                        generation,
+                        &cfg.notch.border_effect,
+                        &shape,
+                        &geometry,
+                        rim,
+                        progress,
+                    );
                 }
             }
         }

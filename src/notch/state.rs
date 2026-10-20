@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::config::{AppConfig, SlideKind};
+use crate::config::{AppConfig, BorderEffect, BorderEffectConfig, SlideKind};
 use crate::notch::anim::{smoothstep, Spring};
 
 /// Placeholder shown when the focus line has been cleared entirely.
@@ -14,6 +14,11 @@ const EMPTY_FOCUS: &str = "What are you working on?";
 
 /// How long the click-through badge stays up after the chord.
 const FLASH_SECONDS: f32 = 1.6;
+
+/// Delay before the first border effect after launch, or after one is picked
+/// in settings, so the choice is seen straight away rather than an interval
+/// later.
+const EFFECT_FIRST_RUN: f32 = 0.6;
 
 pub struct NotchState {
     /// 0 = collapsed pill, 1 = fully open panel.
@@ -56,6 +61,16 @@ pub struct NotchState {
     /// invisible by nature — the clicks go somewhere else — so the notch says
     /// out loud which mode it just entered, then gets out of the way.
     pub click_through_flash: f32,
+
+    /// Seconds into the running border effect; `None` between runs, which is
+    /// almost always. Part of the frame key, so the notch only repaints for
+    /// an effect while one is actually playing.
+    pub effect_time: Option<f32>,
+    /// Seconds until the next run.
+    effect_wait: f32,
+    /// What the schedule was last armed for, so picking another effect or
+    /// pressing Preview starts a run immediately.
+    effect_armed: (BorderEffect, u32),
 }
 
 impl NotchState {
@@ -80,7 +95,54 @@ impl NotchState {
             selected_notification_id: None,
             dirty: false,
             click_through_flash: 0.0,
+            effect_time: None,
+            effect_wait: EFFECT_FIRST_RUN,
+            effect_armed: (
+                cfg.notch.border_effect.effect,
+                cfg.notch.border_effect.preview,
+            ),
         }
+    }
+
+    /// Run the border effect on its interval. Between runs this is a
+    /// subtraction a tick; nothing is painted.
+    fn tick_border_effect(&mut self, cfg: &AppConfig, dt: f32) {
+        let fx = &cfg.notch.border_effect;
+        let armed = (fx.effect, fx.preview);
+        if armed != self.effect_armed {
+            self.effect_armed = armed;
+            self.effect_time = None;
+            self.effect_wait = EFFECT_FIRST_RUN;
+        }
+        if fx.effect == BorderEffect::Off {
+            self.effect_time = None;
+            return;
+        }
+
+        if let Some(time) = self.effect_time {
+            let time = time + dt;
+            if time >= fx.duration_secs {
+                self.effect_time = None;
+                self.effect_wait =
+                    fx.interval_secs.max(BorderEffectConfig::MIN_INTERVAL_SECS) as f32;
+            } else {
+                self.effect_time = Some(time);
+            }
+            return;
+        }
+
+        self.effect_wait -= dt;
+        // A notification glow owns the rim while it is up; wait it out.
+        let toast_up = self.toast_progress.value > 0.01;
+        if self.effect_wait <= 0.0 && !toast_up {
+            self.effect_time = Some(0.0);
+        }
+    }
+
+    /// Progress of the running border effect, 0 to 1.
+    pub fn effect_progress(&self, cfg: &AppConfig) -> Option<f32> {
+        let duration = cfg.notch.border_effect.duration_secs.max(0.1);
+        self.effect_time.map(|t| (t / duration).clamp(0.0, 1.0))
     }
 
     /// Show the click-through badge for long enough to read and no longer.
@@ -187,6 +249,7 @@ impl NotchState {
     pub fn tick(&mut self, cfg: &AppConfig, target_expand: f32, dt: f32) {
         self.elapsed += dt;
         self.click_through_flash = (self.click_through_flash - dt).max(0.0);
+        self.tick_border_effect(cfg, dt);
 
         self.expand.step(target_expand, dt);
         self.carousel.step(self.active as f32, dt);
@@ -399,5 +462,73 @@ mod tests {
         let mut state = resting(&cfg, SlideKind::Marquee, false);
         state.tick(&cfg, 0.0, 0.032);
         assert!(state.marquee_offset < 0.0);
+    }
+
+    fn effect_cfg(effect: BorderEffect) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.notch.border_effect.effect = effect;
+        cfg.notch.border_effect.interval_secs = 30;
+        cfg.notch.border_effect.duration_secs = 1.0;
+        cfg
+    }
+
+    /// Advance the effect clock alone, in idle-poll sized steps.
+    fn run_for(state: &mut NotchState, cfg: &AppConfig, seconds: f32) {
+        let mut left = seconds;
+        while left > 0.0 {
+            let dt = left.min(0.032);
+            state.tick_border_effect(cfg, dt);
+            left -= dt;
+        }
+    }
+
+    #[test]
+    fn border_effect_off_never_runs() {
+        let cfg = effect_cfg(BorderEffect::Off);
+        let mut state = NotchState::new(&cfg);
+        run_for(&mut state, &cfg, 120.0);
+        assert!(state.effect_time.is_none());
+    }
+
+    #[test]
+    fn border_effect_runs_once_then_waits_its_interval() {
+        let cfg = effect_cfg(BorderEffect::Rainbow);
+        let mut state = NotchState::new(&cfg);
+
+        run_for(&mut state, &cfg, EFFECT_FIRST_RUN + 0.05);
+        assert!(state.effect_time.is_some(), "first run starts promptly");
+
+        run_for(&mut state, &cfg, 1.0);
+        assert!(state.effect_time.is_none(), "and stops after its duration");
+
+        run_for(&mut state, &cfg, 29.0);
+        assert!(state.effect_time.is_none(), "idle for the interval");
+        run_for(&mut state, &cfg, 1.1);
+        assert!(state.effect_time.is_some(), "then plays again");
+    }
+
+    #[test]
+    fn preview_restarts_the_schedule() {
+        let mut cfg = effect_cfg(BorderEffect::SweepRight);
+        let mut state = NotchState::new(&cfg);
+        run_for(&mut state, &cfg, EFFECT_FIRST_RUN + 1.2);
+        assert!(state.effect_time.is_none());
+
+        cfg.notch.border_effect.preview += 1;
+        run_for(&mut state, &cfg, EFFECT_FIRST_RUN + 0.05);
+        assert!(state.effect_time.is_some());
+    }
+
+    #[test]
+    fn border_effect_waits_for_a_notification_glow() {
+        let cfg = effect_cfg(BorderEffect::Breathe);
+        let mut state = NotchState::new(&cfg);
+        state.toast_progress.set(1.0);
+        run_for(&mut state, &cfg, 5.0);
+        assert!(state.effect_time.is_none());
+
+        state.toast_progress.set(0.0);
+        run_for(&mut state, &cfg, 0.05);
+        assert!(state.effect_time.is_some());
     }
 }
