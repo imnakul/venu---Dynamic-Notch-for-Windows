@@ -346,6 +346,37 @@ pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
     ]
 }
 
+/// Centres and radius of the Timer slide's buttons (reset / start-pause /
+/// skip), along the body's bottom edge like the media transport.
+pub fn timer_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
+    media_transport_buttons(body)
+}
+
+/// The Quick Toggles slide's tiles, one per switch: a row of four on a wide
+/// panel, two by two on a narrow one.
+pub fn toggle_tiles(body: D2D_RECT_F) -> [D2D_RECT_F; 4] {
+    let w = body.right - body.left;
+    let top = body.top + 22.0;
+    let h_avail = (body.bottom - top).max(40.0);
+    let gap = 10.0;
+    let (cols, rows) = if w >= 420.0 { (4, 1) } else { (2, 2) };
+    let tile_w = (w - gap * (cols - 1) as f32) / cols as f32;
+    let tile_h = ((h_avail - gap * (rows - 1) as f32) / rows as f32).min(96.0);
+    let mut out = [D2D_RECT_F::default(); 4];
+    for (i, tile) in out.iter_mut().enumerate() {
+        let (c, r) = (i % cols, i / cols);
+        let left = body.left + c as f32 * (tile_w + gap);
+        let t = top + r as f32 * (tile_h + gap);
+        *tile = D2D_RECT_F {
+            left,
+            top: t,
+            right: left + tile_w,
+            bottom: t + tile_h,
+        };
+    }
+    out
+}
+
 /// "Clear All" button bounds in the Notifications slide header.
 pub fn notification_clear_button(body: D2D_RECT_F) -> D2D_RECT_F {
     D2D_RECT_F {

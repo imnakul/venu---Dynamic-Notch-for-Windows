@@ -5,12 +5,16 @@
 //!
 //! * [`anim`]     — springs and easing, no Win32
 //! * [`backdrop`] — the desktop capture behind the frosted theme
+//! * [`battery`]  — charging and low-battery toasts
+//! * [`calendar`] — the iCal feed behind the Calendar slide
 //! * [`effects`]  — the periodic border effects
 //! * [`state`]   — what is shown, how open it is, what is being typed
 //! * [`geom`]    — the silhouette and its path
 //! * [`hook`]    — the wheel hook, parked on its own thread
 //! * [`media`]   — the Now Playing poller, on its own thread
 //! * [`theme`]   — colour and type tokens
+//! * [`timer`]   — the focus timer
+//! * [`toggles`] — the Quick Toggles switches
 //! * [`text`]    — DirectWrite, including the bundled private fonts
 //! * [`surface`] — the Direct2D target behind the layered window
 //! * [`paint`]   — every slide, drawn
@@ -18,6 +22,8 @@
 
 pub mod anim;
 pub mod backdrop;
+pub mod battery;
+pub mod calendar;
 pub mod effects;
 pub mod geom;
 pub mod hook;
@@ -28,6 +34,8 @@ pub mod state;
 pub mod surface;
 pub mod text;
 pub mod theme;
+pub mod timer;
+pub mod toggles;
 pub mod window;
 
 use std::sync::Arc;

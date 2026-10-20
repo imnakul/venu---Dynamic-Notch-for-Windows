@@ -196,10 +196,16 @@ pub enum SlideKind {
     Usage,
     /// Live Windows system resource usage and power state.
     Stats,
+    /// A Pomodoro focus timer with breaks.
+    Timer,
+    /// What is on your calendar next, from an iCal feed.
+    Calendar,
+    /// One-click switches: microphone, sound, dark mode, keep awake.
+    Controls,
 }
 
 impl SlideKind {
-    pub const ALL: [SlideKind; 8] = [
+    pub const ALL: [SlideKind; 11] = [
         SlideKind::Status,
         SlideKind::Clock,
         SlideKind::Marquee,
@@ -208,6 +214,9 @@ impl SlideKind {
         SlideKind::Notifications,
         SlideKind::Usage,
         SlideKind::Stats,
+        SlideKind::Timer,
+        SlideKind::Calendar,
+        SlideKind::Controls,
     ];
 
     pub fn label(self) -> &'static str {
@@ -220,6 +229,9 @@ impl SlideKind {
             SlideKind::Notifications => "Notifications",
             SlideKind::Usage => "Claude Usage",
             SlideKind::Stats => "Stats",
+            SlideKind::Timer => "Focus Timer",
+            SlideKind::Calendar => "Calendar",
+            SlideKind::Controls => "Quick Toggles",
         }
     }
 }
@@ -246,12 +258,16 @@ pub enum CollapsedMode {
     Usage,
     /// Resets to system stats slide.
     Stats,
+    /// Resets to the focus timer.
+    Timer,
+    /// Resets to the calendar slide.
+    Calendar,
     /// Smart / Auto mode: shows active alerts if unread, or Now Playing if music is on, otherwise Clock.
     Auto,
 }
 
 impl CollapsedMode {
-    pub const ALL: [CollapsedMode; 10] = [
+    pub const ALL: [CollapsedMode; 12] = [
         CollapsedMode::LastActive,
         CollapsedMode::Status,
         CollapsedMode::Clock,
@@ -261,6 +277,8 @@ impl CollapsedMode {
         CollapsedMode::Notifications,
         CollapsedMode::Usage,
         CollapsedMode::Stats,
+        CollapsedMode::Timer,
+        CollapsedMode::Calendar,
         CollapsedMode::Auto,
     ];
 
@@ -275,6 +293,8 @@ impl CollapsedMode {
             CollapsedMode::Notifications => "Notifications",
             CollapsedMode::Usage => "Claude Usage",
             CollapsedMode::Stats => "Stats",
+            CollapsedMode::Timer => "Focus Timer",
+            CollapsedMode::Calendar => "Calendar",
             CollapsedMode::Auto => "Dynamic / Auto",
         }
     }
@@ -319,10 +339,15 @@ pub enum BorderEffect {
     SweepLeft,
     SweepBounce,
     Breathe,
+    Aurora,
+    Comet,
+    Neon,
+    Heartbeat,
+    Fire,
 }
 
 impl BorderEffect {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 12] = [
         Self::Off,
         Self::Rainbow,
         Self::GlassShine,
@@ -330,6 +355,11 @@ impl BorderEffect {
         Self::SweepLeft,
         Self::SweepBounce,
         Self::Breathe,
+        Self::Aurora,
+        Self::Comet,
+        Self::Neon,
+        Self::Heartbeat,
+        Self::Fire,
     ];
 
     pub fn label(self) -> &'static str {
@@ -341,6 +371,11 @@ impl BorderEffect {
             Self::SweepLeft => "Colour sweep, right to left",
             Self::SweepBounce => "Colour sweep, there and back",
             Self::Breathe => "Breathing glow",
+            Self::Aurora => "Aurora",
+            Self::Comet => "Comet",
+            Self::Neon => "Neon sign",
+            Self::Heartbeat => "Heartbeat",
+            Self::Fire => "Fire",
         }
     }
 
@@ -349,8 +384,47 @@ impl BorderEffect {
     pub fn uses_color(self) -> bool {
         matches!(
             self,
-            Self::SweepRight | Self::SweepLeft | Self::SweepBounce | Self::Breathe
+            Self::SweepRight
+                | Self::SweepLeft
+                | Self::SweepBounce
+                | Self::Breathe
+                | Self::Comet
+                | Self::Neon
+                | Self::Heartbeat
         )
+    }
+}
+
+/// Which state of the notch a border effect plays in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EffectScope {
+    #[default]
+    Always,
+    /// Only on the resting pill; it fades out as the notch opens.
+    CollapsedOnly,
+    /// Only on the open panel.
+    ExpandedOnly,
+}
+
+impl EffectScope {
+    pub const ALL: [Self; 3] = [Self::Always, Self::CollapsedOnly, Self::ExpandedOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::CollapsedOnly => "Pill only",
+            Self::ExpandedOnly => "Open panel only",
+        }
+    }
+
+    /// How much of the effect shows at `expand` (0 shut, 1 open).
+    pub fn visibility(self, expand: f32) -> f32 {
+        let open = expand.clamp(0.0, 1.0);
+        match self {
+            Self::Always => 1.0,
+            Self::CollapsedOnly => 1.0 - open,
+            Self::ExpandedOnly => open,
+        }
     }
 }
 
@@ -366,6 +440,8 @@ pub struct BorderEffectConfig {
     /// Loop the effect without a break instead of playing it on the
     /// interval. Drawn at a capped frame rate, so it stays cheap.
     pub continuous: bool,
+    /// Whether the effect plays on the resting pill, the open panel, or both.
+    pub scope: EffectScope,
     /// Bumped by the settings window to play the effect once, right now.
     /// Never saved: it only has to differ from the last value the notch saw.
     #[serde(skip)]
@@ -389,7 +465,72 @@ impl Default for BorderEffectConfig {
             duration_secs: 1.8,
             color: [0.22, 0.74, 0.97, 1.0], // #38BDF8, the logo's cyan
             continuous: false,
+            scope: EffectScope::Always,
             preview: 0,
+        }
+    }
+}
+
+/// The focus timer's lengths, in minutes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimerConfig {
+    pub focus_mins: u32,
+    pub short_break_mins: u32,
+    pub long_break_mins: u32,
+    /// Focus rounds before a long break instead of a short one.
+    pub rounds: u32,
+    /// Start the break as soon as a focus round ends.
+    pub auto_start_breaks: bool,
+}
+
+impl Default for TimerConfig {
+    fn default() -> Self {
+        Self {
+            focus_mins: 25,
+            short_break_mins: 5,
+            long_break_mins: 15,
+            rounds: 4,
+            auto_start_breaks: true,
+        }
+    }
+}
+
+/// Where the calendar slide reads events from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalendarConfig {
+    /// An iCal (`.ics`) address — the "secret address" Google Calendar or
+    /// Outlook offer for sharing — or a path to an `.ics` file.
+    pub source: String,
+    /// How often the feed is fetched again.
+    pub refresh_mins: u32,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            refresh_mins: 15,
+        }
+    }
+}
+
+/// Toasts for the charger being plugged in or out, and for a low battery.
+/// Silent on a desktop: with no battery there is nothing to report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BatteryAlertConfig {
+    pub enabled: bool,
+    /// Warn once when the charge falls to this, and again at half of it.
+    pub low_pct: u8,
+}
+
+impl Default for BatteryAlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            low_pct: 20,
         }
     }
 }
@@ -658,6 +799,12 @@ pub struct NotchConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub border_effect: BorderEffectConfig,
+    #[serde(default)]
+    pub timer: TimerConfig,
+    #[serde(default)]
+    pub calendar: CalendarConfig,
+    #[serde(default)]
+    pub battery: BatteryAlertConfig,
     pub accent: [f32; 4],
     pub surface: [f32; 4],
     #[serde(default = "default_theme")]
@@ -698,6 +845,9 @@ impl Default for NotchConfig {
             default_collapsed: CollapsedMode::LastActive,
             notifications: NotificationConfig::default(),
             border_effect: BorderEffectConfig::default(),
+            timer: TimerConfig::default(),
+            calendar: CalendarConfig::default(),
+            battery: BatteryAlertConfig::default(),
             accent: [1.0, 0.604, 0.235, 1.0],     // ember
             surface: [0.031, 0.031, 0.043, 0.97], // obsidian
             theme: NotchTheme::Dark,

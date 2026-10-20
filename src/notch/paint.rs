@@ -589,16 +589,11 @@ impl Painter {
             // The periodic border effect, if one is mid-run. Above the glass,
             // under the content, and never over a notification glow.
             if let (Some(progress), Some(rim)) = (state.effect_progress(cfg), &outline) {
-                if state.toast_progress.value <= 0.01 {
-                    self.effects.paint(
-                        &t,
-                        generation,
-                        &cfg.notch.border_effect,
-                        &shape,
-                        &geometry,
-                        rim,
-                        progress,
-                    );
+                let fx = &cfg.notch.border_effect;
+                let shown = fx.scope.visibility(state.expand.value);
+                if state.toast_progress.value <= 0.01 && shown > 0.004 {
+                    self.effects
+                        .paint(&t, generation, fx, &shape, &geometry, rim, progress, shown);
                 }
             }
         }
@@ -1568,6 +1563,119 @@ impl Painter {
                     }
                 }
             }
+            SlideKind::Timer => {
+                use crate::notch::timer::{self, Phase};
+                let view = timer::view(&cfg.notch.timer);
+                let tone = if view.phase == Phase::Focus {
+                    cfg.notch.accent
+                } else {
+                    BREAK_GREEN
+                };
+                let left = shape.left + pad;
+                self.dot(t, left + 4.0, cy, 3.5, theme::fade(tone, alpha));
+                let word = if !view.running && view.progress() > 0.0 {
+                    "PAUSED"
+                } else if view.phase == Phase::Focus {
+                    "FOCUS"
+                } else {
+                    "BREAK"
+                };
+                self.label(
+                    t,
+                    family,
+                    word,
+                    theme::SIZE_LABEL - 1.0,
+                    DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+                    theme::TRACK_LABEL,
+                    inner_w * 0.5,
+                    left + 14.0,
+                    cy - 7.0,
+                    theme::fade(self.pal.text_lo, alpha),
+                );
+                if let Some((layout, w, h)) = self.measure_text(
+                    crate::fonts::GEIST_MONO,
+                    &view.clock(),
+                    14.5,
+                    DWRITE_FONT_WEIGHT_MEDIUM,
+                ) {
+                    self.draw_layout(
+                        t,
+                        &layout,
+                        shape.right - pad - w,
+                        cy - h * 0.5,
+                        theme::fade(self.pal.text_hi, alpha),
+                    );
+                }
+            }
+            SlideKind::Calendar => {
+                use crate::notch::calendar;
+                let now = calendar::now_local();
+                let soon = calendar::upcoming(now, 5);
+                let next = soon.iter().find(|e| !e.all_day).or(soon.first()).cloned();
+                let (lead, title, tone) = match &next {
+                    Some(ev) if ev.all_day => {
+                        ("TODAY".to_owned(), ev.title.clone(), cfg.notch.accent)
+                    }
+                    Some(ev) if ev.start <= now => {
+                        ("NOW".to_owned(), ev.title.clone(), BREAK_GREEN)
+                    }
+                    Some(ev) => (
+                        span_short(ev.start - now).to_uppercase(),
+                        ev.title.clone(),
+                        cfg.notch.accent,
+                    ),
+                    None => ("CAL".to_owned(), "No events".to_owned(), self.pal.text_lo),
+                };
+                let left = shape.left + pad;
+                let lead_w = self
+                    .measure_text(
+                        family,
+                        &lead,
+                        theme::SIZE_LABEL,
+                        DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+                    )
+                    .map(|(_, w, _)| w)
+                    .unwrap_or(30.0);
+                self.label(
+                    t,
+                    family,
+                    &lead,
+                    theme::SIZE_LABEL,
+                    DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+                    0.0,
+                    inner_w,
+                    left,
+                    cy - 7.0,
+                    theme::fade(tone, alpha),
+                );
+                self.label(
+                    t,
+                    family,
+                    &title,
+                    theme::SIZE_PILL - 1.0,
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    0.0,
+                    (inner_w - lead_w - 10.0).max(10.0),
+                    left + lead_w + 10.0,
+                    cy - 8.5,
+                    theme::fade(self.pal.text_hi, alpha),
+                );
+            }
+            SlideKind::Controls => {
+                use crate::notch::toggles::{self, Toggle};
+                let states = toggles::states();
+                let step = inner_w / Toggle::ALL.len() as f32;
+                for (i, toggle) in Toggle::ALL.into_iter().enumerate() {
+                    let on = states.get(toggle).unwrap_or(false);
+                    let x = shape.left + pad + step * (i as f32 + 0.5);
+                    let color = if on {
+                        theme::fade(cfg.notch.accent, alpha)
+                    } else {
+                        theme::fade(self.pal.text_lo, alpha)
+                    };
+                    self.glyph(t, toggle.glyph(on), 13.0, x, cy, color);
+                }
+            }
         }
     }
 
@@ -1659,6 +1767,425 @@ impl Painter {
             SlideKind::Notifications => self.paint_notifications(t, cfg, state, body, alpha),
             SlideKind::Usage => self.paint_usage(t, cfg, body, alpha),
             SlideKind::Stats => self.paint_stats(t, cfg, body, alpha),
+            SlideKind::Timer => self.paint_timer(t, cfg, body, alpha),
+            SlideKind::Calendar => self.paint_calendar(t, cfg, body, alpha),
+            SlideKind::Controls => self.paint_controls(t, cfg, body, alpha),
+        }
+    }
+
+    /// Draw one Segoe MDL2 Assets glyph centred on `(cx, cy)`.
+    fn glyph(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        glyph: &str,
+        size: f32,
+        cx: f32,
+        cy: f32,
+        color: Rgba,
+    ) {
+        let Ok(fmt) = self
+            .text
+            .format("Segoe MDL2 Assets", size, DWRITE_FONT_WEIGHT_MEDIUM)
+        else {
+            return;
+        };
+        let Ok(layout) = self.text.layout(glyph, &fmt, size * 2.0, size * 2.0) else {
+            return;
+        };
+        let (w, h) = TextEngine::measure(&layout);
+        self.draw_layout(t, &layout, cx - w * 0.5, cy - h * 0.5, color);
+    }
+
+    /// Lay `text` out and report its size, for callers that position it by
+    /// its measured width.
+    fn measure_text(
+        &self,
+        family: &str,
+        text: &str,
+        size: f32,
+        weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
+    ) -> Option<(IDWriteTextLayout, f32, f32)> {
+        let fmt = self.text.format(family, size, weight).ok()?;
+        let layout = self.text.layout(text, &fmt, 2000.0, size * 2.4).ok()?;
+        let (w, h) = TextEngine::measure(&layout);
+        Some((layout, w, h))
+    }
+
+    fn paint_timer(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        use crate::notch::timer::{self, Phase};
+        let family = &cfg.notch.font_family;
+        let view = timer::view(&cfg.notch.timer);
+        let tone = if view.phase == Phase::Focus {
+            cfg.notch.accent
+        } else {
+            BREAK_GREEN
+        };
+
+        let heading = if view.phase == Phase::Focus {
+            format!("FOCUS  \u{00B7}  ROUND {} OF {}", view.round, view.rounds)
+        } else {
+            view.phase.label().to_owned()
+        };
+        self.label(
+            t,
+            family,
+            &heading,
+            theme::SIZE_LABEL,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            theme::TRACK_LABEL,
+            body.right - body.left,
+            body.left,
+            body.top + 2.0,
+            theme::fade(tone, alpha),
+        );
+
+        // The countdown, centred and big, between the heading and buttons.
+        let cx = (body.left + body.right) * 0.5;
+        let buttons = crate::notch::geom::timer_buttons(body);
+        let (_, button_y, button_r) = buttons[1];
+        let clock_mid = (body.top + 18.0 + button_y - button_r - 22.0) * 0.5;
+        if let Some((layout, w, h)) = self.measure_text(
+            crate::fonts::GEIST_MONO,
+            &view.clock(),
+            theme::SIZE_CLOCK,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+        ) {
+            let dim = if view.running { 1.0 } else { 0.62 };
+            self.draw_layout(
+                t,
+                &layout,
+                cx - w * 0.5,
+                clock_mid - h * 0.5,
+                theme::fade(self.pal.text_hi, alpha * dim),
+            );
+        }
+
+        // Progress through the phase.
+        let bar_w = ((body.right - body.left) * 0.62).min(320.0);
+        let bar_y = clock_mid + theme::SIZE_CLOCK * 0.5 + 6.0;
+        let bar = D2D_RECT_F {
+            left: cx - bar_w * 0.5,
+            top: bar_y,
+            right: cx + bar_w * 0.5,
+            bottom: bar_y + 4.0,
+        };
+        self.fill_rrect(t, bar, 2.0, theme::fade(self.pal.text_hi, alpha * 0.32));
+        let done = D2D_RECT_F {
+            right: bar.left + bar_w * view.progress().clamp(0.0, 1.0),
+            ..bar
+        };
+        self.fill_rrect(t, done, 2.0, theme::fade(tone, alpha));
+
+        // Reset / start-pause / skip.
+        let glyphs = [
+            "\u{E72C}",
+            if view.running { "\u{E769}" } else { "\u{E768}" },
+            "\u{E893}",
+        ];
+        for (i, ((bx, by, r), g)) in buttons.into_iter().zip(glyphs).enumerate() {
+            let main = i == 1;
+            let fill = if main {
+                theme::fade(tone, alpha)
+            } else {
+                theme::fade(self.pal.well, alpha * 1.6)
+            };
+            self.dot(t, bx, by, r, fill);
+            let ink = if main {
+                [0.04, 0.04, 0.06, alpha]
+            } else {
+                theme::fade(self.pal.text_hi, alpha * 0.82)
+            };
+            self.glyph(t, g, if main { 13.0 } else { 11.0 }, bx, by, ink);
+        }
+    }
+
+    fn paint_calendar(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        use crate::notch::calendar::{self, Status};
+        let family = &cfg.notch.font_family;
+        let now = calendar::now_local();
+        let mut events = calendar::upcoming(now, 5);
+        let width = body.right - body.left;
+        // A meeting is what "next" means; an all-day event is context, so
+        // it goes in the list below rather than taking the headline.
+        if let Some(i) = events.iter().position(|e| !e.all_day) {
+            let timed = events.remove(i);
+            events.insert(0, timed);
+        }
+
+        let Some(next) = events.first() else {
+            let (head, line) = match calendar::status() {
+                Status::Unset => (
+                    "CALENDAR",
+                    "Add your calendar\u{2019}s iCal link in Settings \u{2192} Slides \u{2192} Calendar.",
+                ),
+                Status::Loading => ("CALENDAR", "Loading your calendar\u{2026}"),
+                Status::Failed(_) => (
+                    "CALENDAR",
+                    "Couldn\u{2019}t reach your calendar. Trying again soon.",
+                ),
+                Status::Ready => ("ALL CLEAR", "Nothing on your calendar this week."),
+            };
+            self.label(
+                t,
+                family,
+                head,
+                theme::SIZE_LABEL,
+                DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+                theme::TRACK_LABEL,
+                width,
+                body.left,
+                body.top + 2.0,
+                theme::fade(self.pal.text_lo, alpha),
+            );
+            self.paragraph(
+                t,
+                family,
+                line,
+                theme::SIZE_BODY + 1.0,
+                width,
+                body.left,
+                body.top + 22.0,
+                theme::fade(self.pal.text_hi, alpha),
+            );
+            return;
+        };
+
+        let live = next.start <= now;
+        let when = if next.all_day {
+            "ALL DAY".to_owned()
+        } else if live {
+            format!(
+                "NOW  \u{00B7}  {} LEFT",
+                span_text(next.end - now).to_uppercase()
+            )
+        } else {
+            format!("IN {}", span_text(next.start - now).to_uppercase())
+        };
+        let tone = if live { BREAK_GREEN } else { cfg.notch.accent };
+        self.label(
+            t,
+            family,
+            &when,
+            theme::SIZE_LABEL,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            theme::TRACK_LABEL,
+            width,
+            body.left,
+            body.top + 2.0,
+            theme::fade(tone, alpha),
+        );
+
+        let title_h = self.label(
+            t,
+            family,
+            &next.title,
+            theme::SIZE_LEAD + 2.0,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            0.0,
+            width,
+            body.left,
+            body.top + 20.0,
+            theme::fade(self.pal.text_hi, alpha),
+        );
+        let mut detail = event_time_range(next, cfg.notch.clock_24h, now);
+        if !next.location.is_empty() {
+            detail = format!("{detail}  \u{00B7}  {}", next.location);
+        }
+        let detail_y = body.top + 24.0 + title_h;
+        self.label(
+            t,
+            family,
+            &detail,
+            theme::SIZE_BODY - 1.0,
+            DWRITE_FONT_WEIGHT_MEDIUM,
+            0.0,
+            width,
+            body.left,
+            detail_y,
+            theme::fade(self.pal.text_mid, alpha),
+        );
+
+        // What comes after it.
+        let mut y = detail_y + 28.0;
+        if events.len() > 1 && y + 20.0 < body.bottom {
+            self.fill_rrect(
+                t,
+                D2D_RECT_F {
+                    left: body.left,
+                    top: y,
+                    right: body.right,
+                    bottom: y + 1.0,
+                },
+                0.5,
+                theme::fade(self.pal.rule, alpha),
+            );
+            y += 10.0;
+        }
+        for ev in events.iter().skip(1) {
+            if y + 18.0 > body.bottom {
+                break;
+            }
+            let time = if ev.all_day {
+                format!("{} all day", day_word(ev.start, now))
+            } else {
+                format!(
+                    "{} {}",
+                    day_word(ev.start, now),
+                    clock_text(ev.start, cfg.notch.clock_24h)
+                )
+            };
+            let time_w = 118.0;
+            self.label(
+                t,
+                crate::fonts::GEIST_MONO,
+                &time,
+                theme::SIZE_BODY - 2.0,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                0.0,
+                time_w,
+                body.left,
+                y + 1.0,
+                theme::fade(self.pal.text_lo, alpha),
+            );
+            self.label(
+                t,
+                family,
+                &ev.title,
+                theme::SIZE_BODY - 1.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                0.0,
+                width - time_w,
+                body.left + time_w,
+                y,
+                theme::fade(self.pal.text_hi, alpha * 0.9),
+            );
+            y += 22.0;
+        }
+    }
+
+    fn paint_controls(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        use crate::notch::toggles::{self, Toggle};
+        let family = &cfg.notch.font_family;
+        let states = toggles::states();
+        self.label(
+            t,
+            family,
+            "QUICK TOGGLES",
+            theme::SIZE_LABEL,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            theme::TRACK_LABEL,
+            body.right - body.left,
+            body.left,
+            body.top + 2.0,
+            theme::fade(self.pal.text_lo, alpha),
+        );
+
+        let tiles = crate::notch::geom::toggle_tiles(body);
+        for (toggle, tile) in Toggle::ALL.into_iter().zip(tiles) {
+            let state = states.get(toggle);
+            let on = state.unwrap_or(false);
+            if on {
+                self.fill_rrect(t, tile, 14.0, theme::fade(cfg.notch.accent, alpha * 0.92));
+            } else {
+                self.fill_rrect(t, tile, 14.0, theme::fade(self.pal.text_hi, alpha * 0.26));
+                self.stroke_rrect(
+                    t,
+                    tile,
+                    14.0,
+                    1.0,
+                    theme::fade(self.pal.text_hi, alpha * 0.34),
+                );
+            }
+            let ink = if on {
+                [0.04, 0.04, 0.06, alpha]
+            } else {
+                theme::fade(self.pal.text_hi, alpha)
+            };
+            let sub = if on {
+                [0.04, 0.04, 0.06, alpha * 0.68]
+            } else {
+                theme::fade(self.pal.text_lo, alpha)
+            };
+            self.glyph(
+                t,
+                toggle.glyph(on),
+                17.0,
+                tile.left + 23.0,
+                tile.top + 23.0,
+                ink,
+            );
+            let text_y = tile.bottom - 38.0;
+            let text_w = tile.right - tile.left - 20.0;
+            self.label(
+                t,
+                family,
+                toggle.label(),
+                theme::SIZE_BODY - 1.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                0.0,
+                text_w,
+                tile.left + 12.0,
+                text_y,
+                ink,
+            );
+            let word = match (toggle, state) {
+                (_, None) => "Unavailable",
+                (Toggle::Mic | Toggle::Sound, Some(false)) => "Muted",
+                (_, Some(true)) => "On",
+                (_, Some(false)) => "Off",
+            };
+            self.label(
+                t,
+                family,
+                word,
+                theme::SIZE_LABEL,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                0.0,
+                text_w,
+                tile.left + 12.0,
+                text_y + 17.0,
+                sub,
+            );
+        }
+    }
+
+    /// Wrapped body text, for messages that may run past one line.
+    #[allow(clippy::too_many_arguments)]
+    fn paragraph(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        family: &str,
+        text: &str,
+        size: f32,
+        max_w: f32,
+        x: f32,
+        y: f32,
+        color: Rgba,
+    ) {
+        let Ok(fmt) = self.text.format(family, size, DWRITE_FONT_WEIGHT_SEMI_BOLD) else {
+            return;
+        };
+        TextEngine::set_wrapping(&fmt, DWRITE_WORD_WRAPPING_WRAP);
+        if let Ok(layout) = self.text.layout(text, &fmt, max_w, size * 6.0) {
+            self.draw_layout(t, &layout, x, y, color);
         }
     }
 
@@ -3524,4 +4051,76 @@ fn build_3sided_border_geometry(
     }
 
     Ok((geometry, current_pt))
+}
+
+/// The colour of a break, and of a meeting that is happening now.
+const BREAK_GREEN: Rgba = [0.30, 0.86, 0.55, 1.0];
+
+/// "45 min", "1 h 20 min", "3 d".
+fn span_text(mins: i64) -> String {
+    let m = mins.max(0);
+    if m < 60 {
+        format!("{} min", m.max(1))
+    } else if m < 1440 {
+        let (h, r) = (m / 60, m % 60);
+        if r == 0 {
+            format!("{h} h")
+        } else {
+            format!("{h} h {r} min")
+        }
+    } else {
+        format!("{} d", m / 1440)
+    }
+}
+
+/// The pill's short form of [`span_text`]: "45m", "1h20", "3d".
+fn span_short(mins: i64) -> String {
+    let m = mins.max(0);
+    if m < 60 {
+        format!("{}m", m.max(1))
+    } else if m < 1440 {
+        let (h, r) = (m / 60, m % 60);
+        if r == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{r:02}")
+        }
+    } else {
+        format!("{}d", m / 1440)
+    }
+}
+
+/// Clock time of a local-minutes timestamp.
+fn clock_text(at: i64, twenty_four: bool) -> String {
+    let m = at.rem_euclid(1440);
+    let (h, mm) = (m / 60, m % 60);
+    if twenty_four {
+        format!("{h:02}:{mm:02}")
+    } else {
+        let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+        format!("{h12}:{mm:02} {}", if h < 12 { "AM" } else { "PM" })
+    }
+}
+
+/// "Today", "Tmrw" or a weekday, for the event list.
+fn day_word(at: i64, now: i64) -> &'static str {
+    let (d, today) = (at.div_euclid(1440), now.div_euclid(1440));
+    match d - today {
+        0 => "Today",
+        1 => "Tmrw",
+        _ => ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+            [crate::notch::calendar::weekday(d) as usize],
+    }
+}
+
+fn event_time_range(ev: &crate::notch::calendar::Event, twenty_four: bool, now: i64) -> String {
+    if ev.all_day {
+        return format!("{}, all day", day_word(ev.start, now));
+    }
+    format!(
+        "{}, {} \u{2013} {}",
+        day_word(ev.start, now),
+        clock_text(ev.start, twenty_four),
+        clock_text(ev.end, twenty_four)
+    )
 }

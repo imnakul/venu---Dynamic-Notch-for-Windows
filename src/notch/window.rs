@@ -307,6 +307,13 @@ struct FrameKey {
     /// Sample revision only while the Stats slide is active, so system
     /// telemetry does not create background work for unrelated slides.
     stats: u64,
+    /// The focus timer, to the second, while a Timer slide is on screen.
+    timer: u64,
+    /// Feed revision and the minute, while a Calendar slide is on screen:
+    /// "in 12 min" has to count down.
+    calendar: (u64, i64),
+    /// The switches' states, while the Quick Toggles slide is on screen.
+    controls: crate::notch::toggles::States,
 }
 
 /// What one frame of the notch asked for.
@@ -617,6 +624,17 @@ impl NotchWindow {
     pub fn tick(&mut self, cfg: &mut AppConfig, dt: f32) -> TickOutcome {
         let mut config_dirty = false;
 
+        // Things that keep time whatever the notch is showing: the focus
+        // timer rolling over, the battery being watched, the calendar feed.
+        // Each is a lock and a comparison unless something is due.
+        let toast_secs = cfg.notch.notifications.toast_duration_secs;
+        crate::notch::timer::tick(&cfg.notch.timer, toast_secs);
+        crate::notch::battery::tick(&cfg.notch.battery, toast_secs);
+        crate::notch::calendar::configure(
+            &cfg.notch.calendar.source,
+            cfg.notch.calendar.refresh_mins,
+        );
+
         // -- geometry -------------------------------------------------------
         // No `SetWindowPos` here: `UpdateLayeredWindow` moves and resizes the
         // window on every frame anyway, and doing it twice would flash the
@@ -852,6 +870,25 @@ impl NotchWindow {
         if stats_visible {
             crate::stats::request_sampling();
         }
+        let shows = |kind: SlideKind| collapsed_shows(kind) || expanded_shows(kind);
+        let timer = if shows(SlideKind::Timer) {
+            crate::notch::timer::view(&cfg.notch.timer).key()
+        } else {
+            0
+        };
+        let calendar = if shows(SlideKind::Calendar) {
+            (
+                crate::notch::calendar::revision(),
+                crate::notch::calendar::now_local(),
+            )
+        } else {
+            (0, 0)
+        };
+        let controls = if shows(SlideKind::Controls) {
+            crate::notch::toggles::states()
+        } else {
+            Default::default()
+        };
         let stats_revision = if stats_visible {
             crate::stats::snapshot().revision
         } else {
@@ -879,18 +916,27 @@ impl NotchWindow {
             media: self.painter.media.revision(),
             notifications: crate::notch::notify::global_store().read().revision(),
             usage: crate::notch::notify::usage_revision(),
-            effect: self.state.effect_time.map(|time| {
-                // A looping effect only moves the key at its capped rate, so
-                // frames in between are skipped like any unchanged frame.
-                let fx = &cfg.notch.border_effect;
-                let fps = if fx.continuous {
-                    BorderEffectConfig::CONTINUOUS_FPS
-                } else {
-                    60.0
-                };
-                (time * fps) as u32
-            }),
+            // An effect scoped away from the notch's current state draws nothing,
+            // so it must not keep the frames coming either.
+            effect: self
+                .state
+                .effect_time
+                .filter(|_| cfg.notch.border_effect.scope.visibility(expand) > 0.004)
+                .map(|time| {
+                    // A looping effect only moves the key at its capped rate, so
+                    // frames in between are skipped like any unchanged frame.
+                    let fx = &cfg.notch.border_effect;
+                    let fps = if fx.continuous {
+                        BorderEffectConfig::CONTINUOUS_FPS
+                    } else {
+                        60.0
+                    };
+                    (time * fps) as u32
+                }),
             stats: stats_revision,
+            timer,
+            calendar,
+            controls,
         }
     }
 
@@ -1002,6 +1048,35 @@ impl NotchWindow {
                         2 => self.painter.media.next(),
                         _ => {}
                     }
+                    break;
+                }
+            }
+            return;
+        }
+
+        if *slide == crate::config::SlideKind::Timer {
+            let body = crate::notch::geom::slide_body(shape);
+            let buttons = crate::notch::geom::timer_buttons(body);
+            for (i, (bx, by, br)) in buttons.into_iter().enumerate() {
+                let hit = br + 5.0;
+                if (cx - bx) * (cx - bx) + (cy - by) * (cy - by) <= hit * hit {
+                    match i {
+                        0 => crate::notch::timer::reset(),
+                        1 => crate::notch::timer::toggle(&cfg.notch.timer),
+                        _ => crate::notch::timer::skip(&cfg.notch.timer),
+                    }
+                    break;
+                }
+            }
+            return;
+        }
+
+        if *slide == crate::config::SlideKind::Controls {
+            let body = crate::notch::geom::slide_body(shape);
+            let tiles = crate::notch::geom::toggle_tiles(body);
+            for (toggle, r) in crate::notch::toggles::Toggle::ALL.into_iter().zip(tiles) {
+                if cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom {
+                    crate::notch::toggles::flip(toggle);
                     break;
                 }
             }

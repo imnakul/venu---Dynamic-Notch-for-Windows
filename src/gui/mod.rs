@@ -6,11 +6,12 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use crate::config::{
-    AppConfig, BorderEffect, BorderEffectConfig, FlashAnim, FlashBackground, FlashContent,
-    FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem,
+    AppConfig, BorderEffect, BorderEffectConfig, EffectScope, FlashAnim, FlashBackground,
+    FlashContent, FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem,
 };
 
 mod color_picker;
+mod effect_preview;
 mod filedlg;
 mod font_setup;
 mod glass;
@@ -302,7 +303,8 @@ const PAGES: &[Page] = &[
             Tab {
                 title: "Border effects",
                 keywords: "rainbow rgb glass reflection shine sweep breathe glow animation \
-                           interval continuous loop duration preview",
+                           interval continuous loop duration preview aurora comet neon \
+                           heartbeat fire pill only open panel",
                 draw: SettingsApp::tab_notch_effects,
             },
         ],
@@ -316,7 +318,7 @@ const PAGES: &[Page] = &[
         tabs: &[
             Tab {
                 title: "Carousel",
-                keywords: "slides order add remove reorder deck faces media clock usage",
+                keywords: "slides order add remove reorder deck faces media clock usage quick \n                           toggles microphone mute dark mode keep awake",
                 draw: SettingsApp::tab_slides_carousel,
             },
             Tab {
@@ -339,6 +341,16 @@ const PAGES: &[Page] = &[
                 keywords: "cpu ram memory gpu power battery system usage monitor",
                 draw: SettingsApp::page_app_stats,
             },
+            Tab {
+                title: "Timer",
+                keywords: "pomodoro focus timer break rounds countdown",
+                draw: SettingsApp::tab_slides_timer,
+            },
+            Tab {
+                title: "Calendar",
+                keywords: "calendar events meetings ical ics google outlook agenda",
+                draw: SettingsApp::tab_slides_calendar,
+            },
         ],
     },
     Page {
@@ -360,7 +372,7 @@ const PAGES: &[Page] = &[
             },
             Tab {
                 title: "Alerts",
-                keywords: "toast duration alert border animation glow drain",
+                keywords: "toast duration alert border animation glow drain battery charging \n                           low battery charger",
                 draw: SettingsApp::tab_notif_alerts,
             },
             Tab {
@@ -1194,6 +1206,217 @@ impl SettingsApp {
 
     fn tab_slides_wallpaper(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_wallpaper(ui, cx.preview, cx.cfg, cx.changed);
+    }
+
+    fn tab_slides_timer(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_timer(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_slides_calendar(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_calendar(ui, cx.cfg, cx.changed);
+    }
+
+    /// "This slide is not in the deck. Add it" — shown on a slide's own tab
+    /// when it is switched off, so setting it up never dead-ends.
+    fn deck_hint(ui: &mut egui::Ui, cfg: &mut AppConfig, kind: SlideKind, changed: &mut bool) {
+        if cfg.notch.slides.contains(&kind) {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("This slide is not in the notch yet.")
+                    .size(11.0)
+                    .color(theme::text_secondary()),
+            );
+            if ui.small_button("Add it").clicked() {
+                cfg.notch.slides.push(kind);
+                *changed = true;
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    fn sec_timer(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::deck_hint(ui, cfg, SlideKind::Timer, changed);
+
+        Self::section_title(ui, "RIGHT NOW");
+        let view = crate::notch::timer::view(&cfg.notch.timer);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(view.clock())
+                    .font(egui::FontId::monospace(26.0))
+                    .color(theme::text_primary()),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "{}{}",
+                    view.phase.label(),
+                    if view.running {
+                        ""
+                    } else {
+                        "  \u{00B7}  PAUSED"
+                    }
+                ))
+                .font(egui::FontId::monospace(10.5))
+                .color(theme::text_tertiary()),
+            );
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let start = egui::Button::new(
+                RichText::new(if view.running { "Pause" } else { "Start" })
+                    .color(theme::on_accent()),
+            )
+            .fill(theme::accent());
+            if ui.add(start).clicked() {
+                crate::notch::timer::toggle(&cfg.notch.timer);
+            }
+            if ui.button("Skip").clicked() {
+                crate::notch::timer::skip(&cfg.notch.timer);
+            }
+            if ui.button("Reset").clicked() {
+                crate::notch::timer::reset();
+            }
+        });
+        // The readout counts down while this tab is open.
+        if view.running {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
+
+        Self::divider(ui);
+        Self::section_title(ui, "LENGTHS");
+        let t = &mut cfg.notch.timer;
+        Self::row_stacked(
+            ui,
+            "Rounds",
+            Some("Each round is focus then a break. After the last round comes a long break."),
+            |ui| {
+                *changed |= Self::slider_line(
+                    ui,
+                    "Focus",
+                    egui::Slider::new(&mut t.focus_mins, 1..=120).suffix(" min"),
+                );
+                *changed |= Self::slider_line(
+                    ui,
+                    "Break",
+                    egui::Slider::new(&mut t.short_break_mins, 1..=30).suffix(" min"),
+                );
+                *changed |= Self::slider_line(
+                    ui,
+                    "Long break",
+                    egui::Slider::new(&mut t.long_break_mins, 1..=60).suffix(" min"),
+                );
+                *changed |=
+                    Self::slider_line(ui, "Rounds", egui::Slider::new(&mut t.rounds, 1..=8));
+            },
+        );
+        if ui
+            .toggle(&mut t.auto_start_breaks, "Start breaks on their own")
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The notch says when each round ends. Start, pause and skip from the Timer \
+                 slide itself, or from here.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+    }
+
+    fn sec_calendar(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        use crate::notch::calendar::{self, Status};
+        Self::deck_hint(ui, cfg, SlideKind::Calendar, changed);
+
+        Self::section_title(ui, "YOUR CALENDAR");
+        let cal = &mut cfg.notch.calendar;
+        Self::row_stacked(
+            ui,
+            "iCal link",
+            Some(
+                "Google Calendar: Settings \u{2192} your calendar \u{2192} \u{201C}Secret address \
+                 in iCal format\u{201D}. Outlook: Settings \u{2192} Calendar \u{2192} Shared \
+                 calendars \u{2192} Publish, then copy the ICS link. A path to an .ics file \
+                 works too.",
+            ),
+            |ui| {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut cal.source)
+                            .hint_text(
+                                RichText::new(
+                                    "https://calendar.google.com/calendar/ical/.../basic.ics",
+                                )
+                                .color(theme::text_tertiary()),
+                            )
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed()
+                {
+                    *changed = true;
+                }
+            },
+        );
+
+        let status = calendar::status();
+        ui.horizontal(|ui| {
+            let (text, tone) = match &status {
+                Status::Unset => ("Not connected".to_owned(), theme::text_tertiary()),
+                Status::Loading => ("Loading\u{2026}".to_owned(), theme::text_secondary()),
+                Status::Ready => ("Connected".to_owned(), Color32::from_rgb(77, 219, 140)),
+                Status::Failed(e) => (e.clone(), Color32::from_rgb(244, 114, 114)),
+            };
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, tone);
+            ui.label(RichText::new(text).size(11.5).color(tone));
+            if !cal.source.trim().is_empty() && ui.small_button("Refresh now").clicked() {
+                calendar::refresh_now();
+            }
+        });
+        if matches!(status, Status::Loading) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        ui.add_space(14.0);
+
+        Self::row_stacked(ui, "Check for changes every", None, |ui| {
+            *changed |= ui
+                .add(egui::Slider::new(&mut cal.refresh_mins, 5..=120).suffix(" min"))
+                .changed();
+        });
+
+        let events = calendar::upcoming(calendar::now_local(), 3);
+        if !events.is_empty() {
+            Self::divider(ui);
+            Self::section_title(ui, "COMING UP");
+            for ev in events {
+                let (y, m, d) = calendar::civil_from_days(ev.start.div_euclid(1440));
+                let when = if ev.all_day {
+                    format!("{y}-{m:02}-{d:02}  all day")
+                } else {
+                    let mins = ev.start.rem_euclid(1440);
+                    format!("{y}-{m:02}-{d:02}  {:02}:{:02}", mins / 60, mins % 60)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(when)
+                            .font(egui::FontId::monospace(11.0))
+                            .color(theme::text_tertiary()),
+                    );
+                    ui.label(
+                        RichText::new(&ev.title)
+                            .size(12.5)
+                            .color(theme::text_primary()),
+                    );
+                });
+            }
+        }
     }
 
     fn tab_slides_marquee(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -2213,7 +2436,12 @@ impl SettingsApp {
                                     .add(
                                         egui::TextEdit::singleline(text)
                                             .desired_width(ui.available_width())
-                                            .hint_text("What should flash across your screen?"),
+                                            .hint_text(
+                                                RichText::new(
+                                                    "What should flash across your screen?",
+                                                )
+                                                .color(theme::text_tertiary()),
+                                            ),
                                     )
                                     .changed()
                                 {
@@ -2273,7 +2501,10 @@ impl SettingsApp {
                                     .add(
                                         egui::TextEdit::singleline(path)
                                             .desired_width(ui.available_width())
-                                            .hint_text("C:\\Users\\...\\flash.jpg"),
+                                            .hint_text(
+                                                RichText::new("C:\\Users\\...\\flash.jpg")
+                                                    .color(theme::text_tertiary()),
+                                            ),
                                     )
                                     .changed()
                                 {
@@ -2739,114 +2970,232 @@ impl SettingsApp {
     }
 
     fn sec_notif_general(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
-        Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
-
+        Self::section_title(ui, "NOTIFICATIONS");
         if ui
             .toggle(
                 &mut cfg.notch.notifications.enabled,
-                "Enable Dynamic Notch notifications",
+                "Show notifications in the notch",
             )
             .changed()
         {
             *changed = true;
         }
-
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "When a notification arrives from an allowed app, the notch springs open into a \
-                 dynamic alert capsule, then smoothly settles back.",
+                "When an app you allow sends a notification, the notch opens into a short alert \
+                 with a glowing border, then settles back. Click the alert to read it in full.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
         );
     }
 
+    /// Names offered as one-click additions to the allowed apps.
+    const SUGGESTED_APPS: [&'static str; 8] = [
+        "Claude",
+        "Codex",
+        "Antigravity",
+        "Cursor",
+        "VS Code",
+        "Terminal",
+        "Slack",
+        "Discord",
+    ];
+
     fn sec_notif_apps(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "ALLOWED APPS");
-
         ui.label(
-            RichText::new("Only notifications from these apps will trigger dynamic alerts:")
-                .size(12.0)
-                .color(theme::text_secondary()),
+            RichText::new(
+                "Only these apps can open the notch. Leave the list empty to let every app \
+                 through.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
         );
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        let presets = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
+        let notes = &mut cfg.notch.notifications;
+        let mut edited = false;
 
+        // The current list, as removable chips.
+        let mut remove = None;
         ui.horizontal_wrapped(|ui| {
-            for preset in presets {
-                let is_allowed = cfg
-                    .notch
-                    .notifications
-                    .allowed_apps
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(preset));
-                if ui.selectable_label(is_allowed, preset).clicked() {
-                    if is_allowed {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .retain(|a| !a.eq_ignore_ascii_case(preset));
-                    } else {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .push(preset.to_string());
-                    }
-                    crate::notch::notify::update_server_allowed_apps(
-                        cfg.notch.notifications.allowed_apps.clone(),
-                    );
-                    *changed = true;
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            if notes.allowed_apps.is_empty() {
+                ui.label(
+                    RichText::new("Every app is allowed")
+                        .size(12.0)
+                        .color(theme::text_tertiary()),
+                );
+            }
+            for (i, app) in notes.allowed_apps.iter().enumerate() {
+                let color = notes.get_app_color(app);
+                if Self::app_chip(ui, app, color) {
+                    remove = Some(i);
                 }
             }
         });
+        if let Some(i) = remove {
+            notes.allowed_apps.remove(i);
+            edited = true;
+        }
 
+        // Add by name.
         ui.add_space(10.0);
-        ui.label(
-            RichText::new(format!(
-                "Active whitelist: {}",
-                if cfg.notch.notifications.allowed_apps.is_empty() {
-                    "All apps allowed (whitelist empty)".to_string()
-                } else {
-                    cfg.notch.notifications.allowed_apps.join(", ")
+        let id = egui::Id::new("notif_add_app");
+        let mut name = ui.data_mut(|d| d.get_temp::<String>(id).unwrap_or_default());
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .hint_text(
+                        RichText::new("App name, as it appears in its notifications")
+                            .color(theme::text_tertiary()),
+                    )
+                    .desired_width(ui.available_width() - 70.0),
+            );
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Add").clicked() || entered) && !name.trim().is_empty() {
+                let new = name.trim().to_owned();
+                if !notes
+                    .allowed_apps
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&new))
+                {
+                    notes.allowed_apps.push(new);
+                    edited = true;
                 }
-            ))
-            .size(11.0)
-            .color(theme::text_tertiary()),
+                name.clear();
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(id, name));
+
+        // Suggestions not yet on the list.
+        let missing: Vec<&str> = Self::SUGGESTED_APPS
+            .into_iter()
+            .filter(|s| !notes.allowed_apps.iter().any(|a| a.eq_ignore_ascii_case(s)))
+            .collect();
+        if !missing.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.label(
+                    RichText::new("Suggestions")
+                        .size(11.0)
+                        .color(theme::text_tertiary()),
+                );
+                for app in missing {
+                    if ui.small_button(format!("+ {app}")).clicked() {
+                        notes.allowed_apps.push(app.to_owned());
+                        edited = true;
+                    }
+                }
+            });
+        }
+
+        if edited {
+            crate::notch::notify::update_server_allowed_apps(notes.allowed_apps.clone());
+            *changed = true;
+        }
+    }
+
+    /// A removable chip for one allowed app. Returns true when its remove
+    /// button was clicked.
+    fn app_chip(ui: &mut egui::Ui, name: &str, color: [f32; 4]) -> bool {
+        let galley = ui.painter().layout_no_wrap(
+            name.to_owned(),
+            egui::FontId::proportional(12.0),
+            theme::text_primary(),
         );
+        let size = Vec2::new(galley.size().x + 48.0, 26.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        ui.painter().rect(
+            rect,
+            Rounding::same(13.0),
+            theme::surface_hover(),
+            Stroke::new(1.0, theme::divider()),
+        );
+        let dot = Color32::from_rgb(
+            (color[0] * 255.0) as u8,
+            (color[1] * 255.0) as u8,
+            (color[2] * 255.0) as u8,
+        );
+        ui.painter()
+            .circle_filled(rect.left_center() + Vec2::new(13.0, 0.0), 4.0, dot);
+        ui.painter().galley(
+            egui::pos2(rect.left() + 23.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            theme::text_primary(),
+        );
+        let x = Rect::from_center_size(
+            rect.right_center() - Vec2::new(13.0, 0.0),
+            Vec2::splat(18.0),
+        );
+        let response = ui
+            .interact(x, ui.id().with(("chip_remove", name)), Sense::click())
+            .on_hover_text(format!("Stop allowing {name}"));
+        if response.hovered() {
+            ui.painter()
+                .circle_filled(x.center(), 9.0, theme::surface_active());
+        }
+        paint_glyph(
+            ui.painter(),
+            Glyph::Close,
+            x.center(),
+            theme::text_secondary(),
+        );
+        response.clicked()
+    }
+
+    fn sec_notif_colors(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::section_title(ui, "APP COLOURS");
+        ui.label(
+            RichText::new("The badge and glowing border each app's alerts wear.")
+                .size(11.0)
+                .color(theme::text_secondary()),
+        );
+        ui.add_space(10.0);
+
+        let notes = &mut cfg.notch.notifications;
+        let apps: Vec<String> = if notes.allowed_apps.is_empty() {
+            Self::SUGGESTED_APPS.iter().map(|s| s.to_string()).collect()
+        } else {
+            notes.allowed_apps.clone()
+        };
+        for app in apps {
+            let mut color = notes.get_app_color(&app);
+            let before = color;
+            Self::color_row(ui, &app, &mut color, changed);
+            if color != before {
+                notes.app_colors.insert(app, color);
+            }
+        }
     }
 
     fn sec_notif_alerts(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
-        Self::section_title(ui, "ALERT SETTINGS");
+        Self::section_title(ui, "ALERTS");
 
-        Self::row_inline(ui, "Toast duration", |ui| {
-            if ui
-                .add(
-                    egui::Slider::new(&mut cfg.notch.notifications.toast_duration_secs, 2.0..=10.0)
+        Self::row_stacked(
+            ui,
+            "How long an alert stays",
+            Some("Before the notch settles back. Hovering it keeps it open."),
+            |ui| {
+                *changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut cfg.notch.notifications.toast_duration_secs,
+                            2.0..=10.0,
+                        )
                         .suffix(" s")
                         .step_by(0.5),
-                )
-                .changed()
-            {
-                *changed = true;
-            }
-        });
+                    )
+                    .changed();
+            },
+        );
 
-        ui.add_space(8.0);
-        Self::row_inline(ui, "Alert Border Animation", |ui| {
-            let current = cfg.notch.notifications.glow_style;
+        Self::row_inline(ui, "Border animation", |ui| {
             egui::ComboBox::from_id_salt("notif_glow_style")
-                .selected_text(current.label())
+                .selected_text(cfg.notch.notifications.glow_style.label())
                 .show_ui(ui, |ui| {
                     for style in crate::config::NotificationGlowStyle::ALL {
                         if ui
@@ -2862,127 +3211,108 @@ impl SettingsApp {
                     }
                 });
         });
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(
-                "When a notification arrives, a glowing border lights up around the 3 sides of the notch \
-                 and dynamically drains down as the visual countdown timer.",
-            )
-            .size(11.0)
-            .color(theme::text_secondary()),
-        );
-    }
 
-    fn sec_notif_colors(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
-        Self::section_title(ui, "APP COLOURS");
-
-        ui.label(
-            RichText::new("Custom glowing badge & border colors for each application:")
-                .size(12.0)
-                .color(theme::text_secondary()),
-        );
-        ui.add_space(6.0);
-
-        let app_list = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
-        for app in app_list {
-            let mut current_color = cfg.notch.notifications.get_app_color(app);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(app).size(13.0).color(theme::text_primary()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .color_edit_button_rgba_unmultiplied(&mut current_color)
-                        .changed()
-                    {
-                        cfg.notch
-                            .notifications
-                            .app_colors
-                            .insert(app.to_string(), current_color);
-                        *changed = true;
-                    }
-                });
-            });
-            ui.add_space(2.0);
+        Self::divider(ui);
+        Self::section_title(ui, "BATTERY");
+        let battery = &mut cfg.notch.battery;
+        if ui
+            .toggle(&mut battery.enabled, "Charging and low-battery alerts")
+            .changed()
+        {
+            *changed = true;
         }
-    }
-
-    fn sec_notif_integration(ui: &mut egui::Ui, cfg: &mut AppConfig, _changed: &mut bool) {
-        Self::section_title(ui, "INTEGRATION & TEST");
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Local Webhook Server:")
-                    .size(12.0)
-                    .color(theme::text_primary()),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "http://127.0.0.1:{}/notify",
-                    cfg.notch.notifications.webhook_port
-                ))
-                .size(12.0)
-                .color(theme::text_tertiary())
-                .monospace(),
-            );
-        });
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "AI agents (Antigravity, Codex, Claude) and CLI scripts can send POST requests with JSON \
-                 {\"app\":\"Antigravity\",\"title\":\"Task Finished\",\"body\":\"Ready to review\"} directly.",
+                "A short alert when the charger goes in or out, and when the battery runs low. \
+                 Nothing happens on a PC without a battery.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
         );
-
         ui.add_space(12.0);
+        ui.add_enabled_ui(battery.enabled, |ui| {
+            Self::row_stacked(
+                ui,
+                "Warn when the battery falls to",
+                Some("And again at half of it."),
+                |ui| {
+                    *changed |= ui
+                        .add(egui::Slider::new(&mut battery.low_pct, 5..=50).suffix("%"))
+                        .changed();
+                },
+            );
+        });
+    }
+
+    fn sec_notif_integration(ui: &mut egui::Ui, cfg: &mut AppConfig, _changed: &mut bool) {
+        Self::section_title(ui, "SEND YOUR OWN");
+        ui.label(
+            RichText::new(
+                "Scripts, build tools and AI agents can raise an alert by posting JSON to Venu's \
+                 local address. It only listens on this PC.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        ui.add_space(10.0);
+
+        let url = format!(
+            "http://127.0.0.1:{}/notify",
+            cfg.notch.notifications.webhook_port
+        );
+        Self::row_inline(ui, "Address", |ui| {
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(url.clone());
+            }
+            ui.label(
+                RichText::new(&url)
+                    .font(egui::FontId::monospace(11.5))
+                    .color(theme::text_primary()),
+            );
+        });
+
+        let example = format!(
+            "curl -X POST {url} -H \"Content-Type: application/json\" \
+             -d '{{\"app\":\"Build\",\"title\":\"Done\",\"body\":\"All tests passed\"}}'"
+        );
+        Frame::none()
+            .fill(Color32::from_black_alpha(70))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&example)
+                            .font(egui::FontId::monospace(10.5))
+                            .color(theme::text_secondary()),
+                    )
+                    .wrap(),
+                );
+            });
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("🚀 Send Antigravity Test Alert").strong())
-                .clicked()
-            {
-                let notif_store = crate::notch::notify::global_store();
-                let dur = cfg.notch.notifications.toast_duration_secs;
-                let allowed = &cfg.notch.notifications.allowed_apps;
-                notif_store.write().push(
-                    "Antigravity",
-                    "Task Completed",
-                    "Dynamic Notch glowing drain border & Hugeicons are active with 0 errors.",
-                    crate::notch::notify::NotificationLevel::Success,
-                    dur,
-                    allowed,
-                );
+            if ui.small_button("Copy example").clicked() {
+                ui.ctx().copy_text(example.clone());
             }
+        });
 
-            ui.add_space(8.0);
-
-            if ui.button("⚡ Send Claude Alert").clicked() {
-                let notif_store = crate::notch::notify::global_store();
-                let dur = cfg.notch.notifications.toast_duration_secs;
-                let allowed = &cfg.notch.notifications.allowed_apps;
-                notif_store.write().push(
-                    "Claude",
-                    "Detailed Card Inspection",
-                    "Clicking this toast will expand the detailed view in Notification Center!",
+        Self::divider(ui);
+        Self::section_title(ui, "TRY IT");
+        ui.horizontal(|ui| {
+            if ui.button("Send a test notification").clicked() {
+                crate::notch::notify::global_store().write().push(
+                    "Venu",
+                    "This is a test",
+                    "Alerts from your allowed apps will look like this.",
                     crate::notch::notify::NotificationLevel::Info,
-                    dur,
-                    allowed,
+                    cfg.notch.notifications.toast_duration_secs,
+                    &[],
                 );
             }
-
-            ui.add_space(8.0);
-
-            if ui.button("Clear All").clicked() {
-                let notif_store = crate::notch::notify::global_store();
-                notif_store.write().clear_all();
+            if ui.button("Clear all notifications").clicked() {
+                crate::notch::notify::global_store().write().clear_all();
             }
         });
     }
@@ -3254,6 +3584,21 @@ impl SettingsApp {
     }
 
     fn sec_notch_effects(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::section_title(ui, "LIVE PREVIEW");
+        let open_id = egui::Id::new("effect_preview_open");
+        let mut open = ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
+        ui.horizontal(|ui| {
+            for (value, label) in [(false, "Pill"), (true, "Open panel")] {
+                if Self::segment(ui, label, open == value).clicked() {
+                    open = value;
+                }
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(open_id, open));
+        ui.add_space(8.0);
+        effect_preview::show(ui, &cfg.notch.border_effect, open, cfg.notch.accent);
+        ui.add_space(18.0);
+
         Self::section_title(ui, "BORDER EFFECTS");
 
         let fx = &mut cfg.notch.border_effect;
@@ -3275,6 +3620,26 @@ impl SettingsApp {
                 *changed = true;
             }
         });
+
+        if fx.effect != BorderEffect::Off {
+            Self::row_stacked(
+                ui,
+                "Plays on",
+                Some("Keep the open panel calm, or let the resting pill do the showing off."),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        for scope in EffectScope::ALL {
+                            if Self::segment(ui, scope.label(), fx.scope == scope).clicked()
+                                && fx.scope != scope
+                            {
+                                fx.scope = scope;
+                                *changed = true;
+                            }
+                        }
+                    });
+                },
+            );
+        }
 
         if fx.effect != BorderEffect::Off {
             Self::row_stacked(
@@ -3367,7 +3732,7 @@ impl SettingsApp {
                 .add(
                     egui::TextEdit::singleline(&mut cfg.status.heading)
                         .desired_width(f32::INFINITY)
-                        .hint_text("TODAY"),
+                        .hint_text(RichText::new("TODAY").color(theme::text_tertiary())),
                 )
                 .changed()
             {
@@ -3381,7 +3746,9 @@ impl SettingsApp {
                     egui::TextEdit::multiline(&mut cfg.status.focus)
                         .desired_width(f32::INFINITY)
                         .desired_rows(2)
-                        .hint_text("What are you working on?"),
+                        .hint_text(
+                            RichText::new("What are you working on?").color(theme::text_tertiary()),
+                        ),
                 )
                 .changed()
             {
@@ -3416,7 +3783,10 @@ impl SettingsApp {
                         .add(
                             egui::TextEdit::singleline(&mut item.text)
                                 .desired_width(ui.available_width())
-                                .hint_text("Something else today"),
+                                .hint_text(
+                                    RichText::new("Something else today")
+                                        .color(theme::text_tertiary()),
+                                ),
                         )
                         .changed()
                     {
@@ -3569,7 +3939,10 @@ impl SettingsApp {
                     .add(
                         egui::TextEdit::singleline(&mut cfg.wallpaper.caption)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Why this is on your screen"),
+                            .hint_text(
+                                RichText::new("Why this is on your screen")
+                                    .color(theme::text_tertiary()),
+                            ),
                     )
                     .changed()
                 {
@@ -3743,6 +4116,16 @@ impl eframe::App for SettingsApp {
                             RichText::new(concat!("Venu ", env!("CARGO_PKG_VERSION")))
                                 .font(egui::FontId::monospace(10.0))
                                 .color(theme::text_tertiary()),
+                        );
+                    });
+                    // Bottom-up, so this sits just above the version.
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("Jai Shree Krishna \u{1F64F}")
+                                .size(11.5)
+                                .italics()
+                                .color(theme::text_secondary()),
                         );
                     });
                     ui.add_space(4.0);
