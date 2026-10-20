@@ -88,6 +88,19 @@ jobs:
         shell: pwsh
         run: Copy-Item "target/release/venu.exe" "venu-$env:VERSION.exe"
 
+      - name: Extract this version's notes from CHANGELOG.md
+        shell: bash
+        run: |
+          # Everything under "## [VERSION]" up to the next "## " heading.
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "See the commits below." > release-notes.md
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -96,4 +109,5 @@ jobs:
           files: |
             venu-*.exe
             dist/venu-setup-*.exe
+          body_path: release-notes.md
           generate_release_notes: true

@@ -86,6 +86,13 @@ Available slides include:
 - **Marquee**: Moving reminder or custom text
 - **AI Usage**: Claude, Codex, and Antigravity usage information
 - **Stats**: whole-PC CPU and physical RAM, the busiest GPU engine, and battery or AC power
+- **Focus Timer**: Pomodoro rounds and breaks, with the countdown in the resting pill
+- **Calendar**: your next meeting and what follows, from a Google Calendar or Outlook iCal link
+- **Quick Toggles**: mute the microphone or sound, switch dark mode, keep the PC awake
+
+### Border Effects
+
+The notch can play an effect around its edge on an interval or continuously: Rainbow, Glass reflection, Colour sweeps, Breathing glow, Aurora, Comet, Neon sign, Heartbeat and Fire. Effects can play on the resting pill, the open panel, or both, and Settings shows a live preview. Nothing is drawn between runs.
 
 ### Media Controls
 
@@ -105,6 +112,7 @@ Turn the Dynamic Notch into a lightweight notification hub.
 - Application-specific colors
 - Custom animated notification glow styles
 - Local webhook support for external tools and scripts
+- Charging, unplugged and low-battery alerts
 
 ### AI Agent and Developer Notifications
 
