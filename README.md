@@ -90,9 +90,37 @@ Available slides include:
 - **Calendar**: your next meeting and what follows, from a Google Calendar or Outlook iCal link
 - **Quick Toggles**: mute the microphone or sound, switch dark mode, keep the PC awake
 
+<p align="center">
+  <img src="docs/screenshots/quick-toggles.png" alt="The open notch on the Quick Toggles slide, with tiles for Microphone, Sound, Dark mode and Keep awake" width="420">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/focus-timer-pill.png" alt="The resting notch pill showing the Focus Timer counting down from 25:00" width="560">
+  <br>
+  <img src="docs/screenshots/quick-toggles-pill.png" alt="The resting notch pill showing the Quick Toggles as four small icons" width="400">
+</p>
+<p align="center"><sub>Focus Timer and Quick Toggles on the resting pill.</sub></p>
+
 ### Border Effects
 
 The notch can play an effect around its edge on an interval or continuously: Rainbow, Glass reflection, Colour sweeps, Breathing glow, Aurora, Comet, Neon sign, Heartbeat and Fire. Effects can play on the resting pill, the open panel, or both, and Settings shows a live preview. Nothing is drawn between runs.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/border-effect-rainbow.png" alt="Settings, Appearance, Border effects: the Rainbow border playing on the live preview and on the real notch above the window"></td>
+    <td><img src="docs/screenshots/border-effect-neon.png" alt="Settings, Appearance, Border effects: the Neon sign effect glowing cyan on the live preview and on the real notch"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Rainbow border</sub></td>
+    <td align="center"><sub>Neon sign</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/screenshots/border-effect-fire.png" alt="The resting notch pill showing the clock with the Fire effect burning along its edge" width="600">
+  <br>
+  <sub>Fire, on the resting pill.</sub>
+</p>
 
 ### Media Controls
 
@@ -143,6 +171,32 @@ Display scrolling text around the edges of your Windows desktop.
 - Unicode support including Latin, Devanagari, CJK, and symbols
 
 Use it for reminders, quotes, status information, temporary notes, or anything you want to keep visible while working.
+
+### Settings Window
+
+A floating glass window that sits beside your work. Seven pages in three groups, each split into tabs, with a search box (Ctrl+F) that jumps straight to any setting.
+
+- Frosted glass over your desktop, with a Glass strength slider
+- Your own accent colour for switches, tabs, sliders and the selected page
+- Sliders for every number, switches instead of checkboxes, gliding tabs
+- A wallpaper picker that shows exactly how the notch will frame your image
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/settings-general.png" alt="Venu Settings, General page: switches for showing the notch, keeping it on top, click-through and scroll-to-switch"></td>
+    <td><img src="docs/screenshots/settings-accent-and-glass.png" alt="Venu Settings, Preferences page: accent colour swatches and the Glass strength slider"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>General</sub></td>
+    <td align="center"><sub>Accent colour and glass</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/screenshots/settings-wallpaper.png" alt="Venu Settings, Slides page, Wallpaper tab: the chosen image framed exactly as the open notch will show it, with a zoom slider" width="720">
+  <br>
+  <sub>Framing a wallpaper for the notch.</sub>
+</p>
 
 ### Glass and Surface Themes
 
