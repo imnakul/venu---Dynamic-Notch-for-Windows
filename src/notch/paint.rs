@@ -16,10 +16,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FIGURE_END_OPEN, D2D_POINT_2F, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry,
-    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_BRUSH_PROPERTIES,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_ROUNDED_RECT,
+    ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Layer,
+    ID2D1PathGeometry, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_COMBINE_MODE_EXCLUDE,
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+    D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_EXTRA_BOLD,
@@ -549,10 +551,18 @@ impl Painter {
 
         let expand = state.expand.value.clamp(0.0, 1.0);
 
-        self.paint_shadow(&t, &shape, expand);
+        let geometry = shape.build(&factory).ok();
+        self.paint_shadow(
+            &t,
+            &factory,
+            geometry.as_ref(),
+            &shape,
+            expand,
+            (win_w, win_h),
+        );
 
         // The slab itself.
-        if let Ok(geometry) = shape.build(&factory) {
+        if let Some(geometry) = geometry {
             // Frosted lays a blurred capture of the desktop under a
             // half-transparent tint; the other themes are just the tint. The
             // capture is drawn through a bitmap brush rather than a layer so
@@ -1058,7 +1068,47 @@ impl Painter {
 
     /// Stacked rings of decreasing alpha standing in for a real blur. Cheap,
     /// and at this radius indistinguishable from a Gaussian shadow.
-    fn paint_shadow(&self, t: &ID2D1DCRenderTarget, shape: &NotchShape, expand: f32) {
+    ///
+    /// The rings are masked to fall outside the slab. Under an opaque surface
+    /// that changes nothing, but the glass themes are see-through, and a
+    /// shadow showing through them reads as a second, darker panel with its
+    /// own rounded top sitting under the shoulders.
+    fn paint_shadow(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        factory: &ID2D1Factory,
+        slab: Option<&ID2D1PathGeometry>,
+        shape: &NotchShape,
+        expand: f32,
+        (win_w, win_h): (u32, u32),
+    ) {
+        let bounds = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: win_w as f32,
+            bottom: win_h as f32,
+        };
+        let mask = slab.and_then(|slab| outside(factory, bounds, slab).ok());
+        if let Some(mask) = &mask {
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: bounds,
+                geometricMask: std::mem::ManuallyDrop::new(Some(mask.cast().unwrap())),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: Matrix3x2::identity(),
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            unsafe { t.PushLayer(&params, None::<&ID2D1Layer>) };
+            drop(std::mem::ManuallyDrop::into_inner(params.geometricMask));
+        }
+        self.paint_shadow_rings(t, shape, expand);
+        if mask.is_some() {
+            unsafe { t.PopLayer() };
+        }
+    }
+
+    fn paint_shadow_rings(&self, t: &ID2D1DCRenderTarget, shape: &NotchShape, expand: f32) {
         const RINGS: u32 = 14;
         let spread = theme::shadow_spread(expand);
         // A light panel over a light desktop needs a harder shadow than a
@@ -3991,6 +4041,23 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgba {
 /// the geometry and the leading tip coordinate. Walks the same perimeter
 /// points `NotchShape::rim_points` produces as a polyline, so the two stay
 /// in sync and neither needs to reason about Direct2D arc sweep directions.
+/// Everything in `bounds` except `slab`: the mask that keeps the shadow off
+/// the glass.
+fn outside(
+    factory: &ID2D1Factory,
+    bounds: D2D_RECT_F,
+    slab: &ID2D1PathGeometry,
+) -> windows::core::Result<ID2D1PathGeometry> {
+    let rect = unsafe { factory.CreateRectangleGeometry(&bounds)? };
+    let out = unsafe { factory.CreatePathGeometry()? };
+    let sink = unsafe { out.Open()? };
+    unsafe {
+        rect.CombineWithGeometry(slab, D2D1_COMBINE_MODE_EXCLUDE, None, 0.25, &sink)?;
+        sink.Close()?;
+    }
+    Ok(out)
+}
+
 fn build_3sided_border_geometry(
     factory: &ID2D1Factory,
     shape: &NotchShape,
