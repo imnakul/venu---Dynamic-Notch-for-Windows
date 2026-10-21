@@ -2,6 +2,14 @@
 
 What's new in each version of Venu, written for the people who use it.
 
+## [0.5.1] - 2026-10-21
+
+### Fixed
+- **Glass notch looks like one piece again.** On the see-through themes, a
+  faint band showed across the top of the resting pill, and the open notch
+  looked like a separate darker panel under a lighter strip. The notch's
+  shadow was showing through the glass; it now only falls around the notch.
+
 ## [0.5.0] - 2026-10-21
 
 The biggest update yet: a redesigned Settings window, three new slides, border
