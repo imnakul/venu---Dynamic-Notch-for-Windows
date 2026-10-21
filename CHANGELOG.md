@@ -2,6 +2,14 @@
 
 What's new in each version of Venu, written for the people who use it.
 
+## [0.5.2] - 2026-10-21
+
+### Improved
+- **Lighter, quicker start-up.** When you sign in to Windows, Venu now starts
+  with just the notch and its tray icon. The Settings window is only created
+  the first time you open it, so Venu uses less memory while it sits in the
+  tray, and Settings reliably comes back when you open it again from the tray.
+
 ## [0.5.1] - 2026-10-21
 
 ### Fixed
