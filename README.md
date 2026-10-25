@@ -101,6 +101,34 @@ Available slides include:
 </p>
 <p align="center"><sub>Focus Timer and Quick Toggles on the resting pill.</sub></p>
 
+### Split Pill
+
+Show more than one thing at a glance without a second notch. With **Settings > General > Layout > Split pill** on, the resting pill keeps its usual face in the middle and adds a fixed face on either side — for example the time on the left and CPU / RAM on the right.
+
+- Any slide can be a side segment: Clock, Stats, Moving text, Timer, Calendar, Now Playing and more
+- A side that matches the middle face hides itself, so nothing is ever shown twice
+- Hover a side segment and the panel opens straight onto that slide; when it closes, the pill goes back to the face it was resting on
+
+### Satellite Pods
+
+Live activities bud out of the notch as small pods beside it, and merge back into it when you open the panel (**Settings > General > Layout > Satellite pods**).
+
+- **Coding agents at work** — e.g. Claude Code, with how long it has been running (see below)
+- **Focus timer** running, with its countdown ring
+- **A meeting** happening now or starting soon
+- **Music** that is playing
+- At most two at once, in priority order; a pod never repeats a face already on the pill
+- Hover a pod to open the notch onto its slide
+
+### Notch Shape
+
+**Settings > Appearance > Shape** controls the silhouette and finish, with a live preview:
+
+- Style presets — **Classic**, **Pill**, **Soft**, **Sharp** — as starting points
+- Corner roundness for the resting pill and the open panel
+- Shoulder size: how the notch melts into the top edge (0 for square shoulders)
+- Outline, glass sheen and shadow strength, relative to the chosen theme
+
 ### Border Effects
 
 The notch can play an effect around its edge on an interval or continuously: Rainbow, Glass reflection, Colour sweeps, Breathing glow, Aurora, Comet, Neon sign, Heartbeat and Fire. Effects can play on the resting pill, the open panel, or both, and Settings shows a live preview. Nothing is drawn between runs.
@@ -156,6 +184,15 @@ This can be useful for events such as:
 - Deployment status
 - Background scripts finishing
 - Agent attention or approval requests
+
+Work in progress can also be shown as a satellite pod. Post to `/activity` when something starts, and Venu shows a pod counting up beside the notch:
+
+```bash
+curl -X POST http://127.0.0.1:18923/activity -H "Content-Type: application/json" \
+  -d '{"app":"Claude","state":"start"}'
+```
+
+Post `"state":"stop"` when it ends — or just send a normal notification with `"level":"success"` from the same app, which closes it too. Anything not stopped is dropped after an hour. For Claude Code, register `scripts/notch-hooks/claude-activity.ps1` as a `UserPromptSubmit` hook; the existing Stop hook (`claude-notify.ps1`) already ends the pod.
 
 ### Edge Marquee
 

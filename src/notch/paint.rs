@@ -13,10 +13,10 @@ use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN, D2D_POINT_2F, D2D_RECT_F,
+    D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D_POINT_2F, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Layer,
+    ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry, ID2D1Layer,
     ID2D1PathGeometry, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_COMBINE_MODE_EXCLUDE,
@@ -37,6 +37,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use crate::config::{AppConfig, SlideKind};
 use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::geom::NotchShape;
+use crate::notch::layout::PodKind;
 use crate::notch::media::{MediaWatcher, NowPlaying};
 use crate::notch::state::NotchState;
 use crate::notch::surface::D2DSurface;
@@ -105,6 +106,41 @@ pub enum Motion {
     Ambient,
     /// Motion that has to be smooth: keep the full frame rate.
     Continuous,
+}
+
+/// One side segment of the split pill: which face, where, how visible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentDraw {
+    pub kind: SlideKind,
+    pub left: f32,
+    pub right: f32,
+    pub alpha: f32,
+}
+
+/// One satellite pod: what it shows, its own silhouette, how visible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PodDraw {
+    pub kind: PodKind,
+    pub shape: NotchShape,
+    pub alpha: f32,
+}
+
+/// Everything drawn besides the main slab and its slide. Built by the window
+/// from the notch state each tick, and part of its frame key, so the frame
+/// gate covers it like everything else. Empty — and free — unless the split
+/// pill or pods are switched on and showing something.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Scene {
+    /// `[left, right]` side segments of the split pill.
+    pub segments: [Option<SegmentDraw>; 2],
+    /// `[right, left]` satellite pods.
+    pub pods: [Option<PodDraw>; 2],
+}
+
+impl Scene {
+    fn has_pods(&self) -> bool {
+        self.pods.iter().any(Option::is_some)
+    }
 }
 
 pub struct Painter {
@@ -503,6 +539,7 @@ impl Painter {
         cfg: &AppConfig,
         state: &NotchState,
         shape: NotchShape,
+        scene: &Scene,
         origin: (i32, i32),
         may_capture: bool,
     ) -> windows::core::Result<()> {
@@ -512,6 +549,12 @@ impl Painter {
         }
 
         self.pal = theme::Palette::for_theme(cfg.notch.theme);
+        // The user's finish strengths scale the theme's own values, so every
+        // theme keeps its character and "1.0" is exactly the theme as shipped.
+        let finish = &cfg.notch.shape;
+        self.pal.edge[3] *= finish.outline_strength();
+        self.pal.sheen[3] *= finish.sheen_strength();
+        self.pal.shadow_strength *= finish.shadow_strength();
         // Each frame reports its own motion from scratch.
         self.motion.set(Motion::Still);
 
@@ -552,49 +595,49 @@ impl Painter {
         let expand = state.expand.value.clamp(0.0, 1.0);
 
         let geometry = shape.build(&factory).ok();
+        // Pods are separate little slabs. Their outlines are built only when
+        // there are pods to draw, so a notch without any pays nothing here.
+        let pod_geometry: [Option<ID2D1PathGeometry>; 2] = std::array::from_fn(|i| {
+            scene.pods[i]
+                .as_ref()
+                .and_then(|pod| pod.shape.build(&factory).ok())
+        });
         self.paint_shadow(
             &t,
             &factory,
             geometry.as_ref(),
             &shape,
+            scene,
+            &pod_geometry,
             expand,
             (win_w, win_h),
         );
 
-        // The slab itself.
-        if let Some(geometry) = geometry {
-            // Frosted lays a blurred capture of the desktop under a
-            // half-transparent tint; the other themes are just the tint. The
-            // capture is drawn through a bitmap brush rather than a layer so
-            // it takes the silhouette exactly, shoulders included.
-            if self.pal.blur_backdrop && may_capture {
-                self.paint_backdrop(&t, &geometry, &shape, origin);
-            }
-
-            if let Ok(fill) = self.brush(&t, cfg.notch.surface) {
-                unsafe { t.FillGeometry(&geometry, &fill, None) };
-            }
-            // Hairline edge, then a brighter specular lip across the top third.
-            // Neither runs along a fused top: that edge is the screen's.
-            let outline = shape.build_edge(&factory).ok();
-            if let (Some(outline), Ok(edge)) = (&outline, self.brush(&t, self.pal.edge)) {
-                unsafe { t.DrawGeometry(outline, &edge, 1.0, None) };
-            }
-            if let Ok(inner) = shape.inset(0.9).build_edge(&factory) {
-                if let Ok(sheen) = self.brush(&t, self.pal.sheen) {
-                    self.clip(
-                        &t,
-                        D2D_RECT_F {
-                            left: shape.left - shape.flare,
-                            top: shape.top,
-                            right: shape.right + shape.flare,
-                            bottom: shape.top + shape.height() * 0.42,
-                        },
-                    );
-                    unsafe { t.DrawGeometry(&inner, &sheen, 1.4, None) };
-                    self.unclip(&t);
+        // Frosted and friends lay a blurred capture of the desktop under a
+        // half-transparent tint. One capture covers the notch and its pods.
+        if self.pal.blur_backdrop && may_capture {
+            let mut slabs: Vec<(&ID2D1PathGeometry, &NotchShape, f32)> = Vec::with_capacity(3);
+            for (pod, geo) in scene.pods.iter().zip(&pod_geometry) {
+                if let (Some(pod), Some(geo)) = (pod, geo) {
+                    slabs.push((geo, &pod.shape, pod.alpha));
                 }
             }
+            if let Some(geo) = &geometry {
+                slabs.push((geo, &shape, 1.0));
+            }
+            self.paint_backdrop(&t, &slabs, origin);
+        }
+
+        // Pods before the slab: while they bud out they are tucked under it.
+        for (pod, geo) in scene.pods.iter().zip(&pod_geometry) {
+            if let (Some(pod), Some(geo)) = (pod, geo) {
+                self.paint_glass(&t, &factory, &pod.shape, geo, cfg.notch.surface, pod.alpha);
+            }
+        }
+
+        // The slab itself.
+        if let Some(geometry) = geometry {
+            let outline = self.paint_glass(&t, &factory, &shape, &geometry, cfg.notch.surface, 1.0);
 
             // The periodic border effect, if one is mid-run. Above the glass,
             // under the content, and never over a notification glow.
@@ -627,15 +670,32 @@ impl Painter {
 
         if collapsed_alpha > 0.004 {
             let idx = state.active.min(slides.len().saturating_sub(1));
-            self.paint_collapsed(
-                &t,
-                cfg,
-                state,
-                slides[idx],
-                shape,
-                collapsed_alpha,
-                generation,
-            );
+            let toast_up = crate::notch::notify::global_store()
+                .read()
+                .active_toast
+                .is_some();
+            if toast_up || scene.segments.iter().all(Option::is_none) {
+                self.paint_collapsed(
+                    &t,
+                    cfg,
+                    state,
+                    slides[idx],
+                    shape,
+                    collapsed_alpha,
+                    generation,
+                );
+            } else {
+                self.paint_split(
+                    &t,
+                    cfg,
+                    state,
+                    slides[idx],
+                    shape,
+                    scene,
+                    collapsed_alpha,
+                    generation,
+                );
+            }
         }
 
         if expanded_alpha > 0.004 {
@@ -659,6 +719,11 @@ impl Painter {
         self.paint_click_through(&t, cfg, state, shape);
 
         self.unclip(&t);
+
+        // Pod faces, each clipped to its own little slab.
+        for pod in scene.pods.iter().flatten() {
+            self.paint_pod_face(&t, cfg, pod);
+        }
 
         unsafe { t.EndDraw(None, None)? };
         Ok(())
@@ -1015,23 +1080,43 @@ impl Painter {
 
     /// Capture the desktop under the slab, blurred, and fill the silhouette
     /// with it. Silently does nothing if the capture is unavailable.
+    /// Fill each slab with a blurred capture of the desktop behind it.
+    ///
+    /// One capture covers the bounding box of every slab — the notch and any
+    /// pods — so pods add no extra screen grab, only a slightly wider one.
     fn paint_backdrop(
         &mut self,
         t: &ID2D1DCRenderTarget,
-        geometry: &windows::Win32::Graphics::Direct2D::ID2D1PathGeometry,
-        shape: &NotchShape,
+        slabs: &[(&ID2D1PathGeometry, &NotchShape, f32)],
         origin: (i32, i32),
     ) {
+        if slabs.is_empty() {
+            return;
+        }
         // What is behind the notch is not ours to watch for changes, so a
         // glass theme has to keep resampling. Ambient rather than continuous:
         // a blur this heavy, behind a strip this small, reads the same at a
         // few frames a second as it does at sixty.
         self.report(Motion::Ambient);
 
-        let x = origin.0 + shape.left.floor() as i32;
-        let y = origin.1 + shape.top.floor() as i32;
-        let w = shape.width().ceil() as i32;
-        let h = shape.height().ceil() as i32;
+        let left = slabs
+            .iter()
+            .map(|(_, s, _)| s.left)
+            .fold(f32::MAX, f32::min);
+        let right = slabs
+            .iter()
+            .map(|(_, s, _)| s.right)
+            .fold(f32::MIN, f32::max);
+        let top = slabs.iter().map(|(_, s, _)| s.top).fold(f32::MAX, f32::min);
+        let bottom = slabs
+            .iter()
+            .map(|(_, s, _)| s.bottom)
+            .fold(f32::MIN, f32::max);
+
+        let x = origin.0 + left.floor() as i32;
+        let y = origin.1 + top.floor() as i32;
+        let w = (right - left).ceil() as i32;
+        let h = (bottom - top).ceil() as i32;
 
         let Some((bitmap, sx, sy)) = self.backdrop.sample(t, x, y, w, h, self.pal.blur_downscale)
         else {
@@ -1061,9 +1146,53 @@ impl Painter {
                 M31: 0.0,
                 M32: 0.0,
             };
-            brush.SetTransform(&(stretch * Matrix3x2::translation(shape.left, shape.top)));
-            t.FillGeometry(geometry, &brush, None);
+            brush.SetTransform(&(stretch * Matrix3x2::translation(left, top)));
+            for (geometry, _, alpha) in slabs {
+                brush.SetOpacity(alpha.clamp(0.0, 1.0));
+                t.FillGeometry(*geometry, &brush, None);
+            }
         }
+    }
+
+    /// The glass of one slab: tint, hairline edge and the specular lip, all
+    /// at `alpha`. Shared by the notch and its pods so they are one material.
+    /// Returns the edge outline, which the border effects trace.
+    fn paint_glass(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        factory: &ID2D1Factory,
+        shape: &NotchShape,
+        geometry: &ID2D1PathGeometry,
+        surface: Rgba,
+        alpha: f32,
+    ) -> Option<ID2D1PathGeometry> {
+        if let Ok(fill) = self.brush(t, theme::fade(surface, alpha)) {
+            unsafe { t.FillGeometry(geometry, &fill, None) };
+        }
+        // Hairline edge, then a brighter specular lip across the top third.
+        // Neither runs along a fused top: that edge is the screen's.
+        let outline = shape.build_edge(factory).ok();
+        if let (Some(outline), Ok(edge)) =
+            (&outline, self.brush(t, theme::fade(self.pal.edge, alpha)))
+        {
+            unsafe { t.DrawGeometry(outline, &edge, 1.0, None) };
+        }
+        if let Ok(inner) = shape.inset(0.9).build_edge(factory) {
+            if let Ok(sheen) = self.brush(t, theme::fade(self.pal.sheen, alpha)) {
+                self.clip(
+                    t,
+                    D2D_RECT_F {
+                        left: shape.left - shape.flare,
+                        top: shape.top,
+                        right: shape.right + shape.flare,
+                        bottom: shape.top + shape.height() * 0.42,
+                    },
+                );
+                unsafe { t.DrawGeometry(&inner, &sheen, 1.4, None) };
+                self.unclip(t);
+            }
+        }
+        outline
     }
 
     /// Stacked rings of decreasing alpha standing in for a real blur. Cheap,
@@ -1073,12 +1202,15 @@ impl Painter {
     /// that changes nothing, but the glass themes are see-through, and a
     /// shadow showing through them reads as a second, darker panel with its
     /// own rounded top sitting under the shoulders.
+    #[allow(clippy::too_many_arguments)]
     fn paint_shadow(
         &self,
         t: &ID2D1DCRenderTarget,
         factory: &ID2D1Factory,
         slab: Option<&ID2D1PathGeometry>,
         shape: &NotchShape,
+        scene: &Scene,
+        pod_geometry: &[Option<ID2D1PathGeometry>; 2],
         expand: f32,
         (win_w, win_h): (u32, u32),
     ) {
@@ -1088,7 +1220,21 @@ impl Painter {
             right: win_w as f32,
             bottom: win_h as f32,
         };
-        let mask = slab.and_then(|slab| outside(factory, bounds, slab).ok());
+        // The mask excludes every slab — notch and pods — so no shadow shows
+        // through glass. A group is only built when there are pods.
+        let glass: Option<ID2D1Geometry> = if scene.has_pods() {
+            let parts: Vec<Option<ID2D1Geometry>> = slab
+                .into_iter()
+                .chain(pod_geometry.iter().flatten())
+                .map(|g| g.cast().ok())
+                .collect();
+            unsafe { factory.CreateGeometryGroup(D2D1_FILL_MODE_WINDING, &parts) }
+                .ok()
+                .and_then(|group| group.cast().ok())
+        } else {
+            slab.and_then(|g| g.cast().ok())
+        };
+        let mask = glass.and_then(|glass| outside(factory, bounds, &glass).ok());
         if let Some(mask) = &mask {
             let params = D2D1_LAYER_PARAMETERS {
                 contentBounds: bounds,
@@ -1102,18 +1248,27 @@ impl Painter {
             unsafe { t.PushLayer(&params, None::<&ID2D1Layer>) };
             drop(std::mem::ManuallyDrop::into_inner(params.geometricMask));
         }
-        self.paint_shadow_rings(t, shape, expand);
+        self.paint_shadow_rings(t, shape, expand, 1.0);
+        for pod in scene.pods.iter().flatten() {
+            self.paint_shadow_rings(t, &pod.shape, 0.0, pod.alpha);
+        }
         if mask.is_some() {
             unsafe { t.PopLayer() };
         }
     }
 
-    fn paint_shadow_rings(&self, t: &ID2D1DCRenderTarget, shape: &NotchShape, expand: f32) {
+    fn paint_shadow_rings(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        shape: &NotchShape,
+        expand: f32,
+        opacity: f32,
+    ) {
         const RINGS: u32 = 14;
         let spread = theme::shadow_spread(expand);
         // A light panel over a light desktop needs a harder shadow than a
         // black slab does to separate from it at all.
-        let strength = lerp(0.16, 0.34, expand) * self.pal.shadow_strength;
+        let strength = lerp(0.16, 0.34, expand) * self.pal.shadow_strength * opacity;
 
         for i in (0..RINGS).rev() {
             let f = (i as f32 + 1.0) / RINGS as f32;
@@ -1154,10 +1309,7 @@ impl Painter {
         generation: u64,
     ) {
         let family = &cfg.notch.font_family;
-        let pad = theme::PILL_GUTTER;
-        let cx = (shape.left + shape.right) * 0.5;
         let cy = (shape.top + shape.bottom) * 0.5;
-        let inner_w = (shape.width() - pad * 2.0).max(10.0);
 
         let notif_store = crate::notch::notify::global_store();
         let store_read = notif_store.read();
@@ -1226,6 +1378,32 @@ impl Painter {
             );
             return;
         }
+        // Released before the face is drawn: the Notifications face takes
+        // its own read of the same store.
+        drop(store_read);
+
+        self.paint_face(t, cfg, state, slide, shape, alpha, generation);
+    }
+
+    /// One slide's compact face, laid out inside `shape`: the whole pill, or
+    /// one segment of a split pill. Every face sizes itself from the shape it
+    /// is given, which is what lets the split pill reuse them unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_face(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        state: &NotchState,
+        slide: SlideKind,
+        shape: NotchShape,
+        alpha: f32,
+        generation: u64,
+    ) {
+        let family = &cfg.notch.font_family;
+        let pad = theme::PILL_GUTTER;
+        let cx = (shape.left + shape.right) * 0.5;
+        let cy = (shape.top + shape.bottom) * 0.5;
+        let inner_w = (shape.width() - pad * 2.0).max(10.0);
 
         match slide {
             SlideKind::Clock => {
@@ -1726,6 +1904,226 @@ impl Painter {
                     self.glyph(t, toggle.glyph(on), 13.0, x, cy, color);
                 }
             }
+        }
+    }
+
+    // -- split pill and pods ------------------------------------------------
+
+    /// The resting pill split into segments: the face the notch is resting
+    /// on in the middle, a fixed face either side, a hairline between.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_split(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        state: &NotchState,
+        center: SlideKind,
+        shape: NotchShape,
+        scene: &Scene,
+        alpha: f32,
+        generation: u64,
+    ) {
+        let [left, right] = scene.segments;
+        let middle = NotchShape {
+            left: left.map(|s| s.right).unwrap_or(shape.left),
+            right: right.map(|s| s.left).unwrap_or(shape.right),
+            ..shape
+        };
+        self.paint_clipped_face(t, cfg, state, center, middle, alpha, generation);
+
+        let cy = (shape.top + shape.bottom) * 0.5;
+        let rule_half = shape.height() * 0.22;
+        for (segment, inner_edge) in [
+            (left, left.map(|s| s.right)),
+            (right, right.map(|s| s.left)),
+        ] {
+            let (Some(segment), Some(edge)) = (segment, inner_edge) else {
+                continue;
+            };
+            let part = NotchShape {
+                left: segment.left,
+                right: segment.right,
+                ..shape
+            };
+            let shown = alpha * segment.alpha;
+            self.paint_clipped_face(t, cfg, state, segment.kind, part, shown, generation);
+            self.fill_rrect(
+                t,
+                D2D_RECT_F {
+                    left: edge - 0.5,
+                    top: cy - rule_half,
+                    right: edge + 0.5,
+                    bottom: cy + rule_half,
+                },
+                0.5,
+                theme::fade(self.pal.rule, shown),
+            );
+        }
+    }
+
+    /// A face clipped to its own segment, so a wide face never draws into
+    /// its neighbour while the segments are still growing in.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_clipped_face(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        state: &NotchState,
+        slide: SlideKind,
+        shape: NotchShape,
+        alpha: f32,
+        generation: u64,
+    ) {
+        if alpha <= 0.004 || shape.width() < 8.0 {
+            return;
+        }
+        self.clip(
+            t,
+            D2D_RECT_F {
+                left: shape.left,
+                top: shape.top,
+                right: shape.right,
+                bottom: shape.bottom,
+            },
+        );
+        self.paint_face(t, cfg, state, slide, shape, alpha, generation);
+        self.unclip(t);
+    }
+
+    /// What a pod says. Deliberately still: a pod changes at most once a
+    /// second (a timer, an elapsed time), so it never keeps the notch
+    /// repainting on its own.
+    fn paint_pod_face(&self, t: &ID2D1DCRenderTarget, cfg: &AppConfig, pod: &PodDraw) {
+        let alpha = pod.alpha;
+        if alpha <= 0.004 {
+            return;
+        }
+        let shape = &pod.shape;
+        let cy = (shape.top + shape.bottom) * 0.5;
+        let glyph_x = shape.left + 15.0;
+        let text_right = shape.right - 11.0;
+
+        self.clip(
+            t,
+            D2D_RECT_F {
+                left: shape.left,
+                top: shape.top,
+                right: shape.right,
+                bottom: shape.bottom,
+            },
+        );
+
+        let readout = match pod.kind {
+            PodKind::Timer => {
+                use crate::notch::timer::{self, Phase};
+                let view = timer::view(&cfg.notch.timer);
+                let tone = if view.phase == Phase::Focus {
+                    cfg.notch.accent
+                } else {
+                    BREAK_GREEN
+                };
+                self.progress_ring(t, glyph_x, cy, 6.0, view.progress(), tone, alpha);
+                Some(view.clock())
+            }
+            PodKind::Agent => {
+                let activity = crate::notch::notify::current_activity();
+                let tone = activity
+                    .as_ref()
+                    .map(|a| cfg.notch.notifications.get_app_color(&a.app))
+                    .unwrap_or(cfg.notch.accent);
+                self.ring(t, glyph_x, cy, 6.0, 1.6, theme::fade(tone, alpha * 0.45));
+                self.dot(t, glyph_x, cy, 3.2, theme::fade(tone, alpha));
+                activity.map(|a| elapsed_text(a.elapsed_secs()))
+            }
+            PodKind::Calendar => {
+                use crate::notch::calendar;
+                let now = calendar::now_local();
+                let next = calendar::upcoming(now, 3).into_iter().find(|e| !e.all_day);
+                let (word, tone) = match &next {
+                    Some(ev) if ev.start <= now => ("NOW".to_owned(), BREAK_GREEN),
+                    Some(ev) => (span_short(ev.start - now), cfg.notch.accent),
+                    None => ("--".to_owned(), self.pal.text_lo),
+                };
+                self.dot(t, glyph_x, cy, 3.5, theme::fade(tone, alpha));
+                Some(word)
+            }
+            PodKind::Media => {
+                let playing = self.media.snapshot().playing;
+                // Three still bars: an equaliser at rest when playing, flat
+                // when paused. Still on purpose — see the doc comment.
+                let heights: [f32; 3] = if playing {
+                    [0.55, 1.0, 0.75]
+                } else {
+                    [0.3, 0.3, 0.3]
+                };
+                let bar_h = shape.height() * 0.42;
+                let mid = (shape.left + shape.right) * 0.5;
+                for (i, h) in heights.into_iter().enumerate() {
+                    let x = mid + (i as f32 - 1.0) * 6.0;
+                    let half = bar_h * h * 0.5;
+                    self.fill_rrect(
+                        t,
+                        D2D_RECT_F {
+                            left: x - 1.5,
+                            top: cy - half,
+                            right: x + 1.5,
+                            bottom: cy + half,
+                        },
+                        1.5,
+                        theme::fade(cfg.notch.accent, alpha),
+                    );
+                }
+                None
+            }
+        };
+
+        if let Some(text) = readout {
+            if let Some((layout, w, h)) = self.measure_text(
+                crate::fonts::GEIST_MONO,
+                &text,
+                12.0,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+            ) {
+                self.draw_layout(
+                    t,
+                    &layout,
+                    text_right - w,
+                    cy - h * 0.5,
+                    theme::fade(self.pal.text_hi, alpha),
+                );
+            }
+        }
+        self.unclip(t);
+    }
+
+    /// A thin ring with `progress` (0..1) of it drawn in `tone`, clockwise
+    /// from twelve. Short line segments: no geometry to build for a 12px dial.
+    #[allow(clippy::too_many_arguments)]
+    fn progress_ring(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        x: f32,
+        y: f32,
+        r: f32,
+        progress: f32,
+        tone: Rgba,
+        alpha: f32,
+    ) {
+        self.ring(t, x, y, r, 1.8, theme::fade(self.pal.rule, alpha));
+        let sweep = progress.clamp(0.0, 1.0) * std::f32::consts::TAU;
+        if sweep <= 0.01 {
+            return;
+        }
+        let steps = ((sweep / std::f32::consts::TAU) * 32.0).ceil().max(1.0) as usize;
+        let at = |a: f32| {
+            let a = a - std::f32::consts::FRAC_PI_2;
+            (x + r * a.cos(), y + r * a.sin())
+        };
+        let mut from = at(0.0);
+        for i in 1..=steps {
+            let to = at(sweep * i as f32 / steps as f32);
+            self.line(t, from.0, from.1, to.0, to.1, 1.8, theme::fade(tone, alpha));
+            from = to;
         }
     }
 
@@ -4046,7 +4444,7 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgba {
 fn outside(
     factory: &ID2D1Factory,
     bounds: D2D_RECT_F,
-    slab: &ID2D1PathGeometry,
+    slab: &ID2D1Geometry,
 ) -> windows::core::Result<ID2D1PathGeometry> {
     let rect = unsafe { factory.CreateRectangleGeometry(&bounds)? };
     let out = unsafe { factory.CreatePathGeometry()? };
@@ -4118,6 +4516,16 @@ fn build_3sided_border_geometry(
     }
 
     Ok((geometry, current_pt))
+}
+
+/// `m:ss`, or `h:mm:ss` past the hour, for how long something has run.
+fn elapsed_text(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// The colour of a break, and of a meeting that is happening now.

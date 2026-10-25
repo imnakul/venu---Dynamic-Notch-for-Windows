@@ -27,6 +27,7 @@ pub mod calendar;
 pub mod effects;
 pub mod geom;
 pub mod hook;
+pub mod layout;
 pub mod media;
 pub mod notify;
 pub mod paint;

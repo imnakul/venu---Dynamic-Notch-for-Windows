@@ -97,3 +97,35 @@ trace with Windows Performance Recorder and inspect Venu's stacks in Windows
 Performance Analyzer. In particular, distinguish the overlay thread's
 DirectWrite/GDI/Direct2D work from the Settings thread's egui/OpenGL work and
 the media poller's WinRT calls before choosing the next optimization.
+
+## Split pill, satellite pods and shape settings
+
+These were designed to cost nothing while they are off and as little as
+possible while they are on.
+
+- **No new windows.** Pods and split segments are drawn inside the notch's
+  existing layered window. The window's layout frame was already sized to the
+  open panel, several times wider than the resting pill; it now also reserves
+  the pill's split and pod footprint once, in `compute_placement`, so nothing
+  is reallocated while they animate. The blit is still trimmed to what is
+  drawn (`visible_rect` now takes the pods in).
+- **One backdrop capture.** Glass themes capture the desktop once over the
+  bounding box of the notch and its pods, and fill every silhouette from that
+  bitmap, instead of one capture per slab.
+- **Gated like everything else.** Segments and pods are part of `FrameKey`
+  (`scene`, `pod_content`). While they are still, no frame is painted for them.
+- **Pods never animate on their own.** A timer or agent pod changes once a
+  second; a calendar pod once a minute; the media pod only when the track or
+  play state changes. None of them reports ambient motion, so a pod can never
+  hold the notch at the ~11 fps ambient cadence.
+- **Throttled readers.** What pods could show (timer, media, calendar, agent
+  activity) is re-read at most twice a second (`POD_POLL`), and not at all with
+  pods off; the media title and calendar lookups allocate, so they are kept off
+  the per-tick path. The agent pod's frame key reads elapsed seconds without
+  cloning anything.
+- **Shape settings are free.** Corner radii and shoulders feed the same outline
+  the notch always built; outline, sheen and shadow strengths scale the theme's
+  palette once per painted frame.
+- **Live data only while visible.** A face in a split segment counts as on
+  screen for the frame key, so (for example) Stats sampling and the clock key
+  run only while that segment is actually showing.
