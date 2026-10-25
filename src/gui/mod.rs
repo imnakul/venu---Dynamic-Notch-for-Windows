@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crate::config::{
     AppConfig, BorderEffect, BorderEffectConfig, EffectScope, FlashAnim, FlashBackground,
-    FlashContent, FlashLayout, NotchAlign, NotchTheme, SlideKind, StatusItem,
+    FlashContent, FlashLayout, NotchAlign, NotchTheme, ShapeConfig, ShapePreset, SlideKind,
+    StatusItem,
 };
 
 mod color_picker;
@@ -15,6 +16,7 @@ mod effect_preview;
 mod filedlg;
 mod font_setup;
 mod glass;
+mod notch_preview;
 mod theme;
 mod wallpaper;
 
@@ -303,6 +305,13 @@ const PAGES: &[Page] = &[
                            placement",
                 draw: SettingsApp::tab_notch_position,
             },
+            Tab {
+                title: "Layout",
+                keywords: "split pill segments multiple items several faces left right side \
+                           satellite pods live activities agent claude codex timer calendar \
+                           media now playing beside notch",
+                draw: SettingsApp::tab_notch_layout,
+            },
         ],
     },
     Page {
@@ -317,6 +326,13 @@ const PAGES: &[Page] = &[
                 keywords: "theme surface dark light frosted transparent blurred acrylic glass \
                            accent panel colour color font typeface 24-hour clock collapse delay",
                 draw: SettingsApp::tab_notch_style,
+            },
+            Tab {
+                title: "Shape",
+                keywords: "shape roundness rounded corners radius shoulders curve fused bezel \
+                           outline border hairline sheen highlight shadow depth pill soft sharp \
+                           classic preset look",
+                draw: SettingsApp::tab_notch_shape,
             },
             Tab {
                 title: "Border effects",
@@ -1207,6 +1223,14 @@ impl SettingsApp {
 
     fn tab_notch_style(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_notch_look(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notch_layout(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_layout(ui, cx.cfg, cx.changed);
+    }
+
+    fn tab_notch_shape(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::sec_notch_shape(ui, cx.cfg, cx.changed);
     }
 
     fn tab_notch_effects(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -3602,6 +3626,314 @@ impl SettingsApp {
         );
     }
 
+    /// Pill / Open panel switch for a live preview, remembered per tab.
+    fn preview_mode(ui: &mut egui::Ui, key: &str) -> notch_preview::Mode {
+        let id = egui::Id::new(key);
+        let mut open = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+        ui.horizontal(|ui| {
+            for (value, label) in [(false, "Pill"), (true, "Open panel")] {
+                if Self::segment(ui, label, open == value).clicked() {
+                    open = value;
+                }
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(id, open));
+        ui.add_space(8.0);
+        if open {
+            notch_preview::Mode::Panel
+        } else {
+            notch_preview::Mode::Pill
+        }
+    }
+
+    /// A 0–200% strength slider over a 0.0–2.0 multiplier.
+    fn strength_line(ui: &mut egui::Ui, label: &str, value: &mut f32) -> bool {
+        Self::slider_line(
+            ui,
+            label,
+            egui::Slider::new(value, 0.0..=ShapeConfig::MAX_STRENGTH)
+                .step_by(0.05)
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .custom_parser(|s| {
+                    s.trim()
+                        .trim_end_matches('%')
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(|v| v / 100.0)
+                }),
+        )
+    }
+
+    /// A "None or a slide" picker for one side of the split pill.
+    fn side_picker(ui: &mut egui::Ui, id: &str, value: &mut Option<SlideKind>, changed: &mut bool) {
+        let text = value.map(|k| k.label()).unwrap_or("Nothing");
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                *changed |= ui.selectable_value(value, None, "Nothing").clicked();
+                for kind in SlideKind::ALL {
+                    *changed |= ui
+                        .selectable_value(value, Some(kind), kind.label())
+                        .clicked();
+                }
+            });
+    }
+
+    fn sec_notch_layout(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::section_title(ui, "LIVE PREVIEW");
+        notch_preview::show(
+            ui,
+            cfg,
+            notch_preview::Mode::Pill,
+            notch_preview::Content::Layout,
+        );
+        ui.add_space(18.0);
+
+        Self::section_title(ui, "SPLIT PILL");
+        let split = &mut cfg.notch.split;
+        *changed |= ui
+            .toggle(&mut split.enabled, "Show more than one thing on the pill")
+            .changed();
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The face the notch is resting on stays in the middle; pick a face for either \
+                 side. A side that matches the middle hides itself.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        ui.add_space(12.0);
+
+        if split.enabled {
+            Self::row_inline(ui, "Left", |ui| {
+                Self::side_picker(ui, "split_left", &mut split.left, changed);
+            });
+            Self::row_inline(ui, "Right", |ui| {
+                Self::side_picker(ui, "split_right", &mut split.right, changed);
+            });
+            *changed |= ui
+                .toggle(
+                    &mut split.open_hovered,
+                    "Hovering a side opens onto that slide",
+                )
+                .changed();
+            ui.add_space(6.0);
+
+            // Opening onto a side needs its slide in the carousel; say so.
+            let missing: Vec<SlideKind> = [split.left, split.right]
+                .into_iter()
+                .flatten()
+                .filter(|k| !cfg.notch.slides.contains(k))
+                .collect();
+            for kind in missing {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} is not in the carousel, so hovering it opens the main face.",
+                            kind.label()
+                        ))
+                        .size(11.0)
+                        .color(theme::text_secondary()),
+                    );
+                    if ui.small_button("Add it").clicked() {
+                        cfg.notch.slides.push(kind);
+                        *changed = true;
+                    }
+                });
+            }
+            ui.add_space(12.0);
+        }
+
+        Self::divider(ui);
+        Self::section_title(ui, "SATELLITE PODS");
+        let pods = &mut cfg.notch.pods;
+        *changed |= ui
+            .toggle(&mut pods.enabled, "Show live activities beside the notch")
+            .changed();
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Small pills bud out of the notch while something is happening and merge back \
+                 into it when you open the panel. They redraw at most once a second.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        ui.add_space(12.0);
+
+        if pods.enabled {
+            Self::row_inline(ui, "At most", |ui| {
+                for (n, label) in [(2u32, "Two"), (1u32, "One")] {
+                    if Self::segment(ui, label, pods.max == n).clicked() && pods.max != n {
+                        pods.max = n;
+                        *changed = true;
+                    }
+                }
+            });
+
+            Self::row_stacked(
+                ui,
+                "Show a pod for",
+                Some("In priority order: when more is live than fits, the first ones win. A pod never repeats a face already on the pill."),
+                |ui| {
+                    *changed |= ui
+                        .toggle(&mut pods.agents, "Coding agents at work")
+                        .changed();
+                    *changed |= ui.toggle(&mut pods.timer, "A running focus timer").changed();
+                    *changed |= ui
+                        .toggle(&mut pods.calendar, "A meeting now or coming up")
+                        .changed();
+                    *changed |= ui.toggle(&mut pods.media, "Music that is playing").changed();
+                },
+            );
+
+            if pods.calendar {
+                Self::row_stacked(
+                    ui,
+                    "Meeting lead time",
+                    Some("How early an upcoming event gets its pod."),
+                    |ui| {
+                        *changed |= ui
+                            .add(
+                                egui::Slider::new(&mut pods.calendar_lead_mins, 1..=60)
+                                    .suffix(" min"),
+                            )
+                            .changed();
+                    },
+                );
+            }
+
+            if pods.agents {
+                Self::row_stacked(
+                    ui,
+                    "Agents",
+                    Some("Anything can report work in progress to the local webhook. Claude Code: add scripts/notch-hooks/claude-activity.ps1 as a UserPromptSubmit hook — its Stop hook already ends the pod."),
+                    |ui| {
+                        let port = cfg.notch.notifications.webhook_port;
+                        let example = format!(
+                            "curl -X POST http://127.0.0.1:{port}/activity \
+                             -H \"Content-Type: application/json\" \
+                             -d '{{\"app\":\"Claude\",\"state\":\"start\"}}'"
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(&example)
+                                    .font(egui::FontId::monospace(10.5))
+                                    .color(theme::text_secondary()),
+                            );
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(example.clone());
+                            }
+                        });
+                    },
+                );
+            }
+        }
+    }
+
+    fn sec_notch_shape(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        Self::section_title(ui, "LIVE PREVIEW");
+        let mode = Self::preview_mode(ui, "shape_preview_open");
+        notch_preview::show(ui, cfg, mode, notch_preview::Content::Plain);
+        ui.add_space(18.0);
+
+        Self::section_title(ui, "STYLE");
+        let look = &mut cfg.notch.shape;
+        Self::row_stacked(
+            ui,
+            "Starting point",
+            Some(if look.preset == ShapePreset::Custom {
+                "Custom — your own numbers. Pick a style to start again from one."
+            } else {
+                "Pick a style, then fine-tune it below."
+            }),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for preset in ShapePreset::PICKS {
+                        if Self::segment(ui, preset.label(), look.preset == preset).clicked()
+                            && look.preset != preset
+                        {
+                            look.apply_preset(preset);
+                            *changed = true;
+                        }
+                    }
+                });
+            },
+        );
+
+        // Any hand-tuning turns the preset into Custom.
+        let mut tuned = false;
+        Self::row_stacked(
+            ui,
+            "Corner roundness",
+            Some("Bottom corners. The pill never rounds past half its height, so the top of the scale is fully round."),
+            |ui| {
+                tuned |= Self::slider_line(
+                    ui,
+                    "Pill",
+                    egui::Slider::new(&mut look.corner_radius, 0.0..=ShapeConfig::MAX_RADIUS)
+                        .step_by(1.0)
+                        .suffix(" px"),
+                );
+                tuned |= Self::slider_line(
+                    ui,
+                    "Panel",
+                    egui::Slider::new(&mut look.corner_radius_open, 0.0..=ShapeConfig::MAX_RADIUS)
+                        .step_by(1.0)
+                        .suffix(" px"),
+                );
+            },
+        );
+        Self::row_stacked(
+            ui,
+            "Shoulders",
+            Some(if cfg.notch.offset_y > 0 {
+                "The curves that melt the notch into the top edge. Yours floats (General > Position), so it has none right now."
+            } else {
+                "The curves that melt the notch into the top edge. 0 gives square shoulders."
+            }),
+            |ui| {
+                tuned |= Self::slider_line(
+                    ui,
+                    "Pill",
+                    egui::Slider::new(&mut look.shoulder, 0.0..=ShapeConfig::MAX_SHOULDER)
+                        .step_by(1.0)
+                        .suffix(" px"),
+                );
+                tuned |= Self::slider_line(
+                    ui,
+                    "Panel",
+                    egui::Slider::new(&mut look.shoulder_open, 0.0..=ShapeConfig::MAX_SHOULDER)
+                        .step_by(1.0)
+                        .suffix(" px"),
+                );
+            },
+        );
+        if tuned {
+            look.preset = ShapePreset::Custom;
+            *changed = true;
+        }
+
+        Self::section_title(ui, "FINISH");
+        Self::row_stacked(
+            ui,
+            "Glass details",
+            Some("Relative to the theme: 100% is the theme exactly as designed."),
+            |ui| {
+                *changed |= Self::strength_line(ui, "Outline", &mut look.outline);
+                *changed |= Self::strength_line(ui, "Sheen", &mut look.sheen);
+                *changed |= Self::strength_line(ui, "Shadow", &mut look.shadow);
+            },
+        );
+
+        if *look != ShapeConfig::default() && ui.button("Reset to Classic").clicked() {
+            *look = ShapeConfig::default();
+            *changed = true;
+        }
+    }
+
     fn sec_notch_effects(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         Self::section_title(ui, "LIVE PREVIEW");
         let open_id = egui::Id::new("effect_preview_open");
@@ -3615,7 +3947,13 @@ impl SettingsApp {
         });
         ui.data_mut(|d| d.insert_temp(open_id, open));
         ui.add_space(8.0);
-        effect_preview::show(ui, &cfg.notch.border_effect, open, cfg.notch.accent);
+        effect_preview::show(
+            ui,
+            &cfg.notch.border_effect,
+            open,
+            cfg.notch.accent,
+            &cfg.notch.shape,
+        );
         ui.add_space(18.0);
 
         Self::section_title(ui, "BORDER EFFECTS");

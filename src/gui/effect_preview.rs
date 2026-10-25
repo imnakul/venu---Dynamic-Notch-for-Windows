@@ -7,10 +7,9 @@
 
 use eframe::egui::{self, Color32, Mesh, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
-use crate::config::{BorderEffect, BorderEffectConfig};
+use crate::config::{BorderEffect, BorderEffectConfig, ShapeConfig};
 use crate::notch::effects::{self, Mode};
 use crate::notch::geom::NotchShape;
-use crate::notch::theme as notch_theme;
 
 use super::theme;
 
@@ -25,8 +24,14 @@ fn rgba(c: [f32; 4], alpha: f32) -> Color32 {
 }
 
 /// Draw the preview. `open` previews the expanded panel rather than the pill;
-/// `accent` and `slab` are the notch's own colours.
-pub fn show(ui: &mut egui::Ui, fx: &BorderEffectConfig, open: bool, accent: [f32; 4]) {
+/// `accent` is the notch's own accent and `look` its silhouette settings.
+pub fn show(
+    ui: &mut egui::Ui,
+    fx: &BorderEffectConfig,
+    open: bool,
+    accent: [f32; 4],
+    look: &ShapeConfig,
+) {
     let height = 150.0;
     let (frame, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -52,15 +57,17 @@ pub fn show(ui: &mut egui::Ui, fx: &BorderEffectConfig, open: bool, accent: [f32
         right: cx + w * 0.5,
         bottom: frame.top() + h,
         radius_top: 0.0,
+        // The open panel here is a scaled-down stand-in, so its corners and
+        // shoulders scale with it.
         radius_bottom: if open {
-            notch_theme::RADIUS_EXPANDED * 0.8
+            look.radius_at(h, 1.0) * 0.8
         } else {
-            (h * 0.5).min(20.0)
+            look.radius_at(h, 0.0)
         },
         flare: if open {
-            notch_theme::FLARE_EXPANDED * 0.8
+            look.shoulder_at(1.0) * 0.8
         } else {
-            notch_theme::FLARE
+            look.shoulder_at(0.0)
         },
     };
 

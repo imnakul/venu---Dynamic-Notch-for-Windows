@@ -49,7 +49,8 @@ use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::backdrop;
 use crate::notch::geom::NotchShape;
 use crate::notch::hook;
-use crate::notch::paint::{clock_key, Motion, Painter};
+use crate::notch::layout::{self, PillPart, PodCandidates, PodKind};
+use crate::notch::paint::{clock_key, Motion, Painter, PodDraw, Scene, SegmentDraw};
 use crate::notch::state::NotchState;
 use crate::notch::surface::D2DSurface;
 use crate::notch::theme;
@@ -98,6 +99,13 @@ const Z_ORDER_REFRESH: Duration = Duration::from_secs(1);
 /// of that self-correcting rather than permanent.
 const KEEPALIVE_FRAME: Duration = Duration::from_secs(5);
 
+/// How often pods re-check what is live (timer, media, calendar, agents).
+///
+/// Some of those readers allocate (the media title, the calendar's next
+/// events), so they are polled twice a second rather than every tick. Half a
+/// second late to show a pod is invisible; sixty reads a second is not free.
+const POD_POLL: Duration = Duration::from_millis(500);
+
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Input collected by the window procedure and the mouse hook, drained once per
@@ -116,6 +124,9 @@ struct InputBus {
     lost_focus: bool,
     /// Published every frame so hit-testing matches what is on screen *now*.
     shape: Option<NotchShape>,
+    /// Satellite pods, published alongside `shape` so clicks and hover land
+    /// on them too.
+    pods: [Option<NotchShape>; 2],
     /// Layout origin in screen coordinates, so `WM_NCHITTEST` can map the
     /// screen point it is given back into the shape's own space.
     origin: (i32, i32),
@@ -309,6 +320,11 @@ struct FrameKey {
     stats: u64,
     /// The focus timer, to the second, while a Timer slide is on screen.
     timer: u64,
+    /// Split segments and pods: what they show, where, how visible.
+    scene: Scene,
+    /// What each pod reads, at the granularity it draws: the timer and an
+    /// agent's elapsed time to the second, the calendar to the minute.
+    pod_content: [u64; 2],
     /// Feed revision and the minute, while a Calendar slide is on screen:
     /// "in 12 min" has to count down.
     calendar: (u64, i64),
@@ -358,6 +374,13 @@ pub struct NotchWindow {
     /// Set by the Settings button, consumed at the end of `tick`. See
     /// `TickOutcome::open_settings`.
     open_settings: bool,
+    /// What pods could show, re-read every [`POD_POLL`] while pods are on.
+    pod_live: PodCandidates,
+    pod_polled_at: Instant,
+    /// Where the cursor came in when the panel opened from a pod. The pod
+    /// merges into the notch as it opens, so without this a cursor resting
+    /// where the pod was could fall outside the panel and close it again.
+    hold_zone: Option<NotchShape>,
 }
 
 unsafe impl Send for NotchWindow {}
@@ -435,6 +458,9 @@ impl NotchWindow {
             last_paint: Instant::now(),
             z_asserted_at: Instant::now(),
             open_settings: false,
+            pod_live: PodCandidates::default(),
+            pod_polled_at: Instant::now() - POD_POLL,
+            hold_zone: None,
         })
     }
 
@@ -488,6 +514,21 @@ impl NotchWindow {
             expanded_w = expanded_w.max(w).max(cw);
             expanded_h = expanded_h.max(h).max(ch);
         }
+        // The resting pill can be wider than any one slide asks for: split
+        // segments add to it, and pods sit out beside it. Reserve that once,
+        // so the frame never has to grow while they animate.
+        let widest_pill = cfg
+            .notch
+            .effective_slides()
+            .iter()
+            .map(|&slide| slide_collapsed_size(cfg, slide).0)
+            .fold(0.0f32, f32::max);
+        let shoulder = cfg.notch.shape.shoulder_at(0.0);
+        let pill_footprint = widest_pill
+            + layout::max_split_extra(&cfg.notch.split)
+            + 2.0 * layout::max_pod_reach(&cfg.notch.pods, shoulder);
+        expanded_w = expanded_w.max(pill_footprint);
+
         let expanded_w = expanded_w.ceil() as i32;
         let expanded_h = expanded_h.ceil() as i32;
 
@@ -541,6 +582,12 @@ impl NotchWindow {
         let (open_w, open_h) = self.blended_size(cfg, slide_expanded_size);
         let (shut_w, shut_h) = self.blended_size(cfg, slide_collapsed_size);
 
+        // Split segments widen the resting pill either side of its face, and
+        // the panel never opens narrower than the pill it grows out of.
+        let (split_l, split_r) = self.state.split_widths();
+        let shut_w = shut_w + split_l + split_r;
+        let open_w = open_w.max(shut_w);
+
         let tp = self.state.toast_progress.value.clamp(0.0, 1.0);
         let toast_w = 380.0;
         let toast_h = 44.0;
@@ -550,8 +597,10 @@ impl NotchWindow {
         let w = lerp(base_w, open_w, t);
         let h = lerp(base_h, open_h, t);
 
-        let collapsed_radius = (base_h * 0.5).min(20.0);
-        let radius_bottom = lerp(collapsed_radius, theme::RADIUS_EXPANDED, t);
+        // Roundness and shoulders come from Appearance > Shape; the defaults
+        // are the original constants.
+        let look = &cfg.notch.shape;
+        let radius_bottom = look.radius_at(base_h, t);
 
         // Fused to the bezel: square top with concave shoulders, open or shut.
         // The shoulders grow with the panel so they stay in proportion;
@@ -560,7 +609,7 @@ impl NotchWindow {
         // floating panel rounded on all four corners.
         let attached = cfg.notch.offset_y <= 0;
         let (flare, radius_top) = if attached {
-            (lerp(theme::FLARE, theme::FLARE_EXPANDED, t), 0.0)
+            (look.shoulder_at(t), 0.0)
         } else {
             (0.0, radius_bottom)
         };
@@ -585,16 +634,23 @@ impl NotchWindow {
     /// rectangle is what screen capture blacks out — so a window sized to the
     /// largest panel any slide could open put a black slab the size of the
     /// open panel into every screenshot, even while the notch sat collapsed.
-    fn visible_rect(&self, shape: &NotchShape) -> RECT {
+    fn visible_rect(&self, shape: &NotchShape, scene: &Scene) -> RECT {
         // +2 for the rounding either side of the fractional shape edges, with safety margin for neon bloom.
         // The shoulders stick out past the sides by their own reach.
         let reach = (theme::shadow_spread(self.state.expand.value) * 1.25 + 2.0)
             .max(shape.flare + 2.0)
             .max(18.0);
 
-        let left = (shape.left - reach).floor().max(0.0) as i32;
+        // Pods sit beside the slab, so the window takes them in too.
+        let (mut l, mut r) = (shape.left, shape.right);
+        for pod in scene.pods.iter().flatten() {
+            l = l.min(pod.shape.left - pod.shape.flare);
+            r = r.max(pod.shape.right + pod.shape.flare);
+        }
+
+        let left = (l - reach).floor().max(0.0) as i32;
         let top = (shape.top - reach).floor().max(0.0) as i32;
-        let right = (shape.right + reach).ceil().min(self.placement.w as f32) as i32;
+        let right = (r + reach).ceil().min(self.placement.w as f32) as i32;
         let bottom = (shape.bottom + reach).ceil().min(self.placement.h as f32) as i32;
 
         RECT {
@@ -603,6 +659,91 @@ impl NotchWindow {
             right: right.max(left + 1),
             bottom: bottom.max(top + 1),
         }
+    }
+
+    /// Split segments and pods for this frame, laid out against `shape`.
+    fn build_scene(&self, cfg: &AppConfig, shape: &NotchShape) -> Scene {
+        let mut scene = Scene::default();
+
+        let (split_l, split_r) = self.state.split_widths();
+        if let Some(kind) = self.state.split[0].visible() {
+            scene.segments[0] = Some(SegmentDraw {
+                kind,
+                left: shape.left,
+                right: shape.left + split_l,
+                alpha: self.state.split[0].amount(),
+            });
+        }
+        if let Some(kind) = self.state.split[1].visible() {
+            scene.segments[1] = Some(SegmentDraw {
+                kind,
+                left: shape.right - split_r,
+                right: shape.right,
+                alpha: self.state.split[1].amount(),
+            });
+        }
+
+        let pod_shoulder = layout::pod_shoulder(shape.flare);
+        for (i, slot) in self.state.pods.iter().enumerate() {
+            let Some(kind) = slot.visible() else {
+                continue;
+            };
+            let amount = slot.amount();
+            let (left, right) = layout::pod_span(
+                i,
+                amount,
+                shape.left,
+                shape.right,
+                shape.flare,
+                kind.width(),
+                pod_shoulder,
+            );
+            // A pod is the pill's satellite: same height and corners as the
+            // resting pill, its own smaller shoulders.
+            let pill_h = cfg.notch.collapsed_height as f32;
+            let radius = cfg.notch.shape.radius_at(pill_h, 0.0);
+            let floating = shape.flare <= 0.5;
+            scene.pods[i] = Some(PodDraw {
+                kind,
+                shape: NotchShape {
+                    left,
+                    top: shape.top,
+                    right,
+                    bottom: shape.top + pill_h,
+                    radius_top: if floating { radius } else { 0.0 },
+                    radius_bottom: radius,
+                    flare: if floating { 0.0 } else { pod_shoulder },
+                },
+                alpha: amount,
+            });
+        }
+        scene
+    }
+
+    /// Re-read what pods could show, at most every [`POD_POLL`].
+    fn poll_pods(&mut self, cfg: &AppConfig) {
+        let pods = &cfg.notch.pods;
+        if !pods.enabled {
+            self.pod_live = PodCandidates::default();
+            return;
+        }
+        if self.pod_polled_at.elapsed() < POD_POLL {
+            return;
+        }
+        self.pod_polled_at = Instant::now();
+        self.pod_live = PodCandidates {
+            agent: pods.agents && crate::notch::notify::has_activity(),
+            timer: pods.timer && crate::notch::timer::view(&cfg.notch.timer).running,
+            calendar: pods.calendar && {
+                use crate::notch::calendar;
+                let now = calendar::now_local();
+                let lead = pods.calendar_lead_mins as i64;
+                calendar::upcoming(now, 3)
+                    .iter()
+                    .any(|e| !e.all_day && e.start <= now + lead && e.end > now)
+            },
+            media: pods.media && self.painter.media.snapshot().playing,
+        };
     }
 
     fn cursor_in_window(&self) -> Option<(f32, f32)> {
@@ -678,11 +819,55 @@ impl NotchWindow {
         // -- input ----------------------------------------------------------
         let shape = self.current_shape(cfg);
         let hit_shape = shape.inset(-HOVER_SLOP);
+        let scene = self.build_scene(cfg, &shape);
 
-        let hovered = self
-            .cursor_in_window()
+        let cursor = self.cursor_in_window();
+        let on_pill = cursor
             .map(|(x, y)| hit_shape.contains(x, y))
             .unwrap_or(false);
+        let on_pod = cursor.and_then(|(x, y)| {
+            scene
+                .pods
+                .iter()
+                .flatten()
+                .find(|pod| pod.alpha > 0.5 && pod.shape.inset(-HOVER_SLOP).contains(x, y))
+                .map(|pod| pod.kind)
+        });
+        let held = self.state.expand.value > 0.01
+            && cursor
+                .zip(self.hold_zone)
+                .is_some_and(|((x, y), zone)| zone.contains(x, y));
+        let hovered = on_pill || on_pod.is_some() || held;
+
+        // Arriving on a split segment or a pod opens the panel straight onto
+        // that slide. Decided once, as the panel starts to open.
+        let opening = hovered && !self.state.is_open() && self.state.expand.value < 0.05;
+        let toast_up = crate::notch::notify::global_store()
+            .read()
+            .active_toast
+            .is_some();
+        if opening && !toast_up {
+            if let Some(kind) = on_pod {
+                self.state.open_onto(kind.opens(), cfg);
+                self.hold_zone = scene
+                    .pods
+                    .iter()
+                    .flatten()
+                    .find(|pod| pod.kind == kind)
+                    .map(|pod| pod.shape.inset(-HOVER_SLOP));
+            } else if let (Some((x, _)), true) = (cursor, cfg.notch.split.open_hovered) {
+                let (split_l, split_r) = self.state.split_widths();
+                let part = layout::pill_part(x, shape.left, shape.right, split_l, split_r);
+                let segment = match part {
+                    PillPart::Left => self.state.split[0].visible(),
+                    PillPart::Right => self.state.split[1].visible(),
+                    PillPart::Center => None,
+                };
+                if let Some(kind) = segment {
+                    self.state.open_onto(&[kind], cfg);
+                }
+            }
+        }
 
         let wheel = hook::take_wheel();
 
@@ -754,8 +939,30 @@ impl NotchWindow {
         };
         self.state.toast_progress.step(toast_target, dt);
 
+        // Pods merge back into the notch while it is open or showing an
+        // alert, and bud out again once it is resting.
+        self.poll_pods(cfg);
+        let resting = target == 0.0
+            && self.state.expand.value <= 0.02
+            && self.state.toast_progress.value <= 0.01;
+        let wanted = if resting {
+            let slides = cfg.notch.effective_slides();
+            let on_pill = [
+                slides.get(self.state.active).copied(),
+                self.state.split[0].shown,
+                self.state.split[1].shown,
+            ];
+            layout::wanted_pods(&cfg.notch.pods, self.pod_live, &on_pill)
+        } else {
+            [None, None]
+        };
+        self.state.step_pods(wanted, dt);
+
         // Reset to default collapsed slide on collapse
         if target == 0.0 && self.state.expand.value <= 0.05 {
+            // A peek opened onto a segment or pod goes back to where it was.
+            self.state.restore_home();
+            self.hold_zone = None;
             let media_playing = self.painter.media.snapshot().playing;
             let unread = notif_store.read().unread_count() > 0;
             self.state
@@ -771,11 +978,16 @@ impl NotchWindow {
 
         // Publish the freshly-animated shape for hit-testing and the hook.
         let shape = self.current_shape(cfg);
+        let scene = self.build_scene(cfg, &shape);
         let open = self.state.is_open();
         let (wx, wy) = (self.placement.x, self.placement.y);
-        let visible = self.visible_rect(&shape);
+        let visible = self.visible_rect(&shape, &scene);
+        let pod_hits = scene
+            .pods
+            .map(|pod| pod.map(|p| p.shape.inset(-HOVER_SLOP)));
         with_input(|bus| {
             bus.shape = Some(shape.inset(-HOVER_SLOP));
+            bus.pods = pod_hits;
             bus.origin = (wx, wy);
             bus.client_offset = (visible.left as f32, visible.top as f32);
         });
@@ -796,7 +1008,7 @@ impl NotchWindow {
         // atomics. The paint below is not, so it is only spent when the frame
         // would come out different — or when the last one it drew said it was
         // still moving under its own clock.
-        let key = self.frame_key(shape, cfg);
+        let key = self.frame_key(shape, scene, cfg);
         let changed = self.last_key.as_ref() != Some(&key) || self.last_cfg.as_ref() != Some(cfg);
 
         let since_paint = self.last_paint.elapsed();
@@ -807,7 +1019,7 @@ impl NotchWindow {
         };
 
         if changed || due {
-            if let Err(e) = self.render(cfg, shape) {
+            if let Err(e) = self.render(cfg, shape, &scene) {
                 eprintln!("[notch] render failed: {e:?}");
             }
             self.last_motion = self.painter.take_motion();
@@ -835,7 +1047,7 @@ impl NotchWindow {
 
     /// Snapshot of everything that would change what the next frame looks
     /// like. See [`FrameKey`].
-    fn frame_key(&self, shape: NotchShape, cfg: &AppConfig) -> FrameKey {
+    fn frame_key(&self, shape: NotchShape, scene: Scene, cfg: &AppConfig) -> FrameKey {
         let slides = cfg.notch.effective_slides();
         let position = self.state.carousel.value;
         let expand = self.state.expand.value;
@@ -855,8 +1067,12 @@ impl NotchWindow {
                             > 0.006
                 })
         };
-        let collapsed_shows =
-            |kind: SlideKind| collapsed_visible && slides.get(self.state.active) == Some(&kind);
+        // A face can be on the resting pill as its main face or in a split
+        // segment; either way its live data has to keep the frame current.
+        let collapsed_shows = |kind: SlideKind| {
+            collapsed_visible
+                && (slides.get(self.state.active) == Some(&kind) || self.state.split_shows(kind))
+        };
 
         let collapsed_stats_visible = collapsed_shows(SlideKind::Stats)
             && crate::notch::notify::global_store()
@@ -937,6 +1153,26 @@ impl NotchWindow {
             timer,
             calendar,
             controls,
+            pod_content: scene
+                .pods
+                .map(|pod| pod.map(|p| self.pod_content_key(p.kind, cfg)).unwrap_or(0)),
+            scene,
+        }
+    }
+
+    /// What a pod's face reads, at the granularity it draws it.
+    fn pod_content_key(&self, kind: PodKind, cfg: &AppConfig) -> u64 {
+        match kind {
+            PodKind::Timer => crate::notch::timer::view(&cfg.notch.timer).key(),
+            PodKind::Agent => {
+                let elapsed = crate::notch::notify::current_elapsed_secs().unwrap_or(0);
+                elapsed ^ (crate::notch::notify::activity_revision() << 40)
+            }
+            PodKind::Calendar => {
+                crate::notch::calendar::revision()
+                    ^ (crate::notch::calendar::now_local() as u64) << 20
+            }
+            PodKind::Media => self.painter.media.revision(),
         }
     }
 
@@ -1145,7 +1381,12 @@ impl NotchWindow {
         self.z_asserted_at = Instant::now();
     }
 
-    fn render(&mut self, cfg: &AppConfig, shape: NotchShape) -> windows::core::Result<()> {
+    fn render(
+        &mut self,
+        cfg: &AppConfig,
+        shape: NotchShape,
+        scene: &Scene,
+    ) -> windows::core::Result<()> {
         self.assert_z_order(cfg);
 
         // The surface stays at the full layout size — it is the expensive
@@ -1160,6 +1401,7 @@ impl NotchWindow {
             cfg,
             &self.state,
             shape,
+            scene,
             (self.placement.x, self.placement.y),
             self.capture_excluded,
         )?;
@@ -1171,7 +1413,7 @@ impl NotchWindow {
 
         unsafe {
             let screen_dc = GetDC(None);
-            let visible = self.visible_rect(&shape);
+            let visible = self.visible_rect(&shape, scene);
             let dst = POINT {
                 x: self.placement.x + visible.left,
                 y: self.placement.y + visible.top,
@@ -1225,12 +1467,11 @@ impl NotchWindow {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
-                let inside = with_input(|bus| match bus.shape {
-                    Some(shape) => {
-                        let (ox, oy) = bus.origin;
-                        shape.contains((x - ox) as f32, (y - oy) as f32)
-                    }
-                    None => false,
+                let inside = with_input(|bus| {
+                    let (ox, oy) = bus.origin;
+                    let (lx, ly) = ((x - ox) as f32, (y - oy) as f32);
+                    bus.shape.is_some_and(|shape| shape.contains(lx, ly))
+                        || bus.pods.iter().flatten().any(|pod| pod.contains(lx, ly))
                 })
                 .unwrap_or(false);
 

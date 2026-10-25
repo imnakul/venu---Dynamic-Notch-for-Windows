@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, BorderEffect, BorderEffectConfig, SlideKind};
 use crate::notch::anim::{smoothstep, Spring};
+use crate::notch::layout::{self, PodKind, Slot};
 
 /// Placeholder shown when the focus line has been cleared entirely.
 const EMPTY_FOCUS: &str = "What are you working on?";
@@ -71,6 +72,17 @@ pub struct NotchState {
     /// What the schedule was last armed for, so picking another effect or
     /// pressing Preview starts a run immediately.
     effect_armed: (BorderEffect, u32, bool),
+
+    /// Split pill side segments, `[left, right]`. Empty and free unless the
+    /// split is switched on.
+    pub split: [Slot<SlideKind>; 2],
+    /// Satellite pods, `[right, left]`. Fed by the window, which owns the
+    /// readers that know what is live.
+    pub pods: [Slot<PodKind>; 2],
+    /// Set when the panel opened onto a segment or pod's slide instead of the
+    /// one the pill rests on: `(resting slide, slide opened onto)`. Collapsing
+    /// puts the resting one back, unless the user scrolled elsewhere meanwhile.
+    home: Option<(usize, usize)>,
 }
 
 impl NotchState {
@@ -102,6 +114,70 @@ impl NotchState {
                 cfg.notch.border_effect.preview,
                 cfg.notch.border_effect.continuous,
             ),
+            // Same feel as the carousel: quick, settling without a wobble.
+            split: [Slot::new(230.0, 30.0), Slot::new(230.0, 30.0)],
+            // A touch springier, so a pod visibly buds out of the notch.
+            pods: [Slot::new(260.0, 24.0), Slot::new(260.0, 24.0)],
+            home: None,
+        }
+    }
+
+    /// Current widths of the split pill's `[left, right]` segments, animated.
+    pub fn split_widths(&self) -> (f32, f32) {
+        let width = |slot: &Slot<SlideKind>| {
+            slot.shown
+                .map(|kind| layout::segment_width(kind) * slot.amount())
+                .unwrap_or(0.0)
+        };
+        (width(&self.split[0]), width(&self.split[1]))
+    }
+
+    /// Whether a side segment is showing `kind` at all.
+    pub fn split_shows(&self, kind: SlideKind) -> bool {
+        self.split.iter().any(|slot| slot.visible() == Some(kind))
+    }
+
+    /// Seat and animate the pods. `wanted` is in priority order; pods keep
+    /// the side they already have.
+    pub fn step_pods(&mut self, wanted: [Option<PodKind>; 2], dt: f32) {
+        let seated = [self.pods[0].shown, self.pods[1].shown];
+        let sides = layout::assign_sides(seated, wanted);
+        for (slot, want) in self.pods.iter_mut().zip(sides) {
+            slot.step(want, dt);
+        }
+    }
+
+    /// Open onto the first of `kinds` that is in the carousel, remembering
+    /// where the pill was resting. Returns whether it switched slides.
+    pub fn open_onto(&mut self, kinds: &[SlideKind], cfg: &AppConfig) -> bool {
+        if self.home.is_some() {
+            return false;
+        }
+        let slides = cfg.notch.effective_slides();
+        let Some(idx) = kinds
+            .iter()
+            .find_map(|kind| slides.iter().position(|s| s == kind))
+        else {
+            return false;
+        };
+        if idx == self.active {
+            return false;
+        }
+        self.home = Some((self.active, idx));
+        self.active = idx;
+        // Jump, rather than fly the carousel past everything in between.
+        self.carousel.set(idx as f32);
+        true
+    }
+
+    /// Back to the resting slide after the panel closed, if it was opened
+    /// onto a segment or pod and the user did not move on from there.
+    pub fn restore_home(&mut self) {
+        if let Some((resting, opened)) = self.home.take() {
+            if self.active == opened {
+                self.active = resting;
+                self.carousel.set(resting as f32);
+            }
         }
     }
 
@@ -261,18 +337,26 @@ impl NotchState {
         self.expand.step(target_expand, dt);
         self.carousel.step(self.active as f32, dt);
 
-        // The marquee only advances when it can be seen.
+        // Side segments follow whatever the pill is resting on: never a
+        // repeat of the middle face, and nothing at all with the split off.
         let slides = cfg.notch.effective_slides();
+        let [left, right] =
+            layout::split_targets(&cfg.notch.split, slides.get(self.active).copied());
+        self.split[0].step(left, dt);
+        self.split[1].step(right, dt);
+
+        // The marquee only advances when it can be seen.
         let expand = self.expand.value.clamp(0.0, 1.0);
         let collapsed_alpha = 1.0 - smoothstep(0.02, 0.30, expand);
         let expanded_alpha = smoothstep(0.42, 0.96, expand);
         // Match the painter's visibility thresholds. Merely having a
         // marquee somewhere in the deck must not animate a hidden slide.
         let marquee_visible = (collapsed_alpha > 0.004
-            && slides
+            && (slides
                 .get(self.active)
                 .map(|s| *s == SlideKind::Marquee)
-                .unwrap_or(false))
+                .unwrap_or(false)
+                || self.split_shows(SlideKind::Marquee)))
             || (expanded_alpha > 0.004
                 && slides.iter().enumerate().any(|(i, slide)| {
                     *slide == SlideKind::Marquee
@@ -469,6 +553,122 @@ mod tests {
         let mut state = resting(&cfg, SlideKind::Marquee, false);
         state.tick(&cfg, 0.0, 0.032);
         assert!(state.marquee_offset < 0.0);
+    }
+
+    /// The whole per-frame tick, held collapsed, for `seconds`.
+    fn tick_for(state: &mut NotchState, cfg: &AppConfig, seconds: f32) {
+        let mut left = seconds;
+        while left > 0.0 {
+            let dt = left.min(1.0 / 60.0);
+            state.tick(cfg, 0.0, dt);
+            left -= dt;
+        }
+    }
+
+    fn split_cfg(left: SlideKind, right: SlideKind) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.notch.split.enabled = true;
+        cfg.notch.split.left = Some(left);
+        cfg.notch.split.right = Some(right);
+        cfg
+    }
+
+    #[test]
+    fn split_segments_grow_in_and_skip_the_middle_face() {
+        let cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
+        let mut state = resting(&cfg, SlideKind::Media, false);
+        tick_for(&mut state, &cfg, 1.5);
+        let (l, r) = state.split_widths();
+        assert!((l - layout::segment_width(SlideKind::Clock)).abs() < 0.5);
+        assert!((r - layout::segment_width(SlideKind::Stats)).abs() < 0.5);
+
+        // Resting on the Clock: the left segment would repeat it, so it goes.
+        let clock = cfg
+            .notch
+            .effective_slides()
+            .iter()
+            .position(|s| *s == SlideKind::Clock);
+        state.active = clock.unwrap();
+        tick_for(&mut state, &cfg, 1.5);
+        assert_eq!(state.split_widths().0, 0.0);
+        assert!(!state.split_shows(SlideKind::Clock));
+    }
+
+    #[test]
+    fn split_off_costs_nothing() {
+        let cfg = AppConfig::default();
+        let mut state = resting(&cfg, SlideKind::Clock, false);
+        tick_for(&mut state, &cfg, 1.0);
+        assert_eq!(state.split_widths(), (0.0, 0.0));
+        assert!(state.split.iter().all(|s| s.shown.is_none()));
+    }
+
+    #[test]
+    fn marquee_in_a_side_segment_scrolls() {
+        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Stats);
+        let mut state = resting(&cfg, SlideKind::Clock, false);
+        tick_for(&mut state, &cfg, 1.0);
+        let before = state.marquee_offset;
+        tick_for(&mut state, &cfg, 0.5);
+        assert_ne!(state.marquee_offset, before);
+    }
+
+    #[test]
+    fn opening_onto_a_segment_restores_the_resting_face() {
+        let cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
+        let mut state = resting(&cfg, SlideKind::Media, false);
+        let media = state.active;
+        assert!(state.open_onto(&[SlideKind::Stats], &cfg));
+        assert_ne!(state.active, media);
+        assert!(!state.dirty, "a peek is not a choice to persist");
+        state.restore_home();
+        assert_eq!(state.active, media);
+
+        // Scrolling away while open is a real choice: it sticks.
+        assert!(state.open_onto(&[SlideKind::Stats], &cfg));
+        state.step_slide(-1, &cfg);
+        let chosen = state.active;
+        state.restore_home();
+        assert_eq!(state.active, chosen);
+    }
+
+    #[test]
+    fn opening_onto_a_slide_outside_the_deck_does_nothing() {
+        let mut cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
+        cfg.notch.slides.retain(|s| *s != SlideKind::Stats);
+        let mut state = resting(&cfg, SlideKind::Media, false);
+        let before = state.active;
+        assert!(!state.open_onto(&[SlideKind::Stats], &cfg));
+        assert_eq!(state.active, before);
+    }
+
+    #[test]
+    fn pods_keep_their_side_and_leave_cleanly() {
+        let cfg = AppConfig::default();
+        let mut state = NotchState::new(&cfg);
+        let step = |state: &mut NotchState, wanted, secs: f32| {
+            for _ in 0..(secs * 60.0) as usize {
+                state.step_pods(wanted, 1.0 / 60.0);
+            }
+        };
+        step(&mut state, [Some(PodKind::Timer), None], 1.0);
+        assert_eq!(state.pods[0].shown, Some(PodKind::Timer));
+        step(
+            &mut state,
+            [Some(PodKind::Agent), Some(PodKind::Timer)],
+            1.0,
+        );
+        assert_eq!(
+            state.pods[0].shown,
+            Some(PodKind::Timer),
+            "timer stays right"
+        );
+        assert_eq!(state.pods[1].shown, Some(PodKind::Agent));
+        step(&mut state, [None, None], 1.0);
+        assert!(state
+            .pods
+            .iter()
+            .all(|p| p.shown.is_none() && p.amount() == 0.0));
     }
 
     fn effect_cfg(effect: BorderEffect) -> AppConfig {

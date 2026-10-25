@@ -775,6 +775,228 @@ impl MarqueeConfig {
     }
 }
 
+/// A starting point for [`ShapeConfig`]. Picking one fills in the numbers;
+/// touching any slider afterwards turns it into [`ShapePreset::Custom`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ShapePreset {
+    /// The original Venu silhouette.
+    #[default]
+    Classic,
+    /// Fully round ends with small shoulders — the phone-island look.
+    Pill,
+    /// Gentle corners and wide, melting shoulders.
+    Soft,
+    /// Tight corners and barely-there shoulders, for a crisp, technical look.
+    Sharp,
+    /// Hand-tuned values.
+    Custom,
+}
+
+impl ShapePreset {
+    /// The presets offered as one-click starting points (not `Custom`).
+    pub const PICKS: [ShapePreset; 4] = [
+        ShapePreset::Classic,
+        ShapePreset::Pill,
+        ShapePreset::Soft,
+        ShapePreset::Sharp,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapePreset::Classic => "Classic",
+            ShapePreset::Pill => "Pill",
+            ShapePreset::Soft => "Soft",
+            ShapePreset::Sharp => "Sharp",
+            ShapePreset::Custom => "Custom",
+        }
+    }
+
+    /// `(pill corners, panel corners, pill shoulders, panel shoulders)`, or
+    /// `None` for `Custom`, which keeps whatever is set.
+    pub fn geometry(self) -> Option<(f32, f32, f32, f32)> {
+        match self {
+            ShapePreset::Classic => Some((20.0, 26.0, 16.0, 24.0)),
+            ShapePreset::Pill => Some((ShapeConfig::MAX_RADIUS, 34.0, 9.0, 14.0)),
+            ShapePreset::Soft => Some((14.0, 20.0, 22.0, 32.0)),
+            ShapePreset::Sharp => Some((6.0, 10.0, 4.0, 6.0)),
+            ShapePreset::Custom => None,
+        }
+    }
+}
+
+/// How the notch's silhouette and finish are drawn.
+///
+/// Every number here feeds the same outline the painter fills, the window
+/// hit-tests and the border effects trace (`notch/geom.rs`), so changing it
+/// changes all three together. The defaults are the original constants, so a
+/// config written before this existed looks exactly as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShapeConfig {
+    pub preset: ShapePreset,
+    /// Bottom-corner radius of the resting pill, in pixels. Never more than
+    /// half the pill's height, so the largest value is a fully round end.
+    pub corner_radius: f32,
+    /// Bottom-corner radius of the open panel.
+    pub corner_radius_open: f32,
+    /// How far the concave shoulders reach along the bezel while the pill is
+    /// fused to it. Ignored when the notch floats (Position > Down above 0).
+    pub shoulder: f32,
+    /// Shoulder reach when the panel is open.
+    pub shoulder_open: f32,
+    /// Strength of the hairline outline, 0 (none) to 2 (twice the theme's).
+    pub outline: f32,
+    /// Strength of the glassy highlight along the top lip, 0 to 2.
+    pub sheen: f32,
+    /// Strength of the drop shadow, 0 to 2.
+    pub shadow: f32,
+}
+
+impl Default for ShapeConfig {
+    fn default() -> Self {
+        let mut shape = Self {
+            preset: ShapePreset::Classic,
+            corner_radius: 0.0,
+            corner_radius_open: 0.0,
+            shoulder: 0.0,
+            shoulder_open: 0.0,
+            outline: 1.0,
+            sheen: 1.0,
+            shadow: 1.0,
+        };
+        shape.apply_preset(ShapePreset::Classic);
+        shape
+    }
+}
+
+impl ShapeConfig {
+    pub const MAX_RADIUS: f32 = 60.0;
+    pub const MAX_SHOULDER: f32 = 48.0;
+    pub const MAX_STRENGTH: f32 = 2.0;
+    /// Smallest shoulder kept while fused. Zero would make the outline treat
+    /// the top edge as a free edge and stroke a line along the screen's own
+    /// edge; a single pixel reads as square and keeps the top fused.
+    pub const MIN_FUSED_SHOULDER: f32 = 1.0;
+
+    /// Load a preset's geometry. Strengths are a separate concern (the finish,
+    /// not the silhouette) and are left alone.
+    pub fn apply_preset(&mut self, preset: ShapePreset) {
+        self.preset = preset;
+        if let Some((pill, panel, shoulder, shoulder_open)) = preset.geometry() {
+            self.corner_radius = pill;
+            self.corner_radius_open = panel;
+            self.shoulder = shoulder;
+            self.shoulder_open = shoulder_open;
+        }
+    }
+
+    /// Bottom-corner radius at expansion `t` (0 = pill, 1 = panel) for a pill
+    /// `pill_height` tall.
+    pub fn radius_at(&self, pill_height: f32, t: f32) -> f32 {
+        let pill = clean(self.corner_radius, Self::MAX_RADIUS).min(pill_height.max(0.0) * 0.5);
+        let panel = clean(self.corner_radius_open, Self::MAX_RADIUS);
+        pill + (panel - pill) * t.clamp(0.0, 1.0)
+    }
+
+    /// Shoulder reach at expansion `t` while fused to the bezel.
+    pub fn shoulder_at(&self, t: f32) -> f32 {
+        let pill = clean(self.shoulder, Self::MAX_SHOULDER);
+        let panel = clean(self.shoulder_open, Self::MAX_SHOULDER);
+        (pill + (panel - pill) * t.clamp(0.0, 1.0)).max(Self::MIN_FUSED_SHOULDER)
+    }
+
+    pub fn outline_strength(&self) -> f32 {
+        clean(self.outline, Self::MAX_STRENGTH)
+    }
+
+    pub fn sheen_strength(&self) -> f32 {
+        clean(self.sheen, Self::MAX_STRENGTH)
+    }
+
+    pub fn shadow_strength(&self) -> f32 {
+        clean(self.shadow, Self::MAX_STRENGTH)
+    }
+}
+
+/// Clamp a hand-editable number into `0..=max`, treating NaN as 0, so a
+/// mistyped `config.json` can never feed the geometry something absurd.
+fn clean(value: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, max)
+    } else {
+        0.0
+    }
+}
+
+/// The resting pill split into up to three live segments: whatever the notch
+/// is showing in the middle, plus a fixed face on either side.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SplitConfig {
+    pub enabled: bool,
+    /// Face shown left of the main one, if any.
+    pub left: Option<SlideKind>,
+    /// Face shown right of the main one, if any.
+    pub right: Option<SlideKind>,
+    /// Hovering a side segment opens the panel straight onto that slide
+    /// (when it is in the carousel), instead of onto the main one.
+    pub open_hovered: bool,
+}
+
+impl Default for SplitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            left: Some(SlideKind::Clock),
+            right: Some(SlideKind::Stats),
+            open_hovered: true,
+        }
+    }
+}
+
+/// Satellite pods: small live-activity pills that bud off either side of the
+/// notch while something is happening, and merge back into it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PodsConfig {
+    pub enabled: bool,
+    /// How many pods may show at once, 1 or 2.
+    pub max: u32,
+    /// A coding agent reported work in progress over the `/activity` webhook.
+    pub agents: bool,
+    /// The focus timer is running.
+    pub timer: bool,
+    /// A calendar event is on now or starting soon.
+    pub calendar: bool,
+    /// Something is playing.
+    pub media: bool,
+    /// How soon an upcoming event earns a pod, in minutes.
+    pub calendar_lead_mins: u32,
+}
+
+impl Default for PodsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 2,
+            agents: true,
+            timer: true,
+            calendar: true,
+            media: true,
+            calendar_lead_mins: 10,
+        }
+    }
+}
+
+impl PodsConfig {
+    pub const MAX_PODS: u32 = 2;
+
+    /// The configured limit, clamped to what the notch has room for.
+    pub fn limit(&self) -> usize {
+        self.max.clamp(1, Self::MAX_PODS) as usize
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotchConfig {
     pub enabled: bool,
@@ -826,6 +1048,15 @@ pub struct NotchConfig {
     /// button left to press to turn it back off.
     #[serde(default)]
     pub click_through: bool,
+    /// Silhouette and finish: corner roundness, shoulders, outline, shadow.
+    #[serde(default)]
+    pub shape: ShapeConfig,
+    /// Extra live segments either side of the resting pill.
+    #[serde(default)]
+    pub split: SplitConfig,
+    /// Live-activity pods beside the notch.
+    #[serde(default)]
+    pub pods: PodsConfig,
 }
 
 impl Default for NotchConfig {
@@ -857,6 +1088,9 @@ impl Default for NotchConfig {
             scroll_to_switch: true,
             always_on_top: true,
             click_through: false,
+            shape: ShapeConfig::default(),
+            split: SplitConfig::default(),
+            pods: PodsConfig::default(),
         }
     }
 }
@@ -1374,6 +1608,79 @@ mod tests {
             app_config_directory_from(Some(PathBuf::new()), Some(known_folder.clone())),
             Some(known_folder)
         );
+    }
+
+    #[test]
+    fn notch_config_written_before_shape_split_and_pods_still_loads() {
+        // Strip the new keys out of a current config, as an older Venu
+        // would have written it, and read it back.
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let notch = value["notch"].as_object_mut().unwrap();
+        for key in ["shape", "split", "pods"] {
+            assert!(notch.remove(key).is_some(), "{key} is serialised");
+        }
+        let old: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(old.notch.shape, ShapeConfig::default());
+        assert_eq!(old.notch.split, SplitConfig::default());
+        assert_eq!(old.notch.pods, PodsConfig::default());
+        assert!(
+            !old.notch.split.enabled && !old.notch.pods.enabled,
+            "both are opt-in"
+        );
+    }
+
+    #[test]
+    fn default_shape_reproduces_the_original_silhouette() {
+        // What `window.rs` drew before shapes were configurable.
+        let legacy_radius = |h: f32, t: f32| {
+            let pill = (h * 0.5).min(20.0);
+            pill + (26.0 - pill) * t
+        };
+        let legacy_flare = |t: f32| 16.0 + (24.0 - 16.0) * t;
+        let shape = ShapeConfig::default();
+        for h in [18.0, 34.0, 40.0, 60.0, 120.0] {
+            for t in [0.0, 0.25, 0.5, 1.0] {
+                assert!(
+                    (shape.radius_at(h, t) - legacy_radius(h, t)).abs() < 1e-4,
+                    "h {h} t {t}"
+                );
+            }
+        }
+        for t in [0.0, 0.5, 1.0] {
+            assert!((shape.shoulder_at(t) - legacy_flare(t)).abs() < 1e-4);
+        }
+        assert_eq!(
+            (
+                shape.outline_strength(),
+                shape.sheen_strength(),
+                shape.shadow_strength()
+            ),
+            (1.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn shape_numbers_are_clamped_and_presets_apply() {
+        let mut shape = ShapeConfig {
+            corner_radius: f32::NAN,
+            corner_radius_open: 900.0,
+            shoulder: -4.0,
+            outline: f32::INFINITY,
+            ..ShapeConfig::default()
+        };
+        assert_eq!(shape.radius_at(34.0, 0.0), 0.0);
+        assert_eq!(shape.radius_at(34.0, 1.0), ShapeConfig::MAX_RADIUS);
+        // Fused shoulders never collapse to zero (see MIN_FUSED_SHOULDER).
+        assert_eq!(shape.shoulder_at(0.0), ShapeConfig::MIN_FUSED_SHOULDER);
+        assert_eq!(shape.outline_strength(), 0.0);
+
+        shape.apply_preset(ShapePreset::Pill);
+        // A pill preset is fully round whatever the pill's height.
+        assert_eq!(shape.radius_at(34.0, 0.0), 17.0);
+        assert_eq!(shape.radius_at(80.0, 0.0), 40.0);
+        shape.apply_preset(ShapePreset::Custom);
+        assert_eq!(shape.preset, ShapePreset::Custom);
+        assert_eq!(shape.radius_at(80.0, 0.0), 40.0, "Custom keeps the numbers");
     }
 
     #[test]

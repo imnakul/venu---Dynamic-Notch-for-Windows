@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_NOTIF_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -153,6 +153,13 @@ impl NotificationCenter {
         let allowed =
             allowed_apps.is_empty() || allowed_apps.iter().any(|a| a.eq_ignore_ascii_case(app));
 
+        // "Finished" from an app also ends whatever it said it was working on,
+        // so an agent whose Stop hook already posts a success notification
+        // needs nothing extra to clear its pod.
+        if level == NotificationLevel::Success {
+            stop_activity(app);
+        }
+
         if allowed {
             let dur = if duration > 0.5 { duration } else { 4.5 };
             self.active_toast = Some(ToastAlert {
@@ -275,6 +282,102 @@ pub fn usage_store() -> Arc<RwLock<UsageSnapshot>> {
     store
 }
 
+// ---------------------------------------------------------------------------
+// Activities: long-running work an agent or script reports over `/activity`
+// ---------------------------------------------------------------------------
+
+/// Longest an activity is believed without hearing "stop". A crashed agent
+/// or a lost request must not leave a pod counting up forever.
+const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// At most this many activities are tracked; the oldest go first.
+const MAX_ACTIVITIES: usize = 4;
+
+/// Work in progress, as reported by an agent or script.
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub app: String,
+    started: Instant,
+}
+
+impl Activity {
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= ACTIVITY_TIMEOUT
+    }
+}
+
+static ACTIVITIES: parking_lot::RwLock<Vec<Activity>> = parking_lot::RwLock::new(Vec::new());
+static ACTIVITY_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped whenever an activity starts or stops.
+pub fn activity_revision() -> u64 {
+    ACTIVITY_REVISION.load(Ordering::Acquire)
+}
+
+/// The most recently started activity that is still live, if any.
+pub fn current_activity() -> Option<Activity> {
+    ACTIVITIES
+        .read()
+        .iter()
+        .rev()
+        .find(|a| !a.expired())
+        .cloned()
+}
+
+/// Seconds since the most recent live activity started, without cloning it —
+/// cheap enough for the per-tick frame key.
+pub fn current_elapsed_secs() -> Option<u64> {
+    ACTIVITIES
+        .read()
+        .iter()
+        .rev()
+        .find(|a| !a.expired())
+        .map(Activity::elapsed_secs)
+}
+
+/// Whether anything is in progress. A read lock and a scan of at most
+/// [`MAX_ACTIVITIES`] entries; no allocation.
+pub fn has_activity() -> bool {
+    ACTIVITIES.read().iter().any(|a| !a.expired())
+}
+
+fn start_activity(app: &str) {
+    let mut list = ACTIVITIES.write();
+    // One activity per app: restarting it restarts its clock.
+    list.retain(|a| !a.app.eq_ignore_ascii_case(app) && !a.expired());
+    list.push(Activity {
+        app: app.trim().to_string(),
+        started: Instant::now(),
+    });
+    if list.len() > MAX_ACTIVITIES {
+        let excess = list.len() - MAX_ACTIVITIES;
+        list.drain(..excess);
+    }
+    ACTIVITY_REVISION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn stop_activity(app: &str) {
+    let mut list = ACTIVITIES.write();
+    let before = list.len();
+    list.retain(|a| !a.app.eq_ignore_ascii_case(app));
+    if list.len() != before {
+        ACTIVITY_REVISION.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// JSON payload received over the local `/activity` Webhook endpoint.
+/// Unknown fields are ignored, so callers may send extra context.
+#[derive(Debug, Deserialize)]
+pub struct ActivityPayload {
+    pub app: Option<String>,
+    /// `"start"` or `"stop"`.
+    pub state: String,
+}
+
 fn handle_webhook_client(
     mut stream: TcpStream,
     store: Arc<RwLock<NotificationCenter>>,
@@ -322,7 +425,41 @@ fn handle_webhook_client(
             let header_offset = if req_str.contains("\r\n\r\n") { 4 } else { 2 };
             let body_str = &req_str[pos + header_offset..];
 
-            if path == "/usage" {
+            if path == "/activity" {
+                if let Ok(payload) = serde_json::from_str::<ActivityPayload>(body_str.trim()) {
+                    let app = payload.app.unwrap_or_else(|| "System".to_string());
+                    let allowed = {
+                        let list = allowed_apps.read();
+                        list.is_empty() || list.iter().any(|a| a.eq_ignore_ascii_case(&app))
+                    };
+                    let known = match payload.state.trim().to_ascii_lowercase().as_str() {
+                        "start" | "running" => {
+                            if allowed {
+                                start_activity(&app);
+                            }
+                            true
+                        }
+                        "stop" | "done" | "idle" => {
+                            stop_activity(&app);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if known {
+                        let resp_body = format!(r#"{{"status":"ok","tracked":{allowed}}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        return;
+                    }
+                }
+            } else if path == "/usage" {
                 if let Ok(payload) = serde_json::from_str::<UsagePayload>(body_str.trim()) {
                     let epoch = SystemTime::now()
                         .duration_since(UNIX_EPOCH)

@@ -179,13 +179,8 @@ pub const GUTTER: f32 = 26.0;
 pub const PILL_GUTTER: f32 = 14.0;
 /// Fraction of the panel width given to the left half of a split slide.
 pub const SPLIT_RATIO: f32 = 0.44;
-/// Corner radius of the expanded panel.
-pub const RADIUS_EXPANDED: f32 = 26.0;
-/// How far the concave shoulders reach along the bezel and down the side
-/// walls while fused to it, collapsed and fully open. Reach, not radius: the
-/// smoothed curve reads like a circle of about two thirds of this.
-pub const FLARE: f32 = 16.0;
-pub const FLARE_EXPANDED: f32 = 24.0;
+// Corner radii and shoulder reach are user settings now — see
+// `config::ShapeConfig`, whose defaults are the values that used to live here.
 
 /// Straight RGBA to the premultiplied colour a layered-window render target
 /// needs. Every brush in the notch goes through here.
