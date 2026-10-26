@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, BorderEffect, BorderEffectConfig, SlideKind};
 use crate::notch::anim::{smoothstep, Spring};
-use crate::notch::layout::{self, PodKind, Slot};
+use crate::notch::layout::{self, PodKind, Press, Slot, Target};
 
 /// Placeholder shown when the focus line has been cleared entirely.
 const EMPTY_FOCUS: &str = "What are you working on?";
@@ -88,6 +88,14 @@ pub struct NotchState {
     pub editing: bool,
     pub edit_target: EditTarget,
     pub edit_buffer: String,
+    /// The clickable thing under the cursor in the open panel.
+    pub hot: Option<Target>,
+    /// The last one hovered, kept while its highlight fades out.
+    pub hot_shown: Option<Target>,
+    /// The hover highlight, 0..1.
+    pub hot_amount: Spring,
+    /// The click being acknowledged, if any.
+    pub press: Option<Press>,
     /// Music wave bar heights, 0..1, fed by the window's audio meter.
     pub wave: [f32; layout::WAVE_BARS],
     pub caret_on: bool,
@@ -163,6 +171,11 @@ impl NotchState {
             edit_target: EditTarget::Focus,
             edit_buffer: String::new(),
             wave: [0.22; layout::WAVE_BARS],
+            hot: None,
+            hot_shown: None,
+            // Fast in, a touch slower out, like a pointer highlight should.
+            hot_amount: Spring::new(0.0, 520.0, 46.0),
+            press: None,
             caret_on: true,
             caret_clock: 0.0,
             marquee_offset: 0.0,
@@ -428,6 +441,35 @@ impl NotchState {
         target
     }
 
+    /// Acknowledge a click on `target` at `(x, y)` with a ripple.
+    pub fn press(&mut self, target: Target, x: f32, y: f32) {
+        self.press = Some(Press {
+            target,
+            x,
+            y,
+            age: 0.0,
+        });
+    }
+
+    /// Hover highlight and click ripple. A frame's worth of arithmetic, and
+    /// still once both have settled.
+    fn tick_feedback(&mut self, dt: f32) {
+        if self.hot.is_some() {
+            self.hot_shown = self.hot;
+        }
+        let target = if self.hot.is_some() { 1.0 } else { 0.0 };
+        self.hot_amount.step(target, dt);
+        if self.hot.is_none() && self.hot_amount.value <= 0.001 {
+            self.hot_shown = None;
+        }
+        if let Some(press) = self.press.as_mut() {
+            press.age += dt;
+            if press.age >= Press::DURATION {
+                self.press = None;
+            }
+        }
+    }
+
     /// Open and hold open: a click, the shortcut or the mouse trigger.
     pub fn open_sticky(&mut self) {
         self.sticky = true;
@@ -476,6 +518,7 @@ impl NotchState {
         self.expand.step(target_expand, dt);
         let peek_target = if self.peeking { 1.0 } else { 0.0 };
         self.peek.step(peek_target, dt);
+        self.tick_feedback(dt);
         self.carousel.step(self.active as f32, dt);
 
         // Side segments follow whatever the pill is resting on: never a
@@ -1004,5 +1047,24 @@ mod tests {
         state.begin_add();
         assert!(!state.commit_edit(&mut cfg));
         assert_eq!(cfg.status.items.len(), before + 1);
+    }
+
+    #[test]
+    fn a_click_ripple_runs_once_and_the_hover_fades_out() {
+        let cfg = AppConfig::default();
+        let mut state = NotchState::new(&cfg);
+        let target = Target::round(layout::Hit::Settings, (10.0, 10.0, 9.0));
+
+        state.hot = Some(target);
+        tick_for(&mut state, &cfg, 0.2);
+        assert!(state.hot_amount.value > 0.9);
+        state.press(target, 10.0, 10.0);
+        state.hot = None;
+        tick_for(&mut state, &cfg, 1.0);
+        assert!(state.press.is_none(), "the ripple ends by itself");
+        assert!(
+            state.hot_shown.is_none(),
+            "the highlight has faded and let go"
+        );
     }
 }

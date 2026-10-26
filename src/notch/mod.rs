@@ -147,27 +147,11 @@ impl NotchManager {
             crate::tray::restore_settings_window();
         }
 
-        // The right-click menu, likewise shown with the lock released: it
-        // runs a modal loop until the user picks something or looks away.
-        if let Some(request) = outcome.menu {
-            let owner = window.hwnd();
-            match menu::show(&request, owner) {
-                Some(menu::MenuCommand::Settings) => crate::tray::restore_settings_window(),
-                Some(menu::MenuCommand::Quit) => {
-                    // Anything still waiting on the save debounce goes now.
-                    self.config.read().save();
-                    std::process::exit(0);
-                }
-                Some(command) => {
-                    let mut cfg = self.config.write();
-                    if window.apply_menu(command, &mut cfg) {
-                        self.save_countdown = Some(SAVE_DEBOUNCE);
-                    }
-                }
-                None => {}
-            }
-            // The click that closed the menu must not also close the notch.
-            let _ = hook::take_outside();
+        // Quit from the notch's menu: save anything still waiting on the
+        // debounce, then go — the same exit the tray's Exit takes.
+        if outcome.quit {
+            self.config.read().save();
+            std::process::exit(0);
         }
 
         if outcome.config_dirty {

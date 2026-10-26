@@ -397,6 +397,16 @@ impl Rect {
     pub fn height(&self) -> f32 {
         self.bottom - self.top
     }
+
+    /// Shrunk by `dx` on each side and `dy` top and bottom; negative grows.
+    pub fn inset(&self, dx: f32, dy: f32) -> Self {
+        Self::new(
+            self.left + dx,
+            self.top + dy,
+            self.right - dx,
+            self.bottom - dy,
+        )
+    }
 }
 
 pub const SHELF_TILE_W: f32 = 64.0;
@@ -557,6 +567,98 @@ pub fn status_list(column: Rect, count: usize) -> StatusList {
         items: (0..shown).map(row).collect(),
         add: can_add.then(|| row(shown)),
         overflow: count - shown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clickable targets: what the cursor is over, for hover and press feedback
+// ---------------------------------------------------------------------------
+
+/// Something in the open panel that does something when clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Settings,
+    Pin,
+    /// Now Playing: previous, play/pause, next.
+    Media(u8),
+    /// Focus timer: reset, start/pause, skip.
+    Timer(u8),
+    /// A Quick Toggles tile.
+    Toggle(u8),
+    Shelf(ShelfRow, usize),
+    Clip(usize),
+    ClipClear,
+    /// The Status focus line.
+    Focus,
+    StatusRow(usize),
+    /// The list's "+ Add to the list" row.
+    StatusAdd,
+    /// The round + button beside the list heading.
+    StatusPlus,
+    NotifRow(usize),
+    NotifClear,
+    NotifBack,
+    NotifDismiss,
+}
+
+/// A clickable target and where it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Target {
+    pub hit: Hit,
+    pub rect: Rect,
+    /// Corner radius of its highlight; half the height for a round button.
+    pub radius: f32,
+}
+
+impl Target {
+    pub fn rect(hit: Hit, rect: Rect, radius: f32) -> Self {
+        Self { hit, rect, radius }
+    }
+
+    /// A round button from its centre and radius, with a little slop.
+    pub fn round(hit: Hit, (cx, cy, r): (f32, f32, f32)) -> Self {
+        let r = r + 5.0;
+        Self {
+            hit,
+            rect: Rect::new(cx - r, cy - r, cx + r, cy + r),
+            radius: r,
+        }
+    }
+
+    /// Whether a point is on it: within the circle for a round button.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        if self.is_round() {
+            let cx = (self.rect.left + self.rect.right) * 0.5;
+            let cy = (self.rect.top + self.rect.bottom) * 0.5;
+            (x - cx).powi(2) + (y - cy).powi(2) <= self.radius * self.radius
+        } else {
+            self.rect.contains(x, y)
+        }
+    }
+
+    pub fn is_round(&self) -> bool {
+        (self.rect.width() - self.rect.height()).abs() < 0.5
+            && self.radius * 2.0 >= self.rect.width() - 0.5
+    }
+}
+
+/// A click being acknowledged: a ripple from where it landed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Press {
+    pub target: Target,
+    pub x: f32,
+    pub y: f32,
+    /// Seconds since the click.
+    pub age: f32,
+}
+
+impl Press {
+    /// How long the ripple runs.
+    pub const DURATION: f32 = 0.42;
+
+    /// 0 at the click, 1 when the ripple is done.
+    pub fn progress(&self) -> f32 {
+        (self.age / Self::DURATION).clamp(0.0, 1.0)
     }
 }
 
@@ -827,5 +929,20 @@ mod tests {
         let full = status_list(column, STATUS_MAX_ITEMS);
         assert!(full.add.is_none());
         assert_eq!(full.items.len(), 5);
+    }
+
+    #[test]
+    fn round_buttons_answer_to_their_circle_with_a_little_slop() {
+        let button = Target::round(Hit::Pin, (100.0, 50.0, 9.0));
+        assert!(button.is_round());
+        assert!(button.contains(100.0, 50.0));
+        assert!(button.contains(113.0, 50.0), "slop past the drawn edge");
+        assert!(
+            !button.contains(112.0, 62.0),
+            "corner of the box is outside"
+        );
+        let row = Target::rect(Hit::Clip(0), Rect::new(0.0, 0.0, 200.0, 26.0), 7.0);
+        assert!(!row.is_round());
+        assert!(row.contains(199.0, 25.0));
     }
 }

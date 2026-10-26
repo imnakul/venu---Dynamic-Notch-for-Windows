@@ -330,6 +330,11 @@ pub fn slide_body(panel: NotchShape) -> D2D_RECT_F {
     }
 }
 
+/// The round + button at the right end of the Status list's heading.
+pub fn status_plus_button(body: D2D_RECT_F) -> (f32, f32, f32) {
+    (body.right - 9.0, body.top + 6.0, 9.0)
+}
+
 /// The Status slide's right-hand list column: right of the divider, under
 /// its "ON DECK" heading. Shared by the painter and click handling.
 pub fn status_list_column(body: D2D_RECT_F) -> crate::notch::layout::Rect {

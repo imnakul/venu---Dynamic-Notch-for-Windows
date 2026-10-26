@@ -55,6 +55,30 @@ impl TextEngine {
         })
     }
 
+    /// Whether Windows has this font family installed.
+    pub fn system_has(&self, family: &str) -> bool {
+        unsafe {
+            let mut collection = None;
+            if self
+                .factory
+                .GetSystemFontCollection(&mut collection, false)
+                .is_err()
+            {
+                return false;
+            }
+            let Some(collection) = collection else {
+                return false;
+            };
+            let name = HSTRING::from(family);
+            let mut index = 0u32;
+            let mut exists = windows::Win32::Foundation::BOOL(0);
+            collection
+                .FindFamilyName(PCWSTR(name.as_ptr()), &mut index, &mut exists)
+                .is_ok()
+                && exists.as_bool()
+        }
+    }
+
     fn is_private(&self, family: &str) -> bool {
         self.private_families
             .iter()

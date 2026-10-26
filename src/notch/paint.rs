@@ -184,6 +184,9 @@ pub struct Painter {
     effects: crate::notch::effects::EffectPainter,
     /// Shelf icons uploaded to the render target, by path.
     icons: RefCell<IconCache>,
+    /// Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets before it; the
+    /// two share their code points.
+    icon_family: &'static str,
 }
 
 /// Shelf icons as Direct2D bitmaps. They belong to one render target, so a
@@ -268,6 +271,11 @@ pub fn clock_key() -> u64 {
 impl Painter {
     pub fn new() -> windows::core::Result<Self> {
         let text = TextEngine::new()?;
+        let icon_family = if text.system_has("Segoe Fluent Icons") {
+            "Segoe Fluent Icons"
+        } else {
+            "Segoe MDL2 Assets"
+        };
         let wic: Option<IWICImagingFactory> =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok() };
 
@@ -291,6 +299,7 @@ impl Painter {
             solid_generation: 0,
             effects: Default::default(),
             icons: RefCell::new(IconCache::default()),
+            icon_family,
         })
     }
 
@@ -591,6 +600,7 @@ impl Painter {
         scene: &Scene,
         origin: (i32, i32),
         may_capture: bool,
+        menu: Option<&crate::notch::menu::MenuView>,
     ) -> windows::core::Result<()> {
         let (win_w, win_h) = surface.size();
         if win_w == 0 || win_h == 0 {
@@ -763,6 +773,8 @@ impl Painter {
         if expanded_alpha > 0.004 {
             self.paint_settings_button(&t, cfg, state, shape, expanded_alpha);
             self.paint_pin_button(&t, cfg, state, shape, expanded_alpha);
+            // Hover highlight and click ripple over whatever is under them.
+            self.paint_feedback(&t, &factory, cfg, state, expanded_alpha);
         }
 
         self.paint_click_through(&t, cfg, state, shape);
@@ -772,6 +784,11 @@ impl Painter {
         // Pod faces, each clipped to its own little slab.
         for pod in scene.pods.iter().flatten() {
             self.paint_pod_face(&t, cfg, state, pod);
+        }
+
+        // The right-click menu floats over everything.
+        if let Some(menu) = menu {
+            self.paint_menu(&t, cfg, menu);
         }
 
         unsafe { t.EndDraw(None, None)? };
@@ -942,42 +959,26 @@ impl Painter {
         }
     }
 
-    /// Settings launcher button: opens the Settings panel on click (Hugeicons stroke gear).
+    /// The Settings button: a gear on a soft round chip.
     fn paint_settings_button(
         &self,
         t: &ID2D1DCRenderTarget,
-        _cfg: &AppConfig,
+        cfg: &AppConfig,
         _state: &NotchState,
         shape: NotchShape,
         alpha: f32,
     ) {
-        let (cx, cy, r) = shape.settings_button();
-
-        // Soft well
-        self.dot(t, cx, cy, r + 6.0, theme::fade(self.pal.well, alpha));
-
-        let gear_color = theme::fade(self.pal.text_lo, alpha * 0.95);
-        let hub_r = r * 0.36;
-        let outer_r = r * 0.74;
-
-        // Gear body rings
-        self.ring(t, cx, cy, outer_r, 1.2, gear_color);
-        self.ring(t, cx, cy, hub_r, 1.0, gear_color);
-
-        // 6 gear cogs / teeth
-        for i in 0..6 {
-            let angle = (i as f32) * (std::f32::consts::PI / 3.0);
-            let cos_a = angle.cos();
-            let sin_a = angle.sin();
-            let x1 = cx + cos_a * (outer_r - 0.6);
-            let y1 = cy + sin_a * (outer_r - 0.6);
-            let x2 = cx + cos_a * (outer_r + 2.4);
-            let y2 = cy + sin_a * (outer_r + 2.4);
-            self.line(t, x1, y1, x2, y2, 1.6, gear_color);
-        }
+        self.chip_button(
+            t,
+            cfg,
+            shape.settings_button(),
+            crate::notch::menu::glyph::SETTINGS,
+            false,
+            alpha,
+        );
     }
 
-    /// Pin toggle button: locks the panel open, drawn with authentic Hugeicons pushpin stroke geometry.
+    /// Keep open: a pin, filled in the accent while it holds the panel open.
     fn paint_pin_button(
         &self,
         t: &ID2D1DCRenderTarget,
@@ -986,69 +987,12 @@ impl Painter {
         shape: NotchShape,
         alpha: f32,
     ) {
-        let (cx, cy, r) = shape.pin_button();
-        let pinned = state.pinned;
-
-        // Soft well behind it
-        self.dot(t, cx, cy, r + 6.0, theme::fade(self.pal.well, alpha));
-
-        let color = if pinned {
-            theme::fade(cfg.notch.accent, alpha)
-        } else {
-            theme::fade(self.pal.text_lo, alpha * 0.9)
-        };
-
-        // Hugeicons angled pushpin stroke geometry:
-        let tip_x = cx - 4.4;
-        let tip_y = cy + 4.4;
-        let base_x = cx - 1.0;
-        let base_y = cy + 1.0;
-        let head_x = cx + 3.8;
-        let head_y = cy - 3.8;
-
-        // Needle line
-        self.line(t, tip_x, tip_y, base_x, base_y, 1.3, color);
-
-        // Collar crossbar
-        self.line(
-            t,
-            base_x - 2.4,
-            base_y - 2.4,
-            base_x + 2.4,
-            base_y + 2.4,
-            1.5,
-            color,
-        );
-
-        // Barrel
-        self.line(
-            t,
-            base_x,
-            base_y,
-            head_x,
-            head_y,
-            if pinned { 2.6 } else { 1.6 },
-            color,
-        );
-
-        // Pin cap head
-        self.line(
-            t,
-            head_x - 3.2,
-            head_y - 3.2,
-            head_x + 3.2,
-            head_y + 3.2,
-            2.0,
-            color,
-        );
-
-        if pinned {
-            self.dot(t, tip_x, tip_y, 1.6, theme::fade(cfg.notch.accent, alpha));
-        }
+        let glyph = if state.pinned { "\u{E840}" } else { "\u{E718}" };
+        self.chip_button(t, cfg, shape.pin_button(), glyph, state.pinned, alpha);
     }
 
-    /// The click-through marker: a permanent pinprick while the mode is on,
-    /// and a short banner the moment it is switched either way.
+    /// A short banner confirming what just changed — click-through switched,
+    /// hover paused, something copied — since none of those shows by itself.
     ///
     /// A gesture whose whole effect is that clicks stop landing here has no
     /// natural feedback of its own, so the notch has to say what happened —
@@ -1060,18 +1004,6 @@ impl Painter {
         state: &NotchState,
         shape: NotchShape,
     ) {
-        if cfg.notch.click_through {
-            // Bottom-right, small and dim: present enough to explain why
-            // clicks are going elsewhere, quiet enough to live there.
-            self.dot(
-                t,
-                shape.right - 7.5,
-                shape.bottom - 7.5,
-                2.0,
-                theme::fade(self.pal.text_lo, 0.75 * self.pulse(state)),
-            );
-        }
-
         let flash = state.badge_time;
         if flash <= 0.0 {
             return;
@@ -2389,7 +2321,7 @@ impl Painter {
     ) {
         let Ok(fmt) = self
             .text
-            .format("Segoe MDL2 Assets", size, DWRITE_FONT_WEIGHT_MEDIUM)
+            .format(self.icon_family, size, DWRITE_FONT_WEIGHT_MEDIUM)
         else {
             return;
         };
@@ -3600,11 +3532,22 @@ impl Painter {
             theme::SIZE_LABEL,
             DWRITE_FONT_WEIGHT_EXTRA_BOLD,
             theme::TRACK_LABEL,
-            rw,
+            rw - 30.0,
             rx,
             body.top,
             theme::fade(self.pal.text_lo, alpha),
         );
+        // Add a task: a round + in the accent, at the end of the heading.
+        if cfg.status.items.len() < crate::notch::layout::STATUS_MAX_ITEMS {
+            self.chip_button(
+                t,
+                cfg,
+                crate::notch::geom::status_plus_button(body),
+                crate::notch::menu::glyph::ADD,
+                true,
+                alpha,
+            );
+        }
 
         let column = crate::notch::geom::status_list_column(body);
         let list = crate::notch::layout::status_list(column, cfg.status.items.len());

@@ -62,6 +62,58 @@ impl SettingsApp {
         );
         ui.add_space(14.0);
 
+        // The click gesture. Picking one makes it the only click that opens
+        // the notch, so a stray plain click on the pill never does.
+        let clicks = input.open_with.clicks();
+        let trigger = input.mouse_trigger;
+        let shown = |kind: MouseTrigger| -> &'static str {
+            match kind {
+                MouseTrigger::Off if clicks => "Plain click",
+                MouseTrigger::Off => "Nothing",
+                other => other.label(),
+            }
+        };
+        Self::row_inline(
+            ui,
+            if clicks {
+                "Click to open with"
+            } else {
+                "Also open or close with"
+            },
+            |ui| {
+                egui::ComboBox::from_id_salt("mouse_trigger")
+                    .selected_text(shown(trigger))
+                    .show_ui(ui, |ui| {
+                        for kind in MouseTrigger::ALL {
+                            if ui.selectable_label(trigger == kind, shown(kind)).clicked() {
+                                input.mouse_trigger = kind;
+                                *cx.changed = true;
+                            }
+                        }
+                    });
+            },
+        );
+        ui.label(
+            RichText::new(match (clicks, trigger) {
+                (true, MouseTrigger::Off) => {
+                    "Any click on the pill opens it. Pick a gesture such as Ctrl + click to \
+                     make that the only way a click opens it."
+                }
+                (true, _) => {
+                    "Only this gesture opens the notch; a plain click on the pill does \
+                     nothing, so it never opens by accident. The same gesture closes it, and \
+                     it works even while clicks pass through."
+                }
+                (false, _) => {
+                    "A mouse gesture over the notch that opens or closes it. Everywhere else \
+                     the button does what it always does."
+                }
+            })
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        ui.add_space(14.0);
+
         if input.open_with.hovers() {
             Self::row_stacked(
                 ui,
@@ -100,11 +152,14 @@ impl SettingsApp {
             ui.add_space(12.0);
         }
 
-        if input.open_with == OpenWith::Click && cx.cfg.notch.click_through {
+        if input.open_with == OpenWith::Click
+            && input.mouse_trigger == MouseTrigger::Off
+            && cx.cfg.notch.click_through
+        {
             ui.label(
                 RichText::new(
                     "Clicks pass through the notch right now, so a plain click cannot open it. \
-                     Use a shortcut or a mouse trigger below, or switch on hover.",
+                     Pick a click gesture above, use a shortcut, or switch on hover.",
                 )
                 .size(11.5)
                 .color(WARNING),
@@ -114,7 +169,7 @@ impl SettingsApp {
     }
 
     fn sec_wheel_and_mouse(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "WHEEL AND MOUSE");
+        Self::section_title(ui, "SCROLL AND MENU");
         let notch = &mut cx.cfg.notch;
         let current = notch.scroll_pages();
         Self::row_inline(ui, "Scroll changes pages", |ui| {
@@ -132,23 +187,10 @@ impl SettingsApp {
                 });
         });
 
-        let trigger = notch.input.mouse_trigger;
-        Self::row_inline(ui, "Open or close with", |ui| {
-            egui::ComboBox::from_id_salt("mouse_trigger")
-                .selected_text(trigger.label())
-                .show_ui(ui, |ui| {
-                    for kind in MouseTrigger::ALL {
-                        if ui.selectable_label(trigger == kind, kind.label()).clicked() {
-                            notch.input.mouse_trigger = kind;
-                            *cx.changed = true;
-                        }
-                    }
-                });
-        });
         ui.label(
             RichText::new(
-                "Only over the notch: everywhere else the button does what it always does. It \
-                 also works while clicks pass through. Right-click the notch for its menu.",
+                "Right-click the notch for its menu: Settings, keep open, pause hover, \
+                 click-through, pages and quit.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
