@@ -343,6 +343,8 @@ fn sample(kind: SlideKind) -> &'static str {
         SlideKind::Notifications => "2 new",
         SlideKind::Status => "Ship the notch",
         SlideKind::Wallpaper => "Photo",
+        SlideKind::Shelf => "3 pinned",
+        SlideKind::Clipboard => "Copied text",
         SlideKind::Controls => "Toggles",
     }
 }

@@ -129,3 +129,32 @@ possible while they are on.
 - **Live data only while visible.** A face in a split segment counts as on
   screen for the frame key, so (for example) Stats sampling and the clock key
   run only while that segment is actually showing.
+
+## Controls, Shelf, Clipboard and the live wave
+
+- **Hover costs what it did.** Click/hover opening, the hover delay, the
+  fly-by check and the peek grow are arithmetic on the cursor position the
+  notch already read every tick. Full-screen state (`SHQueryUserNotificationState`)
+  is read at most once a second.
+- **The mouse hook stays one compare for moves.** The trigger and the
+  outside-click watch only look at button presses; modifier keys are read only
+  on a left press while a modifier trigger is set.
+- **Shortcuts are `RegisterHotKey`**, delivered as window messages: no keyboard
+  hook, nothing per keystroke.
+- **The menu is the system popup menu**, created on right-click and destroyed
+  when it closes.
+- **Shelf work happens off the render thread.** One thread lists the peeked
+  folder, checks pinned paths and asks the shell for icons, only while the
+  Shelf is in the deck. It sleeps on a folder change notification, not a
+  timer. Icons are uploaded to Direct2D once and cached per surface.
+- **Clipboard history is event-driven.** A message-only window registered with
+  `AddClipboardFormatListener` is told about each copy; nothing polls. Off by
+  default, and the thread does not exist while off.
+- **The live wave is the one new moving thing.** While music plays and a wave
+  is on screen, the default output's peak meter (`IAudioMeterInformation`, a
+  shared-memory read) is sampled every 40 ms and the bars repaint at about
+  20–25 fps. Paused, hidden or switched off (Slides › Now Playing), it costs
+  nothing and the meter is released.
+- **The player's timeline repaints once a second** while the player is open,
+  from a position the media poller anchors; the poll itself does not cause a
+  repaint unless the track, state or position (a seek) actually changed.

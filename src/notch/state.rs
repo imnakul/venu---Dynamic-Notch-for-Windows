@@ -13,8 +13,30 @@ use crate::notch::layout::{self, PodKind, Slot};
 /// Placeholder shown when the focus line has been cleared entirely.
 const EMPTY_FOCUS: &str = "What are you working on?";
 
-/// How long the click-through badge stays up after the chord.
+/// How long a confirmation badge stays up.
 const FLASH_SECONDS: f32 = 1.6;
+
+/// What the inline text field is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditTarget {
+    /// The Status slide's focus line.
+    #[default]
+    Focus,
+    /// A new item for the Status slide's short list.
+    NewItem,
+}
+
+/// A short confirmation shown over the notch: the action itself is invisible
+/// (clicks go elsewhere, hover simply stops), so the notch says what changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Badge {
+    #[default]
+    ClickThrough,
+    /// Hover was paused (`true`) or resumed.
+    HoverPaused(bool),
+    Copied,
+    AddedToShelf,
+}
 
 /// Delay before the first border effect after launch, or after one is picked
 /// in settings, so the choice is seen straight away rather than an interval
@@ -41,8 +63,33 @@ pub struct NotchState {
     /// "the cursor is still here".
     pub pinned: bool,
 
+    /// Opened by a click, the shortcut or the mouse trigger: stays open until
+    /// a click elsewhere, the same gesture again, or a menu choice closes it.
+    pub sticky: bool,
+    /// Hover may not open the notch before this ("Pause hover" in the menu).
+    hover_paused_until: Option<Instant>,
+    /// Seconds the cursor has rested on the closed pill. Hover opens the
+    /// notch once this passes the configured delay.
+    pub dwell: f32,
+    /// After the notch is closed on purpose, hover may not reopen it until
+    /// the cursor has left; otherwise closing it from under the cursor would
+    /// bounce straight back open.
+    pub hover_blocked: bool,
+    /// The small grow of the closed pill under the cursor: "this opens".
+    pub peek: Spring,
+    /// Whether the cursor is on the closed pill and the pill should show it.
+    pub peeking: bool,
+    /// What the expansion was last asked to be, open or shut.
+    pub open_target: bool,
+    /// The wheel moved the closed pill to another face. The resting-face
+    /// rule leaves it there until the panel next opens.
+    pub face_override: bool,
+
     pub editing: bool,
+    pub edit_target: EditTarget,
     pub edit_buffer: String,
+    /// Music wave bar heights, 0..1, fed by the window's audio meter.
+    pub wave: [f32; layout::WAVE_BARS],
     pub caret_on: bool,
     caret_clock: f32,
 
@@ -61,7 +108,9 @@ pub struct NotchState {
     /// Seconds left on the click-through confirmation badge. The chord is
     /// invisible by nature — the clicks go somewhere else — so the notch says
     /// out loud which mode it just entered, then gets out of the way.
-    pub click_through_flash: f32,
+    pub badge_time: f32,
+    /// What the badge says while `badge_time` runs.
+    pub badge: Badge,
 
     /// Seconds into the running border effect; `None` between runs, which is
     /// almost always. Part of the frame key, so the notch only repaints for
@@ -101,15 +150,27 @@ impl NotchState {
             hovered: false,
             left_at: None,
             pinned: false,
+            sticky: false,
+            hover_paused_until: None,
+            dwell: 0.0,
+            hover_blocked: false,
+            // Quick and soft: a hint, not an event.
+            peek: Spring::new(0.0, 320.0, 34.0),
+            peeking: false,
+            open_target: false,
+            face_override: false,
             editing: false,
+            edit_target: EditTarget::Focus,
             edit_buffer: String::new(),
+            wave: [0.22; layout::WAVE_BARS],
             caret_on: true,
             caret_clock: 0.0,
             marquee_offset: 0.0,
             elapsed: 0.0,
             selected_notification_id: None,
             dirty: false,
-            click_through_flash: 0.0,
+            badge_time: 0.0,
+            badge: Badge::ClickThrough,
             effect_time: None,
             effect_wait: EFFECT_FIRST_RUN,
             effect_armed: (
@@ -242,7 +303,21 @@ impl NotchState {
 
     /// Show the click-through badge for long enough to read and no longer.
     pub fn flash_click_through(&mut self) {
-        self.click_through_flash = FLASH_SECONDS;
+        self.flash(Badge::ClickThrough);
+    }
+
+    pub fn flash(&mut self, badge: Badge) {
+        self.badge = badge;
+        self.badge_time = FLASH_SECONDS;
+    }
+
+    /// Stop holding the panel open for a click; it closes once the cursor is
+    /// away, like any hover.
+    pub fn release_sticky(&mut self) {
+        self.sticky = false;
+        if !self.hovered {
+            self.left_at = Some(Instant::now());
+        }
     }
 
     pub fn toggle_pinned(&mut self) {
@@ -307,7 +382,7 @@ impl NotchState {
     /// The focus string to render: the live edit buffer while typing, the
     /// saved value otherwise.
     pub fn display_focus(&self, cfg: &AppConfig) -> String {
-        let raw = if self.editing {
+        let raw = if self.editing && self.edit_target == EditTarget::Focus {
             self.edit_buffer.as_str()
         } else {
             cfg.status.focus.as_str()
@@ -320,11 +395,15 @@ impl NotchState {
         }
     }
 
-    /// Feed the hover result for this frame. Returns the expansion target.
-    pub fn set_hovered(&mut self, hovered: bool, collapse_delay: Duration) -> f32 {
-        self.hovered = hovered;
+    /// Feed this frame's hover result and return the expansion target.
+    ///
+    /// `hover_hold` is whether hover wants the panel open: the cursor is on
+    /// it and either it is already open or it rested long enough to open it.
+    /// A click-held, pinned or edited panel stays open regardless.
+    pub fn set_hovered(&mut self, hover_hold: bool, collapse_delay: Duration) -> f32 {
+        self.hovered = hover_hold;
 
-        if hovered {
+        if hover_hold {
             self.left_at = None;
         } else if self.left_at.is_none() {
             self.left_at = Some(Instant::now());
@@ -332,23 +411,71 @@ impl NotchState {
 
         // Typing keeps the panel open even if the cursor wanders off, or the
         // field would vanish mid-sentence. Pinning does the same, on purpose.
-        if hovered || self.editing || self.pinned {
-            return 1.0;
+        let target = if hover_hold || self.editing || self.pinned || self.sticky {
+            1.0
+        } else {
+            match self.left_at {
+                Some(at) if at.elapsed() >= collapse_delay && self.open_target => 0.0,
+                Some(_) if self.open_target => 1.0,
+                _ => 0.0,
+            }
+        };
+        if target > 0.5 && !self.open_target {
+            // Opening hands the resting face back to the default rule.
+            self.face_override = false;
         }
+        self.open_target = target > 0.5;
+        target
+    }
 
-        match self.left_at {
-            Some(at) if at.elapsed() >= collapse_delay => 0.0,
-            Some(_) => 1.0,
-            None => 0.0,
+    /// Open and hold open: a click, the shortcut or the mouse trigger.
+    pub fn open_sticky(&mut self) {
+        self.sticky = true;
+        self.hover_blocked = false;
+    }
+
+    /// Close now, whatever opened it, and keep hover from reopening it until
+    /// the cursor has left.
+    pub fn close_now(&mut self) {
+        self.sticky = false;
+        self.pinned = false;
+        self.open_target = false;
+        self.hovered = false;
+        self.left_at = None;
+        self.dwell = 0.0;
+        self.hover_blocked = true;
+        if self.editing {
+            self.cancel_edit();
         }
+    }
+
+    /// The shortcut and the mouse trigger: open if shut, close if open.
+    pub fn toggle_open(&mut self) {
+        if self.open_target {
+            self.close_now();
+        } else {
+            self.open_sticky();
+        }
+    }
+
+    /// Stop hover from opening the notch for `duration`, or resume it.
+    pub fn pause_hover(&mut self, duration: Option<Duration>) {
+        self.hover_paused_until = duration.map(|d| Instant::now() + d);
+    }
+
+    pub fn hover_paused(&self) -> bool {
+        self.hover_paused_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     pub fn tick(&mut self, cfg: &AppConfig, target_expand: f32, dt: f32) {
         self.elapsed += dt;
-        self.click_through_flash = (self.click_through_flash - dt).max(0.0);
+        self.badge_time = (self.badge_time - dt).max(0.0);
         self.tick_border_effect(cfg, dt);
 
         self.expand.step(target_expand, dt);
+        let peek_target = if self.peeking { 1.0 } else { 0.0 };
+        self.peek.step(peek_target, dt);
         self.carousel.step(self.active as f32, dt);
 
         // Side segments follow whatever the pill is resting on: never a
@@ -441,9 +568,27 @@ impl NotchState {
             return;
         }
         self.editing = true;
+        self.edit_target = EditTarget::Focus;
         self.edit_buffer = cfg.status.focus.clone();
         self.caret_on = true;
         self.caret_clock = 0.0;
+    }
+
+    /// Start typing a new item for the short list.
+    pub fn begin_add(&mut self) {
+        if self.editing {
+            return;
+        }
+        self.editing = true;
+        self.edit_target = EditTarget::NewItem;
+        self.edit_buffer.clear();
+        self.caret_on = true;
+        self.caret_clock = 0.0;
+    }
+
+    /// Whether the short list's add row is being typed into.
+    pub fn adding_item(&self) -> bool {
+        self.editing && self.edit_target == EditTarget::NewItem
     }
 
     pub fn cancel_edit(&mut self) {
@@ -459,6 +604,14 @@ impl NotchState {
         let next = self.edit_buffer.trim().to_string();
         self.editing = false;
         self.edit_buffer.clear();
+
+        if self.edit_target == EditTarget::NewItem {
+            if next.is_empty() || cfg.status.items.len() >= layout::STATUS_MAX_ITEMS {
+                return false;
+            }
+            cfg.status.items.push(crate::config::StatusItem::new(&next));
+            return true;
+        }
 
         if next != cfg.status.focus {
             cfg.status.focus = next;
@@ -775,5 +928,81 @@ mod tests {
         state.toast_progress.set(0.0);
         run_for(&mut state, &cfg, 0.05);
         assert!(state.effect_time.is_some());
+    }
+
+    #[test]
+    fn a_click_keeps_the_panel_open_until_it_is_released() {
+        let cfg = AppConfig::default();
+        let mut state = NotchState::new(&cfg);
+        let grace = Duration::from_millis(0);
+
+        state.open_sticky();
+        assert_eq!(state.set_hovered(false, grace), 1.0);
+        assert_eq!(
+            state.set_hovered(false, grace),
+            1.0,
+            "still open with the cursor away"
+        );
+
+        state.release_sticky();
+        assert_eq!(state.set_hovered(false, grace), 0.0);
+    }
+
+    #[test]
+    fn closing_on_purpose_keeps_hover_from_reopening_it() {
+        let cfg = AppConfig::default();
+        let mut state = NotchState::new(&cfg);
+        let grace = Duration::from_millis(220);
+
+        state.toggle_open();
+        assert_eq!(state.set_hovered(true, grace), 1.0);
+        state.toggle_open();
+        assert!(state.hover_blocked);
+        // The window turns hover off while blocked, so it asks for shut.
+        assert_eq!(
+            state.set_hovered(false, grace),
+            0.0,
+            "closes at once, no grace period"
+        );
+        assert!(!state.sticky && !state.pinned);
+    }
+
+    #[test]
+    fn hover_pause_lasts_until_resumed() {
+        let cfg = AppConfig::default();
+        let mut state = NotchState::new(&cfg);
+        assert!(!state.hover_paused());
+        state.pause_hover(Some(Duration::from_secs(60)));
+        assert!(state.hover_paused());
+        state.pause_hover(None);
+        assert!(!state.hover_paused());
+    }
+
+    #[test]
+    fn quick_add_appends_to_the_list_and_leaves_the_focus_alone() {
+        let mut cfg = AppConfig::default();
+        let focus = cfg.status.focus.clone();
+        let before = cfg.status.items.len();
+        let mut state = NotchState::new(&cfg);
+
+        state.begin_add();
+        assert!(state.adding_item());
+        for ch in "Call the bank".chars() {
+            state.type_char(ch);
+        }
+        assert_eq!(
+            state.display_focus(&cfg),
+            focus,
+            "the focus line does not echo the new item"
+        );
+        assert!(state.commit_edit(&mut cfg));
+        assert_eq!(cfg.status.items.len(), before + 1);
+        assert_eq!(cfg.status.items.last().unwrap().text, "Call the bank");
+        assert_eq!(cfg.status.focus, focus);
+
+        // An empty entry adds nothing.
+        state.begin_add();
+        assert!(!state.commit_edit(&mut cfg));
+        assert_eq!(cfg.status.items.len(), before + 1);
     }
 }

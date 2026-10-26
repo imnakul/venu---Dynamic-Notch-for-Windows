@@ -12,6 +12,7 @@ use crate::config::{
 };
 
 mod color_picker;
+mod control_pages;
 mod effect_preview;
 mod filedlg;
 mod font_setup;
@@ -278,6 +279,8 @@ struct PageCtx<'a> {
     temp_text: &'a mut String,
     preview: &'a mut wallpaper::PreviewCache,
     native_notification_action: &'a mut Option<NativeNotificationAction>,
+    /// Which shortcut is listening for keys, by its index.
+    recording_hotkey: &'a mut Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -291,8 +294,8 @@ const PAGES: &[Page] = &[
     Page {
         group: Group::Notch,
         title: "General",
-        blurb: "A pill fused to the top of your screen. Hover it and it springs open; scroll \
-                inside to move between slides.",
+        blurb: "A pill fused to the top of your screen. Click or rest the cursor on it to open \
+                it, scroll to move between slides, right-click for its menu.",
         icon: Icon::Notch,
         tabs: &[
             Tab {
@@ -300,6 +303,14 @@ const PAGES: &[Page] = &[
                 keywords: "show notch enable on off keep above always on top click through \
                            pass scroll wheel switch slides default collapsed face rest",
                 draw: SettingsApp::tab_notch_behaviour,
+            },
+            Tab {
+                title: "Controls",
+                keywords: "open click hover delay accidental fullscreen full screen game scroll \
+                           wheel pages mouse middle click back forward side button ctrl alt \
+                           shift trigger keyboard shortcut hotkey global toggle pause right \
+                           click menu",
+                draw: SettingsApp::tab_notch_controls,
             },
             Tab {
                 title: "Size",
@@ -366,6 +377,23 @@ const PAGES: &[Page] = &[
                 title: "Status",
                 keywords: "focus heading one line task list on deck todo checklist",
                 draw: SettingsApp::tab_slides_status,
+            },
+            Tab {
+                title: "Now Playing",
+                keywords: "media music player song video youtube spotify wave equaliser \
+                           equalizer bars album cover thumbnail timeline size",
+                draw: SettingsApp::tab_slides_media,
+            },
+            Tab {
+                title: "Shelf",
+                keywords: "shelf pin files folders apps shortcuts scripts bat screenshots \
+                           downloads recent launcher drop copy",
+                draw: SettingsApp::tab_slides_shelf,
+            },
+            Tab {
+                title: "Clipboard",
+                keywords: "clipboard history copy paste text snippets private",
+                draw: SettingsApp::tab_slides_clipboard,
             },
             Tab {
                 title: "Wallpaper",
@@ -565,6 +593,8 @@ pub struct SettingsApp {
     /// after the config lock is released: the consent prompt is a WinRT call
     /// that must not happen while the notch thread is waiting on that lock.
     native_notification_action: Option<NativeNotificationAction>,
+    /// The shortcut being recorded, if any.
+    recording_hotkey: Option<usize>,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -653,6 +683,7 @@ impl SettingsApp {
             blurred: None,
             logo: load_logo(&cc.egui_ctx),
             native_notification_action: None,
+            recording_hotkey: None,
         }
     }
 
@@ -2989,16 +3020,15 @@ impl SettingsApp {
             .size(11.0)
             .color(theme::text_secondary()),
         );
-        ui.add_space(6.0);
-        if ui
-            .toggle(
-                &mut cfg.notch.scroll_to_switch,
-                "Scroll wheel changes slides",
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "How the notch opens, the scroll wheel, a mouse trigger and keyboard \
+                 shortcuts are on the Controls tab.",
             )
-            .changed()
-        {
-            *changed = true;
-        }
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
 
         ui.add_space(8.0);
         Self::row_inline(ui, "Default Collapsed Face", |ui| {
@@ -4694,6 +4724,7 @@ impl eframe::App for SettingsApp {
                                     preview: &mut self.preview,
                                     native_notification_action: &mut self
                                         .native_notification_action,
+                                    recording_hotkey: &mut self.recording_hotkey,
                                 };
                                 (page.tabs[tab].draw)(ui, &mut cx);
                                 ui.add_space(28.0);

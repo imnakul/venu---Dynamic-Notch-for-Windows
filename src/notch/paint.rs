@@ -39,10 +39,14 @@ use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::geom::NotchShape;
 use crate::notch::layout::PodKind;
 use crate::notch::media::{MediaWatcher, NowPlaying};
-use crate::notch::state::NotchState;
+use crate::notch::state::{Badge, NotchState};
 use crate::notch::surface::D2DSurface;
 use crate::notch::text::TextEngine;
 use crate::notch::theme::{self, Rgba};
+
+#[path = "paint_panels.rs"]
+mod panels;
+pub use panels::shelf_entry_at;
 
 const WEEKDAYS: [&str; 7] = [
     "SUNDAY",
@@ -178,6 +182,22 @@ pub struct Painter {
     solid_generation: u64,
     /// Gradients for the periodic border effects.
     effects: crate::notch::effects::EffectPainter,
+    /// Shelf icons uploaded to the render target, by path.
+    icons: RefCell<IconCache>,
+}
+
+/// Shelf icons as Direct2D bitmaps. They belong to one render target, so a
+/// new surface generation empties the cache.
+#[derive(Default)]
+struct IconCache {
+    generation: u64,
+    bitmaps: std::collections::HashMap<
+        String,
+        (
+            std::sync::Arc<crate::notch::shelf::Icon>,
+            windows::Win32::Graphics::Direct2D::ID2D1Bitmap,
+        ),
+    >,
 }
 
 /// Local time, read once per frame.
@@ -270,6 +290,7 @@ impl Painter {
             solid: RefCell::new(None),
             solid_generation: 0,
             effects: Default::default(),
+            icons: RefCell::new(IconCache::default()),
         })
     }
 
@@ -750,7 +771,7 @@ impl Painter {
 
         // Pod faces, each clipped to its own little slab.
         for pod in scene.pods.iter().flatten() {
-            self.paint_pod_face(&t, cfg, pod);
+            self.paint_pod_face(&t, cfg, state, pod);
         }
 
         unsafe { t.EndDraw(None, None)? };
@@ -1051,7 +1072,7 @@ impl Painter {
             );
         }
 
-        let flash = state.click_through_flash;
+        let flash = state.badge_time;
         if flash <= 0.0 {
             return;
         }
@@ -1059,10 +1080,13 @@ impl Painter {
         // Full opacity for most of the dwell, then a fade out, so it reads as
         // a deliberate confirmation rather than a flicker.
         let alpha = (flash / 0.45).min(1.0);
-        let text = if cfg.notch.click_through {
-            "CLICKS PASS THROUGH"
-        } else {
-            "CLICKS LAND HERE"
+        let text = match state.badge {
+            Badge::ClickThrough if cfg.notch.click_through => "CLICKS PASS THROUGH",
+            Badge::ClickThrough => "CLICKS LAND HERE",
+            Badge::HoverPaused(true) => "HOVER PAUSED",
+            Badge::HoverPaused(false) => "HOVER IS BACK ON",
+            Badge::Copied => "COPIED",
+            Badge::AddedToShelf => "ADDED TO SHELF",
         };
 
         let size = theme::SIZE_LABEL;
@@ -1625,20 +1649,22 @@ impl Painter {
 
             SlideKind::Media => {
                 let now = self.media.snapshot();
-                let dot_r = 3.0;
-                let dot_x = shape.left + pad + dot_r;
-                self.dot(
+                // A small live wave where the dot used to be.
+                let wave_w = 15.0;
+                self.wave(
                     t,
-                    dot_x,
+                    shape.left + pad + wave_w * 0.5,
                     cy,
-                    dot_r,
+                    shape.height() * 0.42,
+                    3.0,
+                    &self.wave_levels(state),
                     theme::fade(
                         cfg.notch.accent,
-                        alpha * if now.playing { self.pulse(state) } else { 0.5 },
+                        alpha * if now.playing { 1.0 } else { 0.6 },
                     ),
                 );
 
-                let text_x = dot_x + dot_r + 9.0;
+                let text_x = shape.left + pad + wave_w + 9.0;
                 let avail = (shape.right - pad - text_x).max(10.0);
                 let text = if !now.has_session {
                     "Nothing playing".to_string()
@@ -1763,60 +1789,89 @@ impl Painter {
                     ("RAM", stats.ram_pct),
                     ("GPU", stats.gpu_pct),
                 ];
+                // Laid out edge to edge: the first column starts on the
+                // padding, the last ends on it, the middle one sits halfway.
+                // Spreading three equal columns instead left the outer ends
+                // padded by however much narrower the text was than its
+                // column, so a pill with Stats at one end looked lopsided.
                 let content_left = shape.left + pad;
-                let content_width = (shape.width() - pad * 2.0).max(1.0);
-                let column_width = content_width / 3.0;
-
-                for (index, (name, value)) in metrics.into_iter().enumerate() {
-                    let column_left = content_left + index as f32 * column_width;
-                    let label_fmt = self.text.format(family, 8.0, DWRITE_FONT_WEIGHT_BOLD);
-                    if let Ok(label_fmt) = label_fmt {
-                        if let Ok(label) = self.text.layout(name, &label_fmt, column_width, 15.0) {
-                            let (width, _) = TextEngine::measure(&label);
-                            self.draw_layout(
-                                t,
-                                &label,
-                                column_left + (column_width - width) * 0.5,
-                                cy - 14.0,
-                                theme::fade(self.pal.text_lo, alpha),
-                            );
-                        }
+                let content_right = shape.right - pad;
+                /// One metric, laid out once and placed by its width.
+                #[derive(Default)]
+                struct Column {
+                    label: Option<(IDWriteTextLayout, f32)>,
+                    value: Option<(IDWriteTextLayout, f32, f32)>,
+                }
+                impl Column {
+                    fn width(&self) -> f32 {
+                        let label = self.label.as_ref().map_or(0.0, |l| l.1);
+                        let value = self.value.as_ref().map_or(0.0, |v| v.1);
+                        label.max(value)
                     }
-
-                    let value = value
-                        .map(|pct| format!("{pct:.0}%"))
-                        .unwrap_or_else(|| "—".to_string());
-                    if let Ok(value_fmt) =
-                        self.text
-                            .format(crate::fonts::GEIST_MONO, 14.5, DWRITE_FONT_WEIGHT_MEDIUM)
-                    {
-                        if let Ok(layout) = self.text.layout(&value, &value_fmt, column_width, 20.0)
-                        {
-                            let (width, height) = TextEngine::measure(&layout);
-                            self.draw_layout(
-                                t,
-                                &layout,
-                                column_left + (column_width - width) * 0.5,
-                                cy + 4.5 - height * 0.5,
-                                theme::fade(self.pal.text_hi, alpha),
-                            );
+                }
+                let columns: Vec<Column> = metrics
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let value = value
+                            .map(|pct| format!("{pct:.0}%"))
+                            .unwrap_or_else(|| "\u{2014}".to_string());
+                        Column {
+                            label: self
+                                .measure_text(family, name, 8.0, DWRITE_FONT_WEIGHT_BOLD)
+                                .map(|(l, w, _)| (l, w)),
+                            value: self.measure_text(
+                                crate::fonts::GEIST_MONO,
+                                &value,
+                                14.5,
+                                DWRITE_FONT_WEIGHT_MEDIUM,
+                            ),
                         }
-                    }
+                    })
+                    .collect();
+                let (w0, w1, w2) = (columns[0].width(), columns[1].width(), columns[2].width());
+                let centres = [
+                    content_left + w0 * 0.5,
+                    (content_left + w0 + content_right - w2) * 0.5,
+                    content_right - w2 * 0.5,
+                ];
+                let edges = [
+                    (centres[0] + w0 * 0.5, centres[1] - w1 * 0.5),
+                    (centres[1] + w1 * 0.5, centres[2] - w2 * 0.5),
+                ];
 
-                    if index < 2 {
-                        let x = content_left + (index + 1) as f32 * column_width;
-                        self.fill_rrect(
+                for (column, centre) in columns.iter().zip(centres) {
+                    if let Some((label, w)) = &column.label {
+                        self.draw_layout(
                             t,
-                            D2D_RECT_F {
-                                left: x,
-                                top: cy - 10.0,
-                                right: x + 1.0,
-                                bottom: cy + 11.0,
-                            },
-                            0.5,
-                            theme::fade(self.pal.rule, alpha),
+                            label,
+                            centre - w * 0.5,
+                            cy - 14.0,
+                            theme::fade(self.pal.text_lo, alpha),
                         );
                     }
+                    if let Some((value, w, h)) = &column.value {
+                        self.draw_layout(
+                            t,
+                            value,
+                            centre - w * 0.5,
+                            cy + 4.5 - h * 0.5,
+                            theme::fade(self.pal.text_hi, alpha),
+                        );
+                    }
+                }
+                for (left, right) in edges {
+                    let x = ((left + right) * 0.5).round();
+                    self.fill_rrect(
+                        t,
+                        D2D_RECT_F {
+                            left: x,
+                            top: cy - 10.0,
+                            right: x + 1.0,
+                            bottom: cy + 11.0,
+                        },
+                        0.5,
+                        theme::fade(self.pal.rule, alpha),
+                    );
                 }
             }
             SlideKind::Timer => {
@@ -1932,6 +1987,63 @@ impl Painter {
                     self.glyph(t, toggle.glyph(on), 13.0, x, cy, color);
                 }
             }
+            SlideKind::Shelf => {
+                let count = crate::notch::shelf::snapshot().pinned.len();
+                self.glyph(
+                    t,
+                    "\u{E718}",
+                    11.0,
+                    shape.left + pad + 6.0,
+                    cy,
+                    theme::fade(cfg.notch.accent, alpha),
+                );
+                let text = match count {
+                    0 => "Shelf".to_owned(),
+                    1 => "1 pinned".to_owned(),
+                    n => format!("{n} pinned"),
+                };
+                self.label(
+                    t,
+                    family,
+                    &text,
+                    theme::SIZE_PILL,
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    0.0,
+                    (inner_w - 20.0).max(10.0),
+                    shape.left + pad + 20.0,
+                    cy - theme::SIZE_PILL * 0.72,
+                    theme::fade(self.pal.text_hi, alpha),
+                );
+            }
+            SlideKind::Clipboard => {
+                self.glyph(
+                    t,
+                    "\u{E77F}",
+                    11.0,
+                    shape.left + pad + 6.0,
+                    cy,
+                    theme::fade(cfg.notch.accent, alpha),
+                );
+                let text = if !cfg.notch.clipboard.enabled {
+                    "Clipboard off".to_owned()
+                } else {
+                    crate::notch::clipboard::latest()
+                        .map(|t| crate::notch::clipboard::one_line(&t))
+                        .unwrap_or_else(|| "Nothing copied yet".to_owned())
+                };
+                self.label(
+                    t,
+                    family,
+                    &text,
+                    theme::SIZE_PILL,
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    0.0,
+                    (inner_w - 20.0).max(10.0),
+                    shape.left + pad + 20.0,
+                    cy - theme::SIZE_PILL * 0.72,
+                    theme::fade(self.pal.text_hi, alpha),
+                );
+            }
         }
     }
 
@@ -2036,10 +2148,16 @@ impl Painter {
         self.unclip(t);
     }
 
-    /// What a pod says. Deliberately still: a pod changes at most once a
-    /// second (a timer, an elapsed time), so it never keeps the notch
-    /// repainting on its own.
-    fn paint_pod_face(&self, t: &ID2D1DCRenderTarget, cfg: &AppConfig, pod: &PodDraw) {
+    /// What a pod says. Still apart from the music wave: a pod's text changes
+    /// at most once a second (a timer, an elapsed time), and the wave only
+    /// moves while music plays and the live wave is on.
+    fn paint_pod_face(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        state: &NotchState,
+        pod: &PodDraw,
+    ) {
         let alpha = pod.alpha;
         if alpha <= 0.004 {
             return;
@@ -2094,31 +2212,19 @@ impl Painter {
                 Some(word)
             }
             PodKind::Media => {
-                let playing = self.media.snapshot().playing;
-                // Three still bars: an equaliser at rest when playing, flat
-                // when paused. Still on purpose — see the doc comment.
-                let heights: [f32; 3] = if playing {
-                    [0.55, 1.0, 0.75]
-                } else {
-                    [0.3, 0.3, 0.3]
-                };
-                let bar_h = shape.height() * 0.42;
+                // The music wave: following the sound while it plays, a
+                // flat line when paused.
+                let levels = self.wave_levels(state);
                 let mid = (shape.left + shape.right) * 0.5;
-                for (i, h) in heights.into_iter().enumerate() {
-                    let x = mid + (i as f32 - 1.0) * 6.0;
-                    let half = bar_h * h * 0.5;
-                    self.fill_rrect(
-                        t,
-                        D2D_RECT_F {
-                            left: x - 1.5,
-                            top: cy - half,
-                            right: x + 1.5,
-                            bottom: cy + half,
-                        },
-                        1.5,
-                        theme::fade(cfg.notch.accent, alpha),
-                    );
-                }
+                self.wave(
+                    t,
+                    mid,
+                    cy,
+                    shape.height() * 0.5,
+                    3.0,
+                    &levels,
+                    theme::fade(cfg.notch.accent, alpha),
+                );
                 None
             }
         };
@@ -2257,7 +2363,11 @@ impl Painter {
             SlideKind::Wallpaper => {
                 self.paint_wallpaper(t, factory, cfg, panel, body, alpha, generation)
             }
-            SlideKind::Media => self.paint_media(t, factory, cfg, body, alpha, generation),
+            SlideKind::Media => {
+                self.paint_now_playing(t, factory, cfg, state, body, alpha, generation)
+            }
+            SlideKind::Shelf => self.paint_shelf(t, cfg, body, alpha, generation),
+            SlideKind::Clipboard => self.paint_clipboard(t, cfg, body, alpha),
             SlideKind::Notifications => self.paint_notifications(t, cfg, state, body, alpha),
             SlideKind::Usage => self.paint_usage(t, cfg, body, alpha),
             SlideKind::Stats => self.paint_stats(t, cfg, body, alpha),
@@ -3424,7 +3534,7 @@ impl Painter {
 
                 // Caret + underline while editing, so the notch clearly has
                 // keyboard focus without borrowing a system text field.
-                if state.editing {
+                if state.editing && !state.adding_item() {
                     let (tw, th) = TextEngine::measure(&layout);
                     let caret_x = (body.left + tw.min(left_w) + 2.0).min(body.left + left_w);
                     let caret_top = focus_y + (th - theme::SIZE_LEAD * 1.15).max(0.0);
@@ -3496,29 +3606,12 @@ impl Painter {
             theme::fade(self.pal.text_lo, alpha),
         );
 
-        let row_h = 25.0;
-        let list_top = body.top + 24.0;
-        let capacity = (((body.bottom - list_top) / row_h).floor() as usize).max(1);
+        let column = crate::notch::geom::status_list_column(body);
+        let list = crate::notch::layout::status_list(column, cfg.status.items.len());
 
-        if cfg.status.items.is_empty() {
-            self.label(
-                t,
-                family,
-                "Nothing else queued",
-                theme::SIZE_BODY,
-                DWRITE_FONT_WEIGHT_MEDIUM,
-                0.0,
-                rw,
-                rx,
-                list_top + 2.0,
-                theme::fade(self.pal.text_lo, alpha),
-            );
-            return;
-        }
-
-        for (i, item) in cfg.status.items.iter().take(capacity).enumerate() {
-            let y = list_top + i as f32 * row_h;
-            let cy = y + row_h * 0.5 - 3.0;
+        for (row, item) in list.items.iter().zip(cfg.status.items.iter()) {
+            let y = row.top;
+            let cy = y + crate::notch::layout::STATUS_ROW_H * 0.5 - 3.0;
 
             // Marker: filled ember pip when done, hollow ring when not.
             if item.done {
@@ -3560,18 +3653,85 @@ impl Painter {
             );
         }
 
-        let overflow = cfg.status.items.len().saturating_sub(capacity);
-        if overflow > 0 {
+        // The add row: a quiet "+ Add" until clicked, then a text field.
+        if let Some(row) = list.add {
+            let cy = row.top + crate::notch::layout::STATUS_ROW_H * 0.5 - 3.0;
+            let adding = state.adding_item();
+            let tone = if adding {
+                cfg.notch.accent
+            } else {
+                self.pal.text_lo
+            };
             self.label(
                 t,
                 family,
-                &format!("+{overflow} MORE"),
+                "+",
+                theme::SIZE_BODY + 2.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                0.0,
+                12.0,
+                rx,
+                cy - 9.0,
+                theme::fade(tone, alpha),
+            );
+            let text = if adding {
+                state.edit_buffer.as_str()
+            } else if list.overflow > 0 {
+                ""
+            } else {
+                "Add to the list"
+            };
+            let text_color = if adding {
+                self.pal.text_hi
+            } else {
+                self.pal.text_lo
+            };
+            let mut caret_x = rx + 16.0;
+            if !text.is_empty() {
+                if let Some((layout, w, _)) =
+                    self.measure_text(family, text, theme::SIZE_BODY, DWRITE_FONT_WEIGHT_MEDIUM)
+                {
+                    self.draw_layout(
+                        t,
+                        &layout,
+                        rx + 16.0,
+                        row.top + 1.0,
+                        theme::fade(text_color, alpha),
+                    );
+                    caret_x += w.min(rw - 24.0) + 2.0;
+                }
+            }
+            if adding && state.caret_on {
+                self.fill_rrect(
+                    t,
+                    D2D_RECT_F {
+                        left: caret_x,
+                        top: row.top + 2.0,
+                        right: caret_x + 2.0,
+                        bottom: row.top + 2.0 + theme::SIZE_BODY * 1.2,
+                    },
+                    1.0,
+                    theme::fade(cfg.notch.accent, alpha),
+                );
+            }
+        }
+
+        if list.overflow > 0 && !state.adding_item() {
+            let y = list.add.map(|r| r.top + 3.0).unwrap_or(body.bottom - 11.0);
+            self.label(
+                t,
+                family,
+                &format!("+{} MORE", list.overflow),
                 theme::SIZE_LABEL - 1.0,
                 DWRITE_FONT_WEIGHT_BOLD,
                 theme::TRACK_LABEL,
                 rw,
-                rx + 16.0,
-                body.bottom - 11.0,
+                if list.add.is_some() {
+                    rx + 34.0
+                } else {
+                    rx + 16.0
+                },
+                y,
                 theme::fade(self.pal.text_lo, alpha * 0.85),
             );
         }
@@ -4057,99 +4217,6 @@ impl Painter {
                 bitmap: bitmap.cast().ok()?,
             })
         }
-    }
-
-    /// Now Playing: album art on the left, title/artist stacked to its right,
-    /// transport buttons along the bottom. Falls back to a centred label when
-    /// no app currently owns the system media session.
-    fn paint_media(
-        &mut self,
-        t: &ID2D1DCRenderTarget,
-        factory: &windows::Win32::Graphics::Direct2D::ID2D1Factory,
-        cfg: &AppConfig,
-        body: D2D_RECT_F,
-        alpha: f32,
-        generation: u64,
-    ) {
-        let family = &cfg.notch.font_family;
-        let now = self.media.snapshot();
-
-        if !now.has_session {
-            self.label(
-                t,
-                family,
-                "NOTHING PLAYING",
-                theme::SIZE_LABEL,
-                DWRITE_FONT_WEIGHT_EXTRA_BOLD,
-                theme::TRACK_LABEL,
-                body.right - body.left,
-                body.left,
-                body.top + (body.bottom - body.top) * 0.5 - 6.0,
-                theme::fade(self.pal.text_lo, alpha),
-            );
-            return;
-        }
-
-        let controls_h = 52.0_f32.min((body.bottom - body.top) * 0.55);
-        let top_h = (body.bottom - body.top - controls_h).max(24.0);
-        let art_size = top_h.min((body.right - body.left) * 0.32).clamp(32.0, 72.0);
-
-        let art = D2D_RECT_F {
-            left: body.left,
-            top: body.top,
-            right: body.left + art_size,
-            bottom: body.top + art_size,
-        };
-        let radius = 8.0;
-
-        let drawn = self.fill_media_art(t, &now, art, radius, alpha, generation);
-        if !drawn {
-            self.fill_rrect(t, art, radius, theme::fade(self.pal.well, alpha * 2.0));
-            self.dot(
-                t,
-                (art.left + art.right) * 0.5,
-                (art.top + art.bottom) * 0.5,
-                art_size * 0.18,
-                theme::fade(self.pal.text_lo, alpha),
-            );
-        }
-
-        let text_x = art.right + 14.0;
-        let text_w = (body.right - text_x).max(20.0);
-        let title = if now.title.trim().is_empty() {
-            "Unknown title"
-        } else {
-            now.title.trim()
-        };
-        let title_h = self.label(
-            t,
-            family,
-            title,
-            theme::SIZE_BODY + 1.0,
-            DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            0.0,
-            text_w,
-            text_x,
-            art.top + 2.0,
-            theme::fade(self.pal.text_hi, alpha),
-        );
-
-        if !now.artist.trim().is_empty() {
-            self.label(
-                t,
-                family,
-                now.artist.trim(),
-                theme::SIZE_LABEL,
-                DWRITE_FONT_WEIGHT_MEDIUM,
-                0.0,
-                text_w,
-                text_x,
-                art.top + 2.0 + title_h + 3.0,
-                theme::fade(self.pal.text_mid, alpha),
-            );
-        }
-
-        self.paint_media_controls(t, factory, cfg, body, now.playing, alpha);
     }
 
     /// Three transport buttons — previous, play/pause, next — drawn as
