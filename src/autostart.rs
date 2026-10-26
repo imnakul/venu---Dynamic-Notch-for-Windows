@@ -1,5 +1,14 @@
-//! Per-user "launch on startup" support, backed by the standard Windows
-//! autostart registry key.
+//! Per-user "launch on startup" support.
+//!
+//! Two mechanisms, picked by how Venu was installed:
+//!
+//! * **Microsoft Store (MSIX) build** — Windows' own `StartupTask`, declared in
+//!   the package manifest with [`STORE_TASK_ID`]. It starts off; switching it
+//!   on asks Windows, and if the user has turned Venu off in Settings › Apps ›
+//!   Startup (or a policy has), Windows says no and Venu respects that rather
+//!   than finding another way in. A packaged app has no business writing the
+//!   Run key, so nothing below the next heading runs for it.
+//! * **Portable exe and Inno Setup installer** — the registry, as follows.
 //!
 //! Venu registers itself under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 //! so no elevation and no service is involved — the entry belongs to the
@@ -13,6 +22,9 @@
 //! updated or moved binary never leaves a stale path behind.
 
 use std::path::{Path, PathBuf};
+
+use windows::ApplicationModel::{StartupTask, StartupTaskState};
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
@@ -35,6 +47,107 @@ const VALUE_NAME: &str = "Venu";
 
 /// Appended to the registered command so a sign-in launch starts quietly.
 const QUIET_FLAG: &str = "--startup";
+
+/// The startup task's id. Must match the `TaskId` of the
+/// `windows.startupTask` extension in the Store package's AppxManifest.xml
+/// (see docs/store-packaging.md).
+pub const STORE_TASK_ID: &str = "VenuStartup";
+
+/// What launch-on-startup ended up as after a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupState {
+    On,
+    Off,
+    /// The user switched Venu off in Windows' Startup settings. Only they can
+    /// switch it back on, there.
+    BlockedByUser,
+    /// An administrator's policy decides.
+    BlockedByPolicy,
+}
+
+impl StartupState {
+    pub fn is_on(self) -> bool {
+        self == StartupState::On
+    }
+
+    fn from_task(state: StartupTaskState) -> Self {
+        match state {
+            StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy => StartupState::On,
+            StartupTaskState::DisabledByUser => StartupState::BlockedByUser,
+            StartupTaskState::DisabledByPolicy => StartupState::BlockedByPolicy,
+            _ => StartupState::Off,
+        }
+    }
+}
+
+/// Whether startup is Windows' to manage: the Store build.
+pub fn managed_by_windows() -> bool {
+    crate::native_notifications::has_package_identity()
+}
+
+/// Run a WinRT call on a short-lived thread with its own multithreaded
+/// apartment, so blocking on the async result never ties up — or assumes
+/// anything about — the caller's thread (the Settings window's, at times).
+fn on_winrt_thread<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    std::thread::Builder::new()
+        .name("Venu startup task".to_owned())
+        .spawn(move || {
+            let initialized = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
+            let out = f();
+            if initialized {
+                unsafe { RoUninitialize() };
+            }
+            out
+        })
+        .map_err(|e| format!("could not start the startup-task thread: {e}"))?
+        .join()
+        .map_err(|_| "the startup-task thread panicked".to_owned())?
+}
+
+fn store_task() -> Result<StartupTask, String> {
+    StartupTask::GetAsync(&HSTRING::from(STORE_TASK_ID))
+        .and_then(|op| op.get())
+        .map_err(|e| format!("Windows has no startup task \"{STORE_TASK_ID}\" for Venu: {e}"))
+}
+
+/// The Store build's startup state as Windows sees it.
+pub fn store_state() -> Result<StartupState, String> {
+    on_winrt_thread(|| {
+        let task = store_task()?;
+        task.State()
+            .map(StartupState::from_task)
+            .map_err(|e| format!("could not read the startup task: {e}"))
+    })
+}
+
+fn store_enable() -> Result<StartupState, String> {
+    on_winrt_thread(|| {
+        let task = store_task()?;
+        let state = task
+            .State()
+            .map_err(|e| format!("could not read the startup task: {e}"))?;
+        // Asking again after the user said no would be ignored anyway, and
+        // is not ours to ask.
+        if state == StartupTaskState::DisabledByUser || state == StartupTaskState::DisabledByPolicy
+        {
+            return Ok(StartupState::from_task(state));
+        }
+        task.RequestEnableAsync()
+            .and_then(|op| op.get())
+            .map(StartupState::from_task)
+            .map_err(|e| format!("Windows did not enable the startup task: {e}"))
+    })
+}
+
+fn store_disable() -> Result<(), String> {
+    on_winrt_thread(|| {
+        store_task()?
+            .Disable()
+            .map_err(|e| format!("could not disable the startup task: {e}"))
+    })
+}
 
 type RegResult<T> = Result<T, u32>;
 
@@ -160,25 +273,40 @@ fn remove_value(subkey: &str, value_name: &str) -> RegResult<()> {
     })
 }
 
-/// Whether a `Venu` entry currently exists under the Run key.
+/// Whether a `Venu` entry currently exists under the Run key. Always false
+/// for the Store build, which never uses it.
 pub fn is_registered() -> bool {
-    value_exists(VALUE_NAME).unwrap_or(false)
+    !managed_by_windows() && value_exists(VALUE_NAME).unwrap_or(false)
 }
 
-/// The command the autostart entry will run, if one is registered.
+/// The command the autostart entry will run, if one is registered. `None`
+/// for the Store build: Windows starts the packaged app itself.
 pub fn registered_command() -> Option<String> {
+    if managed_by_windows() {
+        return None;
+    }
     query_value(VALUE_NAME).ok().flatten()
 }
 
-/// (Re)write the autostart entry so sign-in starts *this* binary quietly.
-pub fn enable() -> Result<(), String> {
+/// Switch launch-on-startup on. The registry build writes the entry so
+/// sign-in starts *this* binary quietly; the Store build asks Windows, which
+/// may answer that the user or a policy has it switched off.
+pub fn enable() -> Result<StartupState, String> {
+    if managed_by_windows() {
+        return store_enable();
+    }
     let exe = this_exe()?;
     set_value(VALUE_NAME, &command_for(&exe))
+        .map(|()| StartupState::On)
         .map_err(|e| format!("could not write the autostart registry entry (Win32 error {e})"))
 }
 
-/// Remove the autostart entry (and the Task Manager approval leftover).
+/// Switch launch-on-startup off: remove the entry (and the Task Manager
+/// approval leftover), or disable the Store startup task.
 pub fn disable() -> Result<(), String> {
+    if managed_by_windows() {
+        return store_disable();
+    }
     remove_value(RUN_KEY_PATH, VALUE_NAME)
         .map_err(|e| format!("could not remove the autostart registry entry (Win32 error {e})"))?;
     // Best effort: the approval entry is Explorer bookkeeping and may not exist.
@@ -191,6 +319,30 @@ mod tests {
     use super::*;
 
     const TEST_VALUE: &str = "VenuTest";
+
+    #[test]
+    fn startup_task_states_map_to_what_the_toggle_can_show() {
+        assert_eq!(
+            StartupState::from_task(StartupTaskState::Enabled),
+            StartupState::On
+        );
+        assert_eq!(
+            StartupState::from_task(StartupTaskState::EnabledByPolicy),
+            StartupState::On
+        );
+        assert_eq!(
+            StartupState::from_task(StartupTaskState::Disabled),
+            StartupState::Off
+        );
+        assert_eq!(
+            StartupState::from_task(StartupTaskState::DisabledByUser),
+            StartupState::BlockedByUser
+        );
+        assert_eq!(
+            StartupState::from_task(StartupTaskState::DisabledByPolicy),
+            StartupState::BlockedByPolicy
+        );
+    }
 
     #[test]
     fn command_is_quoted_and_quiet() {

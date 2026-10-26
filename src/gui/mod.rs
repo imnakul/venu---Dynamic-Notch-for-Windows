@@ -1824,40 +1824,71 @@ impl SettingsApp {
 
     fn tab_prefs_startup(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "STARTUP");
-        Self::row_stacked(
-            ui,
-            "Launch on startup",
-            Some(
-                "Start Venu quietly in the tray when you sign in to Windows. It lives under \
-                  your user's autostart key — no admin rights — and can also be paused from \
-                  Task Manager's Startup list.",
-            ),
-            |ui| {
-                let mut enabled = cx.cfg.launch_on_startup;
-                let check = ui
-                    .toggle(&mut enabled, "Start with Windows")
-                    .on_hover_text("Registers venu.exe under the per-user Run key");
-                if check.changed() {
-                    let result = if enabled {
-                        crate::autostart::enable()
-                    } else {
-                        crate::autostart::disable()
-                    };
-                    match result {
-                        Ok(()) => {
-                            cx.cfg.launch_on_startup = enabled;
-                            *cx.changed = true;
+        let store = crate::autostart::managed_by_windows();
+        let help = if store {
+            "Start Venu quietly in the tray when you sign in to Windows. Windows manages this \
+             for the Store version: you can also switch it in Settings \u{203A} Apps \u{203A} \
+             Startup, and what you choose there wins."
+        } else {
+            "Start Venu quietly in the tray when you sign in to Windows. It lives under your \
+             user's autostart key — no admin rights — and can also be paused from Task \
+             Manager's Startup list."
+        };
+        // Why the last request did not stick, kept until the next one.
+        let note_id = egui::Id::new("startup_note");
+        Self::row_stacked(ui, "Launch on startup", Some(help), |ui| {
+            let mut enabled = cx.cfg.launch_on_startup;
+            let check = ui
+                .toggle(&mut enabled, "Start with Windows")
+                .on_hover_text(if store {
+                    "Uses the Store app's Windows startup task"
+                } else {
+                    "Registers venu.exe under the per-user Run key"
+                });
+            if check.changed() {
+                let result = if enabled {
+                    crate::autostart::enable()
+                } else {
+                    crate::autostart::disable().map(|()| crate::autostart::StartupState::Off)
+                };
+                let note = match result {
+                    Ok(state) => {
+                        cx.cfg.launch_on_startup = state.is_on();
+                        *cx.changed = true;
+                        match state {
+                            crate::autostart::StartupState::BlockedByUser => Some(
+                                "Venu is switched off in Windows Settings \u{203A} Apps \u{203A} \
+                                 Startup. Switch it on there; Venu will not override your choice.",
+                            ),
+                            crate::autostart::StartupState::BlockedByPolicy => {
+                                Some("Your organisation's policy controls startup apps on this PC.")
+                            }
+                            _ => None,
                         }
-                        Err(e) => eprintln!("[settings] autostart toggle failed: {e}"),
                     }
-                }
-                if enabled {
-                    if let Some(cmd) = crate::autostart::registered_command() {
-                        ui.label(RichText::new(cmd).size(10.5).color(theme::text_tertiary()));
+                    Err(e) => {
+                        eprintln!("[settings] autostart toggle failed: {e}");
+                        Some("Windows did not accept the change. Try again, or use Settings \u{203A} Apps \u{203A} Startup.")
                     }
+                };
+                ui.ctx().data_mut(|d| match note {
+                    Some(text) => d.insert_temp(note_id, text.to_owned()),
+                    None => d.remove::<String>(note_id),
+                });
+            }
+            if let Some(text) = ui.ctx().data(|d| d.get_temp::<String>(note_id)) {
+                ui.label(
+                    RichText::new(text)
+                        .size(11.0)
+                        .color(Color32::from_rgb(244, 160, 92)),
+                );
+            }
+            if cx.cfg.launch_on_startup && !store {
+                if let Some(cmd) = crate::autostart::registered_command() {
+                    ui.label(RichText::new(cmd).size(10.5).color(theme::text_tertiary()));
                 }
-            },
-        );
+            }
+        });
     }
 
     fn tab_prefs_storage(ui: &mut egui::Ui, _cx: &mut PageCtx<'_>) {

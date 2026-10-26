@@ -84,14 +84,33 @@ fn acquire_single_instance() -> bool {
     }
 }
 
-/// Keep the registry autostart entry and the saved preference in step.
+/// Keep launch-on-startup and the saved preference in step.
 ///
+/// Store build: Windows owns the startup task, so the preference simply
+/// follows what Windows says — including the user switching Venu off in
+/// Settings › Apps › Startup. Nothing is ever switched on from here.
+///
+/// Registry build:
 /// - Preference on: rewrite the entry every run, so an updated or moved
 ///   `venu.exe` never leaves a stale path registered for sign-in.
 /// - Preference off but an entry exists: the installer wrote it, or the
 ///   config file was reset. Adopt it, so the toggle in Preferences matches
 ///   what actually happens at sign-in.
 fn reconcile_autostart(config: &RwLock<AppConfig>) {
+    if autostart::managed_by_windows() {
+        match autostart::store_state() {
+            Ok(state) => {
+                let mut cfg = config.write();
+                if cfg.launch_on_startup != state.is_on() {
+                    cfg.launch_on_startup = state.is_on();
+                    cfg.save();
+                }
+            }
+            Err(e) => eprintln!("[startup] could not read the Store startup task: {e}"),
+        }
+        return;
+    }
+
     let mut cfg = config.write();
     if cfg.launch_on_startup {
         if let Err(e) = autostart::enable() {
@@ -99,7 +118,7 @@ fn reconcile_autostart(config: &RwLock<AppConfig>) {
         }
     } else if autostart::is_registered() {
         match autostart::enable() {
-            Ok(()) => {
+            Ok(_) => {
                 cfg.launch_on_startup = true;
                 cfg.save();
             }
