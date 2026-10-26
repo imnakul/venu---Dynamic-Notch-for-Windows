@@ -816,6 +816,18 @@ impl NotchWindow {
 
         self.state.clamp_active(cfg);
 
+        // Moving text in a split segment is sized to the text it shows. The
+        // measurement is cached by the painter, so this is a comparison a
+        // tick unless the text, font or size changed.
+        let split = &cfg.notch.split;
+        self.state.text_segment_width = if split.enabled
+            && (split.left == Some(SlideKind::Marquee) || split.right == Some(SlideKind::Marquee))
+        {
+            layout::text_segment_width(self.painter.marquee_text_width(cfg))
+        } else {
+            0.0
+        };
+
         // -- input ----------------------------------------------------------
         let shape = self.current_shape(cfg);
         let hit_shape = shape.inset(-HOVER_SLOP);

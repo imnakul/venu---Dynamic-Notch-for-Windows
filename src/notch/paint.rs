@@ -160,6 +160,10 @@ pub struct Painter {
     pub media: MediaWatcher,
     media_art: Option<CachedArt>,
     media_art_failed: Option<u64>,
+    /// Width of the moving text in the pill font, keyed on what it was
+    /// measured for, so a text layout is only built when the text, font or
+    /// size actually changes.
+    text_measure: Option<(String, String, u32, f32)>,
     /// Raised by the drawing code while a frame is being painted. A `Cell`
     /// because the slides that report it are split between `&self` and
     /// `&mut self` methods and threading a flag back out of every one of them
@@ -261,11 +265,35 @@ impl Painter {
             media: MediaWatcher::spawn(),
             media_art: None,
             media_art_failed: None,
+            text_measure: None,
             motion: Cell::new(Motion::Still),
             solid: RefCell::new(None),
             solid_generation: 0,
             effects: Default::default(),
         })
+    }
+
+    /// Width of the moving text on one line in the pill's font, for sizing
+    /// its split segment. Cached: only a change of text, font or size builds
+    /// a new layout.
+    pub fn marquee_text_width(&mut self, cfg: &AppConfig) -> f32 {
+        let text = cfg.text.trim();
+        let family = &cfg.notch.font_family;
+        let size = cfg.marquee.pill_font(theme::SIZE_PILL);
+        if let Some((t, f, s, w)) = &self.text_measure {
+            if t == text && f == family && *s == size.to_bits() {
+                return *w;
+            }
+        }
+        let width = self
+            .text
+            .format(family, size, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+            .ok()
+            .and_then(|fmt| self.text.layout(text, &fmt, 100_000.0, size * 4.0).ok())
+            .map(|layout| TextEngine::measure(&layout).0)
+            .unwrap_or(0.0);
+        self.text_measure = Some((text.to_string(), family.clone(), size.to_bits(), width));
+        width
     }
 
     /// What the frame just painted needs from the next one. Reading it clears
@@ -1963,6 +1991,11 @@ impl Painter {
 
     /// A face clipped to its own segment, so a wide face never draws into
     /// its neighbour while the segments are still growing in.
+    ///
+    /// Moving text and the wallpaper normally run edge to edge, while every
+    /// other face keeps a gutter of its own. In a split pill that made the
+    /// gaps either side of a divider unequal, so those two are inset here to
+    /// the same padding as the rest.
     #[allow(clippy::too_many_arguments)]
     fn paint_clipped_face(
         &mut self,
@@ -1977,6 +2010,19 @@ impl Painter {
         if alpha <= 0.004 || shape.width() < 8.0 {
             return;
         }
+        let shape = match slide {
+            // Their own edge insets are 2 and 3 px; bring both to the gutter.
+            SlideKind::Marquee | SlideKind::Wallpaper => {
+                let inset = (crate::notch::layout::SEGMENT_PADDING - 2.5)
+                    .min((shape.width() - 8.0).max(0.0) * 0.5);
+                NotchShape {
+                    left: shape.left + inset,
+                    right: shape.right - inset,
+                    ..shape
+                }
+            }
+            _ => shape,
+        };
         self.clip(
             t,
             D2D_RECT_F {

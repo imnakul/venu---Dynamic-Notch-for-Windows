@@ -79,6 +79,9 @@ pub struct NotchState {
     /// Satellite pods, `[right, left]`. Fed by the window, which owns the
     /// readers that know what is live.
     pub pods: [Slot<PodKind>; 2],
+    /// Width the moving-text segment wants, measured from its text by the
+    /// window. Zero until measured, which falls back to the default width.
+    pub text_segment_width: f32,
     /// Set when the panel opened onto a segment or pod's slide instead of the
     /// one the pill rests on: `(resting slide, slide opened onto)`. Collapsing
     /// puts the resting one back, unless the user scrolled elsewhere meanwhile.
@@ -118,6 +121,7 @@ impl NotchState {
             split: [Slot::new(230.0, 30.0), Slot::new(230.0, 30.0)],
             // A touch springier, so a pod visibly buds out of the notch.
             pods: [Slot::new(260.0, 24.0), Slot::new(260.0, 24.0)],
+            text_segment_width: 0.0,
             home: None,
         }
     }
@@ -126,10 +130,20 @@ impl NotchState {
     pub fn split_widths(&self) -> (f32, f32) {
         let width = |slot: &Slot<SlideKind>| {
             slot.shown
-                .map(|kind| layout::segment_width(kind) * slot.amount())
+                .map(|kind| self.segment_width(kind) * slot.amount())
                 .unwrap_or(0.0)
         };
         (width(&self.split[0]), width(&self.split[1]))
+    }
+
+    /// Full width of a side segment showing `kind`: moving text as measured,
+    /// everything else by its fixed size.
+    pub fn segment_width(&self, kind: SlideKind) -> f32 {
+        if kind == SlideKind::Marquee && self.text_segment_width > 0.0 {
+            self.text_segment_width
+        } else {
+            layout::segment_width(kind)
+        }
     }
 
     /// Whether a side segment is showing `kind` at all.
@@ -592,6 +606,17 @@ mod tests {
         tick_for(&mut state, &cfg, 1.5);
         assert_eq!(state.split_widths().0, 0.0);
         assert!(!state.split_shows(SlideKind::Clock));
+    }
+
+    #[test]
+    fn measured_text_sets_the_moving_text_segment() {
+        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Stats);
+        let mut state = resting(&cfg, SlideKind::Wallpaper, false);
+        state.text_segment_width = layout::text_segment_width(250.0);
+        tick_for(&mut state, &cfg, 1.5);
+        let (left, right) = state.split_widths();
+        assert!((left - layout::text_segment_width(250.0)).abs() < 0.5);
+        assert!((right - layout::segment_width(SlideKind::Stats)).abs() < 0.5);
     }
 
     #[test]

@@ -17,10 +17,32 @@ use crate::notch::anim::Spring;
 /// Breathing room between the pill and a pod, on top of both shoulders.
 pub const POD_GAP: f32 = 6.0;
 
+/// Padding every face keeps from a segment edge, so the gap either side of a
+/// divider is always the same. Matches the pill's own gutter.
+pub const SEGMENT_PADDING: f32 = 14.0;
+
+/// Moving text sizes its segment to the text; these bound it. Past the
+/// widest, a scrolling line scrolls and a static one ends in an ellipsis.
+pub const MIN_TEXT_SEGMENT: f32 = 96.0;
+pub const MAX_TEXT_SEGMENT: f32 = 420.0;
+
+/// Sub-pixel slack, so text measured to fit exactly is never trimmed to an
+/// ellipsis by rounding.
+const TEXT_SLACK: f32 = 4.0;
+
+/// Segment width for moving text that measures `text_width` in the pill's
+/// font: the text plus padding either side, within the bounds above.
+pub fn text_segment_width(text_width: f32) -> f32 {
+    (text_width.max(0.0) + SEGMENT_PADDING * 2.0 + TEXT_SLACK)
+        .clamp(MIN_TEXT_SEGMENT, MAX_TEXT_SEGMENT)
+}
+
 /// Width a face needs as a side segment of the split pill, padding included.
 ///
 /// Sized to what each compact face actually draws, so a segment never cuts
 /// its own text off: a clock needs a time and AM/PM, Stats three columns.
+/// Moving text is the exception: its real width is measured from the text
+/// (see [`text_segment_width`]); this is only its fallback.
 pub fn segment_width(kind: SlideKind) -> f32 {
     match kind {
         SlideKind::Clock => 96.0,
@@ -46,7 +68,11 @@ pub fn max_split_extra(split: &SplitConfig) -> f32 {
     [split.left, split.right]
         .into_iter()
         .flatten()
-        .map(segment_width)
+        .map(|kind| match kind {
+            // Measured at runtime, so reserve the most it can take.
+            SlideKind::Marquee => MAX_TEXT_SEGMENT,
+            other => segment_width(other),
+        })
         .sum()
 }
 
@@ -369,6 +395,22 @@ mod tests {
             [Some(SlideKind::Clock), None]
         );
         assert_eq!(split_targets(&cfg, Some(SlideKind::Clock)), [None, None]);
+    }
+
+    #[test]
+    fn text_segments_fit_their_text_within_bounds() {
+        assert_eq!(
+            text_segment_width(200.0),
+            200.0 + SEGMENT_PADDING * 2.0 + TEXT_SLACK
+        );
+        assert_eq!(text_segment_width(10.0), MIN_TEXT_SEGMENT);
+        assert_eq!(text_segment_width(2000.0), MAX_TEXT_SEGMENT);
+        // The frame reserves the widest a text segment can get.
+        let cfg = split(Some(SlideKind::Marquee), Some(SlideKind::Clock));
+        assert_eq!(
+            max_split_extra(&cfg),
+            MAX_TEXT_SEGMENT + segment_width(SlideKind::Clock)
+        );
     }
 
     #[test]
