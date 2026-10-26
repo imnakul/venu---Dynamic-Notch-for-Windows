@@ -21,16 +21,21 @@
 //! * [`window`]  — the layered window, hit-testing and input
 
 pub mod anim;
+pub mod audio;
 pub mod backdrop;
 pub mod battery;
 pub mod calendar;
+pub mod clipboard;
 pub mod effects;
 pub mod geom;
 pub mod hook;
+pub mod keys;
 pub mod layout;
 pub mod media;
+pub mod menu;
 pub mod notify;
 pub mod paint;
+pub mod shelf;
 pub mod state;
 pub mod surface;
 pub mod text;
@@ -61,14 +66,18 @@ pub struct NotchManager {
 
 impl NotchManager {
     pub fn new(config: Arc<RwLock<AppConfig>>) -> Self {
-        let (port, allowed) = {
+        let (port, allowed, windows_listener_enabled, toast_duration_secs) = {
             let cfg = config.read();
             (
                 cfg.notch.notifications.webhook_port,
                 cfg.notch.notifications.allowed_apps.clone(),
+                cfg.notch.notifications.windows_listener_enabled,
+                cfg.notch.notifications.toast_duration_secs,
             )
         };
         notify::start_webhook_server(port, allowed);
+        crate::native_notifications::set_toast_duration(toast_duration_secs);
+        crate::native_notifications::set_enabled(windows_listener_enabled);
 
         Self {
             config,
@@ -94,6 +103,10 @@ impl NotchManager {
             // on screen; otherwise a stale bound rect would keep swallowing
             // chords over empty desktop.
             hook::silence();
+            // Nothing runs for a notch that is not there: no folder watcher,
+            // and above all no clipboard history being collected unseen.
+            shelf::sync(&Default::default(), false, false);
+            clipboard::sync(false, 0);
             return false;
         }
 
@@ -132,6 +145,29 @@ impl NotchManager {
         // hung as "Not Responding" until the app was killed.
         if outcome.open_settings {
             crate::tray::restore_settings_window();
+        }
+
+        // The right-click menu, likewise shown with the lock released: it
+        // runs a modal loop until the user picks something or looks away.
+        if let Some(request) = outcome.menu {
+            let owner = window.hwnd();
+            match menu::show(&request, owner) {
+                Some(menu::MenuCommand::Settings) => crate::tray::restore_settings_window(),
+                Some(menu::MenuCommand::Quit) => {
+                    // Anything still waiting on the save debounce goes now.
+                    self.config.read().save();
+                    std::process::exit(0);
+                }
+                Some(command) => {
+                    let mut cfg = self.config.write();
+                    if window.apply_menu(command, &mut cfg) {
+                        self.save_countdown = Some(SAVE_DEBOUNCE);
+                    }
+                }
+                None => {}
+            }
+            // The click that closed the menu must not also close the notch.
+            let _ = hook::take_outside();
         }
 
         if outcome.config_dirty {

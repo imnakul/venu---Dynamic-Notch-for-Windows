@@ -202,10 +202,15 @@ pub enum SlideKind {
     Calendar,
     /// One-click switches: microphone, sound, dark mode, keep awake.
     Controls,
+    /// Pinned files, folders, apps and scripts, plus the newest files of one
+    /// folder. Venu stores paths only, never copies.
+    Shelf,
+    /// Recently copied text, one click to copy it again. Opt-in, memory only.
+    Clipboard,
 }
 
 impl SlideKind {
-    pub const ALL: [SlideKind; 11] = [
+    pub const ALL: [SlideKind; 13] = [
         SlideKind::Status,
         SlideKind::Clock,
         SlideKind::Marquee,
@@ -217,7 +222,18 @@ impl SlideKind {
         SlideKind::Timer,
         SlideKind::Calendar,
         SlideKind::Controls,
+        SlideKind::Shelf,
+        SlideKind::Clipboard,
     ];
+
+    /// The deck a fresh install starts with: everything except clipboard
+    /// history, which is opt-in and would only say "turned off" until then.
+    pub fn default_deck() -> Vec<SlideKind> {
+        Self::ALL
+            .into_iter()
+            .filter(|kind| *kind != SlideKind::Clipboard)
+            .collect()
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -232,6 +248,8 @@ impl SlideKind {
             SlideKind::Timer => "Focus Timer",
             SlideKind::Calendar => "Calendar",
             SlideKind::Controls => "Quick Toggles",
+            SlideKind::Shelf => "Shelf",
+            SlideKind::Clipboard => "Clipboard",
         }
     }
 }
@@ -539,6 +557,9 @@ impl Default for BatteryAlertConfig {
 #[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
+    /// Opt-in Windows toast history. This works only in an identity-enabled
+    /// package after the user grants Windows notification access.
+    pub windows_listener_enabled: bool,
     /// Allowed apps whose notifications will trigger the Dynamic Notch alert toast.
     pub allowed_apps: Vec<String>,
     /// How long the dynamic alert capsule dwells on screen before settling back (in seconds).
@@ -566,6 +587,7 @@ impl Default for NotificationConfig {
 
         Self {
             enabled: true,
+            windows_listener_enabled: false,
             allowed_apps: vec![
                 "Antigravity".to_string(),
                 "Codex".to_string(),
@@ -997,6 +1019,304 @@ impl PodsConfig {
     }
 }
 
+/// What opens the notch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OpenWith {
+    /// A click opens it and it stays open until you click elsewhere.
+    Click,
+    /// Resting the cursor on it opens it; leaving closes it.
+    Hover,
+    /// Either. A click keeps it open, a hover only while you stay.
+    #[default]
+    Both,
+}
+
+impl OpenWith {
+    pub const ALL: [OpenWith; 3] = [OpenWith::Click, OpenWith::Hover, OpenWith::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OpenWith::Click => "Click",
+            OpenWith::Hover => "Hover",
+            OpenWith::Both => "Click or hover",
+        }
+    }
+
+    pub fn hovers(self) -> bool {
+        matches!(self, OpenWith::Hover | OpenWith::Both)
+    }
+
+    pub fn clicks(self) -> bool {
+        matches!(self, OpenWith::Click | OpenWith::Both)
+    }
+}
+
+/// Where the scroll wheel walks through the pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScrollPages {
+    Off,
+    /// Only while the panel is open.
+    OpenOnly,
+    /// Over the closed pill too, which changes the face it rests on.
+    #[default]
+    Always,
+}
+
+impl ScrollPages {
+    pub const ALL: [ScrollPages; 3] =
+        [ScrollPages::Off, ScrollPages::OpenOnly, ScrollPages::Always];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScrollPages::Off => "Off",
+            ScrollPages::OpenOnly => "Open panel only",
+            ScrollPages::Always => "Open and closed",
+        }
+    }
+
+    pub fn applies(self, open: bool) -> bool {
+        match self {
+            ScrollPages::Off => false,
+            ScrollPages::OpenOnly => open,
+            ScrollPages::Always => true,
+        }
+    }
+}
+
+/// A mouse gesture over the notch that opens or closes it. It is read by the
+/// low-level hook, so it works even while clicks pass through the notch, and
+/// it is only taken while the cursor is over the notch: everywhere else the
+/// button does what it always did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MouseTrigger {
+    #[default]
+    Off,
+    MiddleClick,
+    BackButton,
+    ForwardButton,
+    CtrlClick,
+    AltClick,
+    ShiftClick,
+}
+
+impl MouseTrigger {
+    pub const ALL: [MouseTrigger; 7] = [
+        MouseTrigger::Off,
+        MouseTrigger::MiddleClick,
+        MouseTrigger::BackButton,
+        MouseTrigger::ForwardButton,
+        MouseTrigger::CtrlClick,
+        MouseTrigger::AltClick,
+        MouseTrigger::ShiftClick,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MouseTrigger::Off => "None",
+            MouseTrigger::MiddleClick => "Middle click",
+            MouseTrigger::BackButton => "Mouse back button",
+            MouseTrigger::ForwardButton => "Mouse forward button",
+            MouseTrigger::CtrlClick => "Ctrl + click",
+            MouseTrigger::AltClick => "Alt + click",
+            MouseTrigger::ShiftClick => "Shift + click",
+        }
+    }
+}
+
+/// A global keyboard shortcut. `key` is a key name as egui spells it ("N",
+/// "Space", "F5", "Up"), which [`crate::notch::keys`] maps to a virtual key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hotkey {
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub win: bool,
+    pub key: String,
+}
+
+impl Hotkey {
+    pub fn ctrl_alt(key: &str) -> Self {
+        Self {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            win: false,
+            key: key.to_owned(),
+        }
+    }
+
+    /// At least one modifier: a bare letter as a global shortcut would
+    /// swallow that letter in every app.
+    pub fn has_modifier(&self) -> bool {
+        self.ctrl || self.alt || self.shift || self.win
+    }
+
+    /// "Ctrl + Alt + N".
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::with_capacity(5);
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.win {
+            parts.push("Win");
+        }
+        parts.push(&self.key);
+        parts.join(" + ")
+    }
+}
+
+/// How the notch is opened, closed and driven from the mouse and keyboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputConfig {
+    pub open_with: OpenWith,
+    /// How long the cursor has to rest on the pill before hover opens it.
+    /// Moving across it on the way to something else never counts.
+    pub hover_delay_ms: u32,
+    /// Let hover open the notch while a full-screen app, game or
+    /// presentation is in front. Off, it only opens by click or shortcut.
+    pub hover_in_fullscreen: bool,
+    /// `None` until the user picks one; see [`NotchConfig::scroll_pages`].
+    pub scroll: Option<ScrollPages>,
+    pub mouse_trigger: MouseTrigger,
+    /// Open or close the notch.
+    pub hotkey_toggle: Option<Hotkey>,
+    /// Turn click-through on or off.
+    pub hotkey_click_through: Option<Hotkey>,
+    /// Stop hover from opening the notch, or let it again.
+    pub hotkey_pause_hover: Option<Hotkey>,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            open_with: OpenWith::Both,
+            hover_delay_ms: 200,
+            hover_in_fullscreen: false,
+            scroll: None,
+            mouse_trigger: MouseTrigger::Off,
+            hotkey_toggle: Some(Hotkey::ctrl_alt("N")),
+            hotkey_click_through: Some(Hotkey::ctrl_alt("C")),
+            hotkey_pause_hover: None,
+        }
+    }
+}
+
+impl InputConfig {
+    pub const MAX_HOVER_DELAY_MS: u32 = 1500;
+
+    /// The shortcuts in a fixed order, which is also their id order when
+    /// they are registered with Windows.
+    pub fn hotkeys(&self) -> [Option<&Hotkey>; 3] {
+        [
+            self.hotkey_toggle.as_ref(),
+            self.hotkey_click_through.as_ref(),
+            self.hotkey_pause_hover.as_ref(),
+        ]
+    }
+}
+
+/// The Now Playing panel.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaConfig {
+    /// Let the equaliser bars follow the sound that is actually playing.
+    /// Off, they stand still. On costs a light repaint while music plays.
+    pub live_wave: bool,
+    /// Panel size for this slide; 0 means the centred default.
+    pub panel_width: u32,
+    pub panel_height: u32,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            live_wave: true,
+            panel_width: 0,
+            panel_height: 0,
+        }
+    }
+}
+
+impl MediaConfig {
+    /// The centred player's own size, used while the size fields are 0.
+    pub const AUTO_WIDTH: f32 = 470.0;
+    pub const AUTO_HEIGHT: f32 = 300.0;
+}
+
+/// Files, folders, apps and scripts pinned to the notch. Only the paths are
+/// stored; nothing is copied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShelfConfig {
+    pub items: Vec<String>,
+    /// A folder whose newest files are shown beside the pins, such as
+    /// Screenshots. Empty for none.
+    pub folder: String,
+    /// How many of its newest files to show.
+    pub folder_count: u32,
+}
+
+impl Default for ShelfConfig {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            folder: String::new(),
+            folder_count: 6,
+        }
+    }
+}
+
+impl ShelfConfig {
+    pub const MAX_ITEMS: usize = 24;
+    pub const MAX_FOLDER_COUNT: u32 = 8;
+
+    /// Pin a path, unless it is already pinned or the shelf is full.
+    /// Returns whether anything changed.
+    pub fn pin(&mut self, path: &str) -> bool {
+        let path = path.trim();
+        if path.is_empty()
+            || self.items.len() >= Self::MAX_ITEMS
+            || self.items.iter().any(|p| p.eq_ignore_ascii_case(path))
+        {
+            return false;
+        }
+        self.items.push(path.to_owned());
+        true
+    }
+}
+
+/// Clipboard history. Off by default: what people copy includes passwords.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub enabled: bool,
+    pub max_items: u32,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_items: 15,
+        }
+    }
+}
+
+impl ClipboardConfig {
+    pub const MAX: u32 = 30;
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotchConfig {
     pub enabled: bool,
@@ -1057,6 +1377,22 @@ pub struct NotchConfig {
     /// Live-activity pods beside the notch.
     #[serde(default)]
     pub pods: PodsConfig,
+    /// How the notch opens and closes, and what the mouse and keyboard do.
+    #[serde(default)]
+    pub input: InputConfig,
+    /// The Now Playing panel.
+    #[serde(default)]
+    pub media: MediaConfig,
+    /// Pinned paths and the folder peek.
+    #[serde(default)]
+    pub shelf: ShelfConfig,
+    /// Clipboard history.
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
+    /// Which one-time deck upgrades have run, so a page added in a release
+    /// shows up for existing users once and stays removed if they remove it.
+    #[serde(default)]
+    pub deck_revision: u32,
 }
 
 impl Default for NotchConfig {
@@ -1071,7 +1407,7 @@ impl Default for NotchConfig {
             collapsed_height: 34,
             expanded_width: 760,
             expanded_height: 208,
-            slides: SlideKind::ALL.to_vec(),
+            slides: SlideKind::default_deck(),
             active_slide: 0,
             default_collapsed: CollapsedMode::LastActive,
             notifications: NotificationConfig::default(),
@@ -1091,11 +1427,33 @@ impl Default for NotchConfig {
             shape: ShapeConfig::default(),
             split: SplitConfig::default(),
             pods: PodsConfig::default(),
+            input: InputConfig::default(),
+            media: MediaConfig::default(),
+            shelf: ShelfConfig::default(),
+            clipboard: ClipboardConfig::default(),
+            deck_revision: NotchConfig::DECK_REVISION,
         }
     }
 }
 
 impl NotchConfig {
+    /// Bump with each page that should appear once for existing users.
+    pub const DECK_REVISION: u32 = 1;
+
+    /// Add pages introduced since this config was last saved. Returns whether
+    /// anything changed.
+    pub fn upgrade_deck(&mut self) -> bool {
+        if self.deck_revision >= Self::DECK_REVISION {
+            return false;
+        }
+        // Revision 1: the Shelf.
+        if self.deck_revision < 1 && !self.slides.contains(&SlideKind::Shelf) {
+            self.slides.push(SlideKind::Shelf);
+        }
+        self.deck_revision = Self::DECK_REVISION;
+        true
+    }
+
     /// Slides, guaranteed non-empty, so the carousel always has something to
     /// land on even if every slide was unchecked in settings.
     /// The deck as it is actually shown.
@@ -1112,6 +1470,16 @@ impl NotchConfig {
         } else {
             &self.slides
         }
+    }
+
+    /// Where the scroll wheel changes pages. Configs from before the
+    /// three-way setting only had an on/off switch, which keeps its meaning.
+    pub fn scroll_pages(&self) -> ScrollPages {
+        self.input.scroll.unwrap_or(if self.scroll_to_switch {
+            ScrollPages::Always
+        } else {
+            ScrollPages::Off
+        })
     }
 
     pub fn clamped_active(&self) -> usize {
@@ -1533,7 +1901,9 @@ impl AppConfig {
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(mut config) = serde_json::from_str::<AppConfig>(&content) {
-                    if config.migrate_font_defaults() {
+                    let fonts = config.migrate_font_defaults();
+                    let deck = config.notch.upgrade_deck();
+                    if fonts || deck {
                         config.save();
                     }
                     return config;
@@ -1549,6 +1919,7 @@ impl AppConfig {
                 if let Ok(content) = fs::read_to_string(&legacy_path) {
                     if let Ok(mut config) = serde_json::from_str::<AppConfig>(&content) {
                         let _ = config.migrate_font_defaults();
+                        let _ = config.notch.upgrade_deck();
                         config.save();
                         return config;
                     }
@@ -1722,6 +2093,15 @@ mod tests {
     }
 
     #[test]
+    fn old_notification_config_defaults_windows_listener_to_off() {
+        let old_config = r#"{"enabled":true,"allowed_apps":["Codex"],"webhook_port":18923}"#;
+        let decoded: NotificationConfig = serde_json::from_str(old_config).unwrap();
+        assert!(!decoded.windows_listener_enabled);
+        assert!(decoded.enabled);
+        assert_eq!(decoded.allowed_apps, ["Codex"]);
+    }
+
+    #[test]
     fn stats_controls_preserve_other_slides_and_the_current_face() {
         let mut notch = NotchConfig::default();
         notch.slides = vec![SlideKind::Clock, SlideKind::Media, SlideKind::Usage];
@@ -1748,5 +2128,55 @@ mod tests {
         );
         assert_eq!(notch.default_collapsed, CollapsedMode::LastActive);
         assert_eq!(notch.clamped_active(), 1);
+    }
+
+    #[test]
+    fn configs_from_before_the_controls_load_with_safe_defaults() {
+        // A notch block as v0.5.2 wrote it: no input, media, shelf,
+        // clipboard or deck revision, and the old scroll switch off.
+        let mut notch = NotchConfig::default();
+        notch.slides = vec![SlideKind::Clock, SlideKind::Media];
+        notch.scroll_to_switch = false;
+        let mut value = serde_json::to_value(&notch).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in ["input", "media", "shelf", "clipboard", "deck_revision"] {
+            object.remove(key);
+        }
+        let mut old: NotchConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(old.input, InputConfig::default());
+        assert_eq!(old.input.open_with, OpenWith::Both);
+        assert!(!old.clipboard.enabled, "clipboard history must stay opt-in");
+        // The old switch keeps its meaning until a new choice is made.
+        assert_eq!(old.scroll_pages(), ScrollPages::Off);
+        old.input.scroll = Some(ScrollPages::OpenOnly);
+        assert_eq!(old.scroll_pages(), ScrollPages::OpenOnly);
+
+        // The Shelf appears once, and stays gone if removed afterwards.
+        assert!(old.upgrade_deck());
+        assert_eq!(old.slides.last(), Some(&SlideKind::Shelf));
+        old.slides.retain(|s| *s != SlideKind::Shelf);
+        assert!(!old.upgrade_deck());
+        assert!(!old.slides.contains(&SlideKind::Shelf));
+    }
+
+    #[test]
+    fn a_fresh_deck_has_the_shelf_but_not_the_clipboard() {
+        let notch = NotchConfig::default();
+        assert!(notch.slides.contains(&SlideKind::Shelf));
+        assert!(!notch.slides.contains(&SlideKind::Clipboard));
+        assert_eq!(notch.deck_revision, NotchConfig::DECK_REVISION);
+    }
+
+    #[test]
+    fn the_shelf_pins_each_path_once_and_has_a_ceiling() {
+        let mut shelf = ShelfConfig::default();
+        assert!(shelf.pin(r"C:\Tools\build.bat"));
+        assert!(!shelf.pin(r"c:\tools\BUILD.bat"), "same path, other case");
+        assert!(!shelf.pin("   "));
+        for i in 0..ShelfConfig::MAX_ITEMS {
+            shelf.pin(&format!(r"C:\file{i}.txt"));
+        }
+        assert_eq!(shelf.items.len(), ShelfConfig::MAX_ITEMS);
     }
 }

@@ -330,15 +330,23 @@ pub fn slide_body(panel: NotchShape) -> D2D_RECT_F {
     }
 }
 
-/// Centres and radius of the Now Playing slide's three transport buttons
-/// (previous / play-pause / next), centred along the body's bottom edge.
-/// Shared by the painter and the window for the same draw/hit-test reason as
-/// [`NotchShape::pin_button`].
-pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
+/// The Status slide's right-hand list column: right of the divider, under
+/// its "ON DECK" heading. Shared by the painter and click handling.
+pub fn status_list_column(body: D2D_RECT_F) -> crate::notch::layout::Rect {
+    let split = body.left + (body.right - body.left) * super::theme::SPLIT_RATIO;
+    crate::notch::layout::Rect::new(split + 20.0, body.top + 24.0, body.right, body.bottom)
+}
+
+/// A Now Playing body at least this tall gets the centred, stacked player;
+/// a shorter one lays art and text out side by side.
+pub const MEDIA_STACKED_MIN_H: f32 = 200.0;
+
+/// Previous / play-pause / next centred along the bottom of `area`.
+fn centred_buttons(area: D2D_RECT_F) -> [(f32, f32, f32); 3] {
     let r = 15.0;
     let gap = 34.0;
-    let cx = (body.left + body.right) * 0.5;
-    let cy = body.bottom - r - 4.0;
+    let cx = (area.left + area.right) * 0.5;
+    let cy = area.bottom - r - 4.0;
     [
         (cx - gap, cy, r * 0.72),
         (cx, cy, r),
@@ -346,10 +354,60 @@ pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
     ]
 }
 
-/// Centres and radius of the Timer slide's buttons (reset / start-pause /
-/// skip), along the body's bottom edge like the media transport.
+/// The Now Playing slide's art box. Stacked: centred under the top edge,
+/// sized to leave room for the text, timeline and buttons below; the width
+/// is the art's own (`aspect` = width / height, 1 for album covers, 16:9 for
+/// videos). Side by side: a square the height of the body.
+pub fn media_art(body: D2D_RECT_F, aspect: f32) -> D2D_RECT_F {
+    let w = body.right - body.left;
+    let h = body.bottom - body.top;
+    if h >= MEDIA_STACKED_MIN_H {
+        let art_h = (h - 118.0).clamp(64.0, 320.0);
+        let art_w = (art_h * aspect.clamp(0.5, 2.0)).min(w);
+        let art_h = art_w / aspect.clamp(0.5, 2.0);
+        let cx = (body.left + body.right) * 0.5;
+        D2D_RECT_F {
+            left: cx - art_w * 0.5,
+            top: body.top,
+            right: cx + art_w * 0.5,
+            bottom: body.top + art_h,
+        }
+    } else {
+        let side = h.min(w * 0.4).max(24.0);
+        D2D_RECT_F {
+            left: body.left,
+            top: body.top,
+            right: body.left + side,
+            bottom: body.top + side,
+        }
+    }
+}
+
+/// Where the text, timeline and buttons go beside the art in the side by
+/// side layout; the whole body when stacked.
+pub fn media_text_column(body: D2D_RECT_F) -> D2D_RECT_F {
+    if body.bottom - body.top >= MEDIA_STACKED_MIN_H {
+        body
+    } else {
+        let art = media_art(body, 1.0);
+        D2D_RECT_F {
+            left: art.right + 18.0,
+            ..body
+        }
+    }
+}
+
+/// Centres and radius of the Now Playing slide's three transport buttons
+/// (previous / play-pause / next), along the bottom of the text column.
+/// Shared by the painter and the window for the same draw/hit-test reason as
+/// [`NotchShape::pin_button`].
+pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
+    centred_buttons(media_text_column(body))
+}
+
+/// The focus timer's reset / start-pause / skip buttons.
 pub fn timer_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
-    media_transport_buttons(body)
+    centred_buttons(body)
 }
 
 /// The Quick Toggles slide's tiles, one per switch: a row of four on a wide
@@ -387,11 +445,39 @@ pub fn notification_clear_button(body: D2D_RECT_F) -> D2D_RECT_F {
     }
 }
 
-/// Individual notification item rectangle in the list view.
+const NOTIFICATION_LIST_TOP: f32 = 26.0;
+const NOTIFICATION_ROW_GAP: f32 = 4.0;
+const NOTIFICATION_ROW_MIN_HEIGHT: f32 = 22.0;
+const NOTIFICATION_ROW_MAX_HEIGHT: f32 = 34.0;
+pub const NOTIFICATION_MAX_VISIBLE_ROWS: usize = 4;
+
+/// How many rows fit without crossing the slide body's lower edge.
+pub fn notification_row_count(body: D2D_RECT_F) -> usize {
+    let available = (body.bottom - body.top - NOTIFICATION_LIST_TOP).max(0.0);
+    let fit = ((available + NOTIFICATION_ROW_GAP)
+        / (NOTIFICATION_ROW_MIN_HEIGHT + NOTIFICATION_ROW_GAP))
+        .floor() as usize;
+    fit.min(NOTIFICATION_MAX_VISIBLE_ROWS)
+}
+
+/// Individual notification item rectangle in the responsive list view.
+/// The painter and click handling share these bounds.
 pub fn notification_item_rect(body: D2D_RECT_F, index: usize) -> D2D_RECT_F {
-    let list_top = body.top + 26.0;
-    let item_h = 38.0;
-    let iy = list_top + (index as f32) * (item_h + 6.0);
+    let count = notification_row_count(body);
+    let list_top = body.top + NOTIFICATION_LIST_TOP;
+    if count == 0 || index >= count {
+        return D2D_RECT_F {
+            left: body.left,
+            top: list_top,
+            right: body.right,
+            bottom: list_top,
+        };
+    }
+
+    let available = (body.bottom - list_top).max(0.0);
+    let item_h = ((available - NOTIFICATION_ROW_GAP * (count - 1) as f32) / count as f32)
+        .clamp(NOTIFICATION_ROW_MIN_HEIGHT, NOTIFICATION_ROW_MAX_HEIGHT);
+    let iy = list_top + (index as f32) * (item_h + NOTIFICATION_ROW_GAP);
     D2D_RECT_F {
         left: body.left,
         top: iy,
@@ -501,5 +587,52 @@ mod tests {
         let points = shape.rim_points();
         assert_eq!(points.first(), Some(&(115.0, 0.0)));
         assert_eq!(points.last(), Some(&(285.0, 0.0)));
+    }
+}
+
+#[cfg(test)]
+mod notification_layout_tests {
+    use super::{notification_item_rect, notification_row_count};
+    use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+
+    #[test]
+    fn four_notification_rows_fit_inside_the_default_panel_body() {
+        let body = D2D_RECT_F {
+            left: 28.0,
+            top: 16.0,
+            right: 732.0,
+            bottom: 177.0,
+        };
+
+        assert_eq!(notification_row_count(body), 4);
+        let rows = (0..4)
+            .map(|index| notification_item_rect(body, index))
+            .collect::<Vec<_>>();
+        for row in &rows {
+            assert!(row.top >= body.top + 26.0);
+            assert!(row.bottom <= body.bottom);
+            assert!(row.bottom > row.top);
+        }
+        for pair in rows.windows(2) {
+            assert!(pair[0].bottom < pair[1].top);
+        }
+    }
+
+    #[test]
+    fn notification_rows_shrink_gracefully_for_short_panels() {
+        let body = D2D_RECT_F {
+            left: 12.0,
+            top: 4.0,
+            right: 500.0,
+            bottom: 84.0,
+        };
+
+        assert_eq!(notification_row_count(body), 2);
+        let last = notification_item_rect(body, 1);
+        assert!(last.bottom <= body.bottom);
+        assert_eq!(
+            notification_item_rect(body, 2).top,
+            notification_item_rect(body, 2).bottom
+        );
     }
 }

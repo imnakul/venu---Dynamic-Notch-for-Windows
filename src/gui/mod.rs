@@ -12,6 +12,7 @@ use crate::config::{
 };
 
 mod color_picker;
+mod control_pages;
 mod effect_preview;
 mod filedlg;
 mod font_setup;
@@ -277,6 +278,15 @@ struct PageCtx<'a> {
     changed: &'a mut bool,
     temp_text: &'a mut String,
     preview: &'a mut wallpaper::PreviewCache,
+    native_notification_action: &'a mut Option<NativeNotificationAction>,
+    /// Which shortcut is listening for keys, by its index.
+    recording_hotkey: &'a mut Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum NativeNotificationAction {
+    Connect,
+    Disconnect,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -284,8 +294,8 @@ const PAGES: &[Page] = &[
     Page {
         group: Group::Notch,
         title: "General",
-        blurb: "A pill fused to the top of your screen. Hover it and it springs open; scroll \
-                inside to move between slides.",
+        blurb: "A pill fused to the top of your screen. Click or rest the cursor on it to open \
+                it, scroll to move between slides, right-click for its menu.",
         icon: Icon::Notch,
         tabs: &[
             Tab {
@@ -293,6 +303,14 @@ const PAGES: &[Page] = &[
                 keywords: "show notch enable on off keep above always on top click through \
                            pass scroll wheel switch slides default collapsed face rest",
                 draw: SettingsApp::tab_notch_behaviour,
+            },
+            Tab {
+                title: "Controls",
+                keywords: "open click hover delay accidental fullscreen full screen game scroll \
+                           wheel pages mouse middle click back forward side button ctrl alt \
+                           shift trigger keyboard shortcut hotkey global toggle pause right \
+                           click menu",
+                draw: SettingsApp::tab_notch_controls,
             },
             Tab {
                 title: "Size",
@@ -359,6 +377,23 @@ const PAGES: &[Page] = &[
                 title: "Status",
                 keywords: "focus heading one line task list on deck todo checklist",
                 draw: SettingsApp::tab_slides_status,
+            },
+            Tab {
+                title: "Now Playing",
+                keywords: "media music player song video youtube spotify wave equaliser \
+                           equalizer bars album cover thumbnail timeline size",
+                draw: SettingsApp::tab_slides_media,
+            },
+            Tab {
+                title: "Shelf",
+                keywords: "shelf pin files folders apps shortcuts scripts bat screenshots \
+                           downloads recent launcher drop copy",
+                draw: SettingsApp::tab_slides_shelf,
+            },
+            Tab {
+                title: "Clipboard",
+                keywords: "clipboard history copy paste text snippets private",
+                draw: SettingsApp::tab_slides_clipboard,
             },
             Tab {
                 title: "Wallpaper",
@@ -554,6 +589,12 @@ pub struct SettingsApp {
     /// whether Windows agreed to it.
     blurred: Option<bool>,
     logo: Option<egui::TextureHandle>,
+    /// A Windows-notification permission action picked on this frame. Run
+    /// after the config lock is released: the consent prompt is a WinRT call
+    /// that must not happen while the notch thread is waiting on that lock.
+    native_notification_action: Option<NativeNotificationAction>,
+    /// The shortcut being recorded, if any.
+    recording_hotkey: Option<usize>,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -641,6 +682,8 @@ impl SettingsApp {
             query: String::new(),
             blurred: None,
             logo: load_logo(&cc.egui_ctx),
+            native_notification_action: None,
+            recording_hotkey: None,
         }
     }
 
@@ -1468,6 +1511,8 @@ impl SettingsApp {
 
     fn tab_notif_general(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_notif_general(ui, cx.cfg, cx.changed);
+        Self::divider(ui);
+        Self::sec_notif_windows(ui, cx);
     }
 
     fn tab_notif_apps(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -2975,16 +3020,15 @@ impl SettingsApp {
             .size(11.0)
             .color(theme::text_secondary()),
         );
-        ui.add_space(6.0);
-        if ui
-            .toggle(
-                &mut cfg.notch.scroll_to_switch,
-                "Scroll wheel changes slides",
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "How the notch opens, the scroll wheel, a mouse trigger and keyboard \
+                 shortcuts are on the Controls tab.",
             )
-            .changed()
-        {
-            *changed = true;
-        }
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
 
         ui.add_space(8.0);
         Self::row_inline(ui, "Default Collapsed Face", |ui| {
@@ -3031,6 +3075,62 @@ impl SettingsApp {
             )
             .size(11.0)
             .color(theme::text_secondary()),
+        );
+    }
+
+    /// Windows Notification Center: every app's toasts, through Windows' own
+    /// listener. Only the Microsoft Store build has the package identity the
+    /// API needs, so the portable build explains that instead of offering a
+    /// button that cannot work.
+    fn sec_notif_windows(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "WINDOWS NOTIFICATIONS");
+        let packaged = crate::native_notifications::has_package_identity();
+        ui.label(
+            RichText::new(if packaged {
+                "Show recent notifications from every Windows app in the notch. Windows asks \
+                 for your permission first."
+            } else {
+                "Showing notifications from every Windows app needs the Microsoft Store \
+                 version of Venu: Windows only lets packaged apps read the notification \
+                 center. This build still shows alerts from the apps and tools above."
+            })
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+        if !packaged {
+            return;
+        }
+        ui.add_space(8.0);
+        Self::row_inline(ui, "Access", |ui| {
+            ui.label(
+                RichText::new(crate::native_notifications::status_label())
+                    .size(12.0)
+                    .color(theme::text_primary()),
+            );
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if cx.cfg.notch.notifications.windows_listener_enabled
+                && ui.button("Disconnect").clicked()
+            {
+                cx.cfg.notch.notifications.windows_listener_enabled = false;
+                *cx.changed = true;
+                *cx.native_notification_action = Some(NativeNotificationAction::Disconnect);
+            }
+            if !crate::native_notifications::is_connected()
+                && ui.button("Connect Windows notifications…").clicked()
+            {
+                *cx.native_notification_action = Some(NativeNotificationAction::Connect);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Venu keeps the latest four in memory for this session only. Clearing them in \
+                 the notch does not remove anything from Windows, and nothing is saved to disk.",
+            )
+            .size(11.0)
+            .color(theme::text_tertiary()),
         );
     }
 
@@ -4622,6 +4722,9 @@ impl eframe::App for SettingsApp {
                                     changed: &mut config_changed,
                                     temp_text: &mut self.temp_text,
                                     preview: &mut self.preview,
+                                    native_notification_action: &mut self
+                                        .native_notification_action,
+                                    recording_hotkey: &mut self.recording_hotkey,
                                 };
                                 (page.tabs[tab].draw)(ui, &mut cx);
                                 ui.add_space(28.0);
@@ -4663,6 +4766,22 @@ impl eframe::App for SettingsApp {
         if config_changed {
             cfg_guard.save();
         }
+        drop(cfg_guard);
+
+        if let Some(action) = self.native_notification_action.take() {
+            match action {
+                NativeNotificationAction::Connect => {
+                    crate::native_notifications::request_access_on_ui_thread(
+                        std::sync::Arc::clone(&self.config),
+                    );
+                }
+                NativeNotificationAction::Disconnect => {
+                    crate::native_notifications::set_enabled(false);
+                }
+            }
+        }
+        let duration = self.config.read().notch.notifications.toast_duration_secs;
+        crate::native_notifications::set_toast_duration(duration);
 
         // Nothing on this window animates on a clock of its own: egui asks for
         // its own frames while a transition is running, and the tray wakes the

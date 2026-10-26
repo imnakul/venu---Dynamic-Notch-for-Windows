@@ -68,6 +68,12 @@ Venu also includes notification hooks for developer tools and AI agents such as 
 A compact Dynamic Island-style panel that expands when you need it and stays out of the way when you do not.
 
 - Smooth spring-based expansion and collapse
+- Open with a **click**, a **hover**, or either; hover waits a moment you choose and ignores the cursor sweeping past on its way to a tab
+- No accidental opening while dragging a window or file, or over full-screen apps and games
+- Right-click menu: Settings, keep open, pause hover, next page, click-through, quit
+- Global keyboard shortcuts you set yourself (default `Ctrl + Alt + N` to open or close, `Ctrl + Alt + C` for click-through)
+- A mouse trigger over the notch: middle click, a side button, or Ctrl/Alt/Shift + click (works even with click-through on)
+- Scroll to change pages on the open panel and, optionally, on the closed pill
 - Top or bottom placement
 - Configurable monitor, width, height, and offset
 - Multiple information slides
@@ -89,6 +95,8 @@ Available slides include:
 - **Focus Timer**: Pomodoro rounds and breaks, with the countdown in the resting pill
 - **Calendar**: your next meeting and what follows, from a Google Calendar or Outlook iCal link
 - **Quick Toggles**: mute the microphone or sound, switch dark mode, keep the PC awake
+- **Shelf**: pinned files, folders, apps and `.bat` scripts, plus the newest files of a folder such as Screenshots; one click opens, right-click copies (Venu stores paths only, never copies)
+- **Clipboard**: the last few things you copied, one click to copy again (opt-in, memory only, private content skipped)
 
 <p align="center">
   <img src="docs/screenshots/quick-toggles.png" alt="The open notch on the Quick Toggles slide, with tiles for Microphone, Sound, Dark mode and Keep awake" width="420">
@@ -156,6 +164,10 @@ Control media playback without leaving your current application.
 
 Venu integrates with Windows System Media Transport Controls to show the currently playing track, artist, artwork, playback state, and controls for play, pause, previous, and next.
 
+- A centred player: the album cover or video thumbnail large in the middle, the title, artist or channel and the app under it, then the timeline and controls
+- A live equaliser on the pill and the media pod that follows what is actually playing
+- Click the media pod to play or pause, the timer pod to pause or resume
+
 ### Notifications
 
 Turn the Dynamic Notch into a lightweight notification hub.
@@ -169,6 +181,7 @@ Turn the Dynamic Notch into a lightweight notification hub.
 - Custom animated notification glow styles
 - Local webhook support for external tools and scripts
 - Charging, unplugged and low-battery alerts
+- **Microsoft Store version:** notifications from every Windows app, with your permission. Windows only lets packaged apps read the notification center, so the portable and installer builds show alerts from the webhook only. Venu keeps the latest four in memory for the session; nothing is written to disk.
 
 ### AI Agent and Developer Notifications
 

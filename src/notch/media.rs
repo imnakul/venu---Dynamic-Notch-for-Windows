@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use windows::core::Interface;
@@ -37,6 +37,71 @@ pub struct NowPlaying {
     /// Bumped whenever `art` changes, so the painter's decode cache knows to
     /// re-decode without hashing or comparing the byte slice itself.
     pub art_generation: u64,
+    pub album: String,
+    /// The app playing it, in words: "Spotify", "Chrome".
+    pub source: String,
+    /// Track length in seconds; 0 when the app does not report one (live
+    /// streams, some browsers).
+    pub duration_secs: f64,
+    /// Position in seconds as of `position_at`. The painter runs it forward
+    /// from there while playing, so it never needs a poll to tick.
+    pub position_secs: f64,
+    pub position_at: Option<Instant>,
+}
+
+impl NowPlaying {
+    /// Where playback is now, in seconds, clamped to the track.
+    pub fn position_now(&self) -> f64 {
+        let mut pos = self.position_secs;
+        if self.playing {
+            if let Some(at) = self.position_at {
+                pos += at.elapsed().as_secs_f64();
+            }
+        }
+        if self.duration_secs > 0.0 {
+            pos.clamp(0.0, self.duration_secs)
+        } else {
+            pos.max(0.0)
+        }
+    }
+}
+
+/// A media app's id as a name people know.
+pub fn source_name(app_id: &str) -> String {
+    let lower = app_id.to_ascii_lowercase();
+    let known = [
+        ("spotify", "Spotify"),
+        ("chrome", "Chrome"),
+        ("msedge", "Edge"),
+        ("firefox", "Firefox"),
+        // Firefox registers under a hash of its install path.
+        ("308046b0af4a39cb", "Firefox"),
+        ("brave", "Brave"),
+        ("opera", "Opera"),
+        ("vivaldi", "Vivaldi"),
+        ("thebrowsercompany", "Arc"),
+        ("zunemusic", "Media Player"),
+        ("zunevideo", "Films & TV"),
+        ("vlc", "VLC"),
+        ("applemusic", "Apple Music"),
+        ("itunes", "iTunes"),
+        ("tidal", "TIDAL"),
+        ("deezer", "Deezer"),
+        ("youtube", "YouTube"),
+    ];
+    if let Some((_, name)) = known.iter().find(|(key, _)| lower.contains(key)) {
+        return (*name).to_owned();
+    }
+    // "Publisher.App_hash!App" or "app.exe": keep the readable part.
+    let tail = app_id.rsplit('!').next().unwrap_or(app_id);
+    let tail = tail.rsplit(['\\', '/']).next().unwrap_or(tail);
+    let tail = tail.strip_suffix(".exe").unwrap_or(tail);
+    let tail = tail.rsplit('.').next().unwrap_or(tail);
+    let mut chars = tail.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 enum Command {
@@ -82,11 +147,28 @@ impl MediaWatcher {
         self.snapshot.read().clone()
     }
 
+    /// Whether something is playing, without cloning the snapshot: read on
+    /// every frame for the music wave.
+    pub fn is_playing(&self) -> bool {
+        self.snapshot.read().playing
+    }
+
     /// Monotonic counter over every change to what is playing. Equal
     /// revisions mean the notch would draw the same Now Playing it drew last
     /// time, without having to clone and compare the snapshot.
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// The playback position to the second, for the open player's frame
+    /// key: it has to repaint once a second while the time counts up, and
+    /// not otherwise.
+    pub fn position_key(&self) -> u64 {
+        let now = self.snapshot.read();
+        if !now.has_session || now.duration_secs <= 0.0 {
+            return 0;
+        }
+        now.position_now() as u64 + 1
     }
 
     pub fn play_pause(&self) {
@@ -165,12 +247,23 @@ fn publish(snapshot: &Arc<RwLock<NowPlaying>>, revision: &Arc<AtomicU64>, next: 
         let current = snapshot.read();
         // `art` is compared through `art_generation`, which the poller bumps
         // whenever it reads new bytes — cheaper than comparing the bytes.
-        if current.has_session == next.has_session
+        let same = current.has_session == next.has_session
             && current.playing == next.playing
             && current.title == next.title
             && current.artist == next.artist
             && current.art_generation == next.art_generation
-        {
+            && current.album == next.album
+            && current.source == next.source
+            && (current.duration_secs - next.duration_secs).abs() < 0.5;
+        // Position moves on its own while playing; only a jump (a seek)
+        // is news.
+        let seeked = (current.position_now() - next.position_now()).abs() > 2.0;
+        if same && !seeked {
+            drop(current);
+            // Keep the anchor fresh without calling it a change.
+            let mut write = snapshot.write();
+            write.position_secs = next.position_secs;
+            write.position_at = next.position_at;
             return;
         }
     }
@@ -198,14 +291,50 @@ fn poll_once(
         .unwrap_or(false);
 
     let props = session.TryGetMediaPropertiesAsync().and_then(|op| op.get());
-    let (title, artist, thumb_ref) = match &props {
+    let (title, artist, album, thumb_ref) = match &props {
         Ok(p) => (
             p.Title().map(|h| h.to_string_lossy()).unwrap_or_default(),
             p.Artist().map(|h| h.to_string_lossy()).unwrap_or_default(),
+            p.AlbumTitle()
+                .map(|h| h.to_string_lossy())
+                .unwrap_or_default(),
             p.Thumbnail().ok(),
         ),
-        Err(_) => (String::new(), String::new(), None),
+        Err(_) => (String::new(), String::new(), String::new(), None),
     };
+    let source = session
+        .SourceAppUserModelId()
+        .map(|id| source_name(&id.to_string_lossy()))
+        .unwrap_or_default();
+
+    // Timeline: where the app says it is, as of when it said so. Ticks are
+    // 100 ns; the two times are in the same clock, so their difference is
+    // how long ago the app last reported.
+    let (duration_secs, position_secs) = session
+        .GetTimelineProperties()
+        .ok()
+        .map(|tl| {
+            let ticks = |span: windows::core::Result<windows::Foundation::TimeSpan>| {
+                span.map(|s| s.Duration as f64 / 1e7).unwrap_or(0.0)
+            };
+            let start = ticks(tl.StartTime());
+            let end = ticks(tl.EndTime());
+            let mut position = ticks(tl.Position()) - start;
+            if playing {
+                if let Ok(updated) = tl.LastUpdatedTime() {
+                    let now = now_universal_ticks();
+                    if now > updated.UniversalTime {
+                        let since = (now - updated.UniversalTime) as f64 / 1e7;
+                        // A stale report is better ignored than trusted.
+                        if since < 600.0 {
+                            position += since;
+                        }
+                    }
+                }
+            }
+            ((end - start).max(0.0), position.max(0.0))
+        })
+        .unwrap_or((0.0, 0.0));
 
     // The thumbnail read is the expensive part of a poll; only redo it when
     // the track has actually changed.
@@ -233,8 +362,54 @@ fn poll_once(
             artist,
             art,
             art_generation: *art_generation,
+            album,
+            source,
+            duration_secs,
+            position_secs,
+            position_at: Some(Instant::now()),
         },
     );
+}
+
+/// Now, in the 100 ns ticks since 1601 that WinRT's `DateTime` uses.
+fn now_universal_ticks() -> i64 {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (unix.as_nanos() / 100) as i64 + 116_444_736_000_000_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_apps_get_names_people_know() {
+        assert_eq!(source_name("Spotify.exe"), "Spotify");
+        assert_eq!(source_name("Chrome"), "Chrome");
+        assert_eq!(source_name("MSEdge"), "Edge");
+        assert_eq!(source_name("308046B0AF4A39CB"), "Firefox");
+        assert_eq!(
+            source_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"),
+            "Media Player"
+        );
+        assert_eq!(source_name("foobar2000.exe"), "Foobar2000");
+    }
+
+    #[test]
+    fn position_runs_forward_only_while_playing() {
+        let mut now = NowPlaying {
+            duration_secs: 100.0,
+            position_secs: 10.0,
+            position_at: Some(Instant::now() - Duration::from_secs(5)),
+            ..Default::default()
+        };
+        assert!((now.position_now() - 10.0).abs() < 0.01);
+        now.playing = true;
+        assert!((now.position_now() - 15.0).abs() < 0.2);
+        now.position_secs = 99.0;
+        assert_eq!(now.position_now(), 100.0);
+    }
 }
 
 fn read_thumbnail(reference: &IRandomAccessStreamReference) -> Option<Vec<u8>> {

@@ -14,6 +14,9 @@
 use crate::config::{PodsConfig, SlideKind, SplitConfig};
 use crate::notch::anim::Spring;
 
+/// Bars in the music wave (the media pod, the Now Playing face and player).
+pub const WAVE_BARS: usize = 3;
+
 /// Breathing room between the pill and a pod, on top of both shoulders.
 pub const POD_GAP: f32 = 6.0;
 
@@ -56,6 +59,8 @@ pub fn segment_width(kind: SlideKind) -> f32 {
         SlideKind::Media => 180.0,
         SlideKind::Calendar => 180.0,
         SlideKind::Stats => 210.0,
+        SlideKind::Shelf => 140.0,
+        SlideKind::Clipboard => 180.0,
     }
 }
 
@@ -358,6 +363,203 @@ pub fn max_pod_reach(cfg: &PodsConfig, shoulder: f32) -> f32 {
     widest + POD_GAP + shoulder * 3.0
 }
 
+// ---------------------------------------------------------------------------
+// Panel grids: the Shelf, Clipboard and the Status list
+// ---------------------------------------------------------------------------
+
+/// A plain rectangle, so panel grids stay free of Direct2D types.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Rect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl Rect {
+    pub fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+
+    pub fn width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    pub fn height(&self) -> f32 {
+        self.bottom - self.top
+    }
+}
+
+pub const SHELF_TILE_W: f32 = 64.0;
+pub const SHELF_TILE_H: f32 = 58.0;
+pub const SHELF_GAP: f32 = 8.0;
+/// Room for a row heading ("PINNED", the folder's name).
+pub const SHELF_HEADER: f32 = 16.0;
+
+/// Which row of the shelf a tile is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShelfRow {
+    Pinned,
+    Recent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShelfTile {
+    pub row: ShelfRow,
+    /// Index into that row's entries.
+    pub index: usize,
+    pub rect: Rect,
+}
+
+/// Where everything on the shelf goes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShelfLayout {
+    pub tiles: Vec<ShelfTile>,
+    /// Each row's heading position, top-left.
+    pub headings: Vec<(ShelfRow, f32, f32)>,
+    /// Pinned items that did not fit.
+    pub pinned_overflow: usize,
+}
+
+/// Lay the shelf out in `body`: pinned items, then the folder's newest
+/// files. A section with the other one empty gets both rows.
+pub fn shelf_layout(body: Rect, pinned: usize, recent: usize) -> ShelfLayout {
+    let mut layout = ShelfLayout::default();
+    let per_row =
+        (((body.width() + SHELF_GAP) / (SHELF_TILE_W + SHELF_GAP)).floor() as usize).max(1);
+    // Spread spare width evenly so a row ends flush with the body.
+    let step = if per_row > 1 {
+        (body.width() - SHELF_TILE_W) / (per_row - 1) as f32
+    } else {
+        0.0
+    };
+    let step = step.min(SHELF_TILE_W + SHELF_GAP * 3.0);
+    let row_h = SHELF_TILE_H + SHELF_GAP;
+    let rows_fit = (((body.height() - SHELF_HEADER + SHELF_GAP) / row_h).floor() as usize).max(1);
+
+    let mut sections: Vec<(ShelfRow, usize, usize)> = Vec::new();
+    match (pinned > 0, recent > 0) {
+        (true, true) => {
+            // One row each, each with its own heading.
+            sections.push((ShelfRow::Pinned, pinned, 1));
+            sections.push((ShelfRow::Recent, recent, 1));
+        }
+        (true, false) => sections.push((ShelfRow::Pinned, pinned, rows_fit)),
+        (false, true) => sections.push((ShelfRow::Recent, recent, rows_fit)),
+        (false, false) => {}
+    }
+
+    let mut y = body.top;
+    for (row, count, rows) in sections {
+        if y + SHELF_HEADER + SHELF_TILE_H > body.bottom + 0.5 {
+            break;
+        }
+        layout.headings.push((row, body.left, y));
+        y += SHELF_HEADER;
+        let mut rows_used = 0;
+        let capacity = per_row * rows;
+        for index in 0..count.min(capacity) {
+            let col = index % per_row;
+            let line = index / per_row;
+            let top = y + line as f32 * row_h;
+            if top + SHELF_TILE_H > body.bottom + 0.5 {
+                break;
+            }
+            rows_used = rows_used.max(line + 1);
+            let left = body.left + col as f32 * step;
+            layout.tiles.push(ShelfTile {
+                row,
+                index,
+                rect: Rect::new(left, top, left + SHELF_TILE_W, top + SHELF_TILE_H),
+            });
+        }
+        if row == ShelfRow::Pinned {
+            let shown = layout.tiles.iter().filter(|t| t.row == row).count();
+            layout.pinned_overflow = count.saturating_sub(shown);
+        }
+        y += rows_used.max(1) as f32 * row_h;
+    }
+    layout
+}
+
+pub const CLIP_ROW_H: f32 = 26.0;
+pub const CLIP_ROW_GAP: f32 = 4.0;
+/// Room for the heading and the Clear button.
+pub const CLIP_HEADER: f32 = 22.0;
+
+/// Clipboard rows: one column on a narrow panel, two on a wide one, newest
+/// first down the first column.
+pub fn clipboard_rows(body: Rect, count: usize) -> Vec<Rect> {
+    let cols = if body.width() >= 520.0 { 2 } else { 1 };
+    let col_gap = 12.0;
+    let col_w = (body.width() - col_gap * (cols - 1) as f32) / cols as f32;
+    let top = body.top + CLIP_HEADER;
+    let per_col = ((((body.bottom - top) + CLIP_ROW_GAP) / (CLIP_ROW_H + CLIP_ROW_GAP)).floor()
+        as usize)
+        .max(1);
+    (0..count.min(per_col * cols))
+        .map(|i| {
+            let col = i / per_col;
+            let line = i % per_col;
+            let left = body.left + col as f32 * (col_w + col_gap);
+            let y = top + line as f32 * (CLIP_ROW_H + CLIP_ROW_GAP);
+            Rect::new(left, y, left + col_w, y + CLIP_ROW_H)
+        })
+        .collect()
+}
+
+/// The Clear button in the clipboard heading.
+pub fn clipboard_clear_button(body: Rect) -> Rect {
+    Rect::new(
+        body.right - 52.0,
+        body.top - 2.0,
+        body.right,
+        body.top + 16.0,
+    )
+}
+
+pub const STATUS_ROW_H: f32 = 25.0;
+/// The short list stops growing here: past it, it is a to-do app.
+pub const STATUS_MAX_ITEMS: usize = 12;
+
+/// The Status slide's right-hand list: where each visible item sits and
+/// where the "+ Add" row goes (if there is room for one more item).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusList {
+    pub items: Vec<Rect>,
+    pub add: Option<Rect>,
+    /// Items that did not fit.
+    pub overflow: usize,
+}
+
+/// `column` is the list's own column: left edge, right edge, top of the
+/// list (under its heading) and the body's bottom.
+pub fn status_list(column: Rect, count: usize) -> StatusList {
+    let capacity = ((column.height() / STATUS_ROW_H).floor() as usize).max(1);
+    let can_add = count < STATUS_MAX_ITEMS;
+    // The add row takes the last slot when the list would fill the column.
+    let slots_for_items = if can_add { capacity - 1 } else { capacity };
+    let shown = count.min(slots_for_items);
+    let row = |i: usize| {
+        let y = column.top + i as f32 * STATUS_ROW_H;
+        Rect::new(column.left, y, column.right, y + STATUS_ROW_H)
+    };
+    StatusList {
+        items: (0..shown).map(row).collect(),
+        add: can_add.then(|| row(shown)),
+        overflow: count - shown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +766,66 @@ mod tests {
         let (l, r) = pod_span(1, 1.0, 100.0, 300.0, 16.0, 80.0, 12.0);
         assert_eq!(r, 100.0 - POD_GAP - 16.0 - 12.0);
         assert_eq!(r - l, 80.0);
+    }
+
+    #[test]
+    fn shelf_gives_each_section_a_row_and_counts_what_overflows() {
+        let body = Rect::new(0.0, 0.0, 704.0, 158.0);
+        let both = shelf_layout(body, 20, 6);
+        let pinned = both
+            .tiles
+            .iter()
+            .filter(|t| t.row == ShelfRow::Pinned)
+            .count();
+        let recent = both
+            .tiles
+            .iter()
+            .filter(|t| t.row == ShelfRow::Recent)
+            .count();
+        assert_eq!(pinned, 9);
+        assert_eq!(recent, 6);
+        assert_eq!(both.pinned_overflow, 11);
+        assert_eq!(both.headings.len(), 2);
+        for tile in &both.tiles {
+            assert!(tile.rect.bottom <= body.bottom + 0.5);
+            assert!(tile.rect.right <= body.right + 0.5);
+        }
+
+        // With no folder, pins get two rows.
+        let pins_only = shelf_layout(body, 20, 0);
+        assert_eq!(pins_only.tiles.len(), 18);
+        assert_eq!(pins_only.pinned_overflow, 2);
+        assert!(shelf_layout(body, 0, 0).tiles.is_empty());
+    }
+
+    #[test]
+    fn clipboard_rows_fill_down_then_across() {
+        let wide = Rect::new(0.0, 0.0, 704.0, 158.0);
+        let rows = clipboard_rows(wide, 30);
+        assert_eq!(rows.len(), 8);
+        assert!(rows[0].left < rows[4].left);
+        assert_eq!(rows[0].top, rows[4].top);
+        let narrow = Rect::new(0.0, 0.0, 400.0, 158.0);
+        assert_eq!(clipboard_rows(narrow, 30).len(), 4);
+        assert!(clipboard_rows(wide, 30)
+            .iter()
+            .all(|r| r.bottom <= wide.bottom));
+    }
+
+    #[test]
+    fn status_list_leaves_a_row_for_adding_until_it_is_full() {
+        let column = Rect::new(0.0, 0.0, 300.0, 125.0);
+        let list = status_list(column, 3);
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(list.add.map(|r| r.top), Some(75.0));
+
+        let crowded = status_list(column, 8);
+        assert_eq!(crowded.items.len(), 4);
+        assert_eq!(crowded.overflow, 4);
+        assert!(crowded.add.is_some());
+
+        let full = status_list(column, STATUS_MAX_ITEMS);
+        assert!(full.add.is_none());
+        assert_eq!(full.items.len(), 5);
     }
 }
