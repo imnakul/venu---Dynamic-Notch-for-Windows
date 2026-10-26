@@ -92,8 +92,24 @@ pub fn show(ui: &mut egui::Ui, cfg: &AppConfig, mode: Mode, content: Content) {
     } else {
         (None, None)
     };
-    let left_w = left_kind.map(layout::segment_width).unwrap_or(0.0);
-    let right_w = right_kind.map(layout::segment_width).unwrap_or(0.0);
+    // Moving text sizes its segment to the text, measured in the pill's
+    // font, exactly as the notch does; everything else has a fixed width.
+    let text_size = cfg.marquee.pill_font(13.0);
+    let moving_text = cfg.text.trim();
+    let text_width = painter
+        .layout_no_wrap(
+            moving_text.to_owned(),
+            egui::FontId::proportional(text_size),
+            Color32::WHITE,
+        )
+        .size()
+        .x;
+    let segment_width = |kind: SlideKind| match kind {
+        SlideKind::Marquee => layout::text_segment_width(text_width),
+        other => layout::segment_width(other),
+    };
+    let left_w = left_kind.map(segment_width).unwrap_or(0.0);
+    let right_w = right_kind.map(segment_width).unwrap_or(0.0);
 
     let shoulder = if floating { 0.0 } else { look.shoulder_at(0.0) };
     let pod_shoulder = if floating {
@@ -167,17 +183,19 @@ pub fn show(ui: &mut egui::Ui, cfg: &AppConfig, mode: Mode, content: Content) {
         first = false;
         let cell = Rect::from_min_max(Pos2::new(x, main.top), Pos2::new(x + width, main.bottom));
         let split_shown = left_kind.is_some() || right_kind.is_some();
-        let text = match (i, kind) {
-            (1, _) if split_shown => "Main face",
-            (1, _) => "9:41",
-            (_, Some(kind)) => sample(kind),
-            _ => "",
+        let (text, size) = match (i, kind) {
+            (1, _) if split_shown => ("Main face", 12.0),
+            (1, _) => ("9:41", 12.0),
+            // The user's own moving text, at the size the notch draws it.
+            (_, Some(SlideKind::Marquee)) => (moving_text, text_size),
+            (_, Some(kind)) => (sample(kind), 12.0),
+            _ => ("", 12.0),
         };
         painter.text(
             cell.center(),
             egui::Align2::CENTER_CENTER,
             text,
-            egui::FontId::proportional((12.0 * scale).max(9.5)),
+            egui::FontId::proportional((size * scale).max(9.5)),
             rgba(if i == 1 { pal.text_mid } else { pal.text_hi }, 1.0),
         );
         x += width;
