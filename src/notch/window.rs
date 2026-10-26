@@ -828,6 +828,17 @@ impl NotchWindow {
             0.0
         };
 
+        if let Some(selected_id) = self.state.selected_notification_id {
+            let selected_still_exists = crate::notch::notify::global_store()
+                .read()
+                .items
+                .iter()
+                .any(|item| item.id == selected_id);
+            if !selected_still_exists {
+                self.state.selected_notification_id = None;
+            }
+        }
+
         // -- input ----------------------------------------------------------
         let shape = self.current_shape(cfg);
         let hit_shape = shape.inset(-HOVER_SLOP);
@@ -1122,6 +1133,27 @@ impl NotchWindow {
         } else {
             0
         };
+        let notification_expanded_visible = expanded_alpha > 0.004
+            && slides.iter().enumerate().any(|(index, slide)| {
+                *slide == SlideKind::Notifications
+                    && (index as f32 - position).abs() <= 1.05
+                    && expanded_alpha
+                        * (1.0 - (index as f32 - position).abs())
+                            .clamp(0.0, 1.0)
+                            .powf(1.4)
+                        > 0.006
+            });
+        let notifications = crate::notch::notify::global_store();
+        let notifications = notifications.read();
+        let notification_pixels_visible = notifications.active_toast.is_some()
+            || (collapsed_visible
+                && slides.get(self.state.active) == Some(&SlideKind::Notifications))
+            || notification_expanded_visible;
+        let notification_revision = if notification_pixels_visible {
+            notifications.revision()
+        } else {
+            0
+        };
 
         FrameKey {
             placement: self.placement,
@@ -1142,7 +1174,7 @@ impl NotchWindow {
             capture_excluded: self.capture_excluded,
             clock: if clock_visible { clock_key() } else { 0 },
             media: self.painter.media.revision(),
-            notifications: crate::notch::notify::global_store().read().revision(),
+            notifications: notification_revision,
             usage: crate::notch::notify::usage_revision(),
             // An effect scoped away from the notch's current state draws nothing,
             // so it must not keep the frames coming either.
@@ -1269,15 +1301,19 @@ impl NotchWindow {
 
             // Hit test individual notification card rows to open detailed view:
             let store = notif_store.read();
-            let max_items = 3.min(store.items.len());
+            let max_items = crate::notch::geom::notification_row_count(body).min(store.items.len());
+            let mut selected_id = None;
             for i in 0..max_items {
                 let r = crate::notch::geom::notification_item_rect(body, i);
                 if cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom {
-                    if let Some(item) = store.items.get(i) {
-                        self.state.selected_notification_id = Some(item.id);
-                        return;
-                    }
+                    selected_id = store.items.get(i).map(|item| item.id);
+                    break;
                 }
+            }
+            drop(store);
+            if let Some(id) = selected_id {
+                self.state.selected_notification_id = Some(id);
+                notif_store.write().mark_read(id);
             }
             return;
         }

@@ -5,6 +5,7 @@ mod font_families;
 mod fonts;
 mod gui;
 mod launch;
+mod native_notifications;
 mod notch;
 mod overlay;
 mod startup_log;
