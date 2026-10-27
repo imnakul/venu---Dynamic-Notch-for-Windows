@@ -792,7 +792,7 @@ impl Painter {
 
         // The right-click menu floats over everything.
         if let Some(menu) = menu {
-            self.paint_menu(&t, &factory, cfg, menu, origin, may_capture, &shape, expand);
+            self.paint_menu(&t, cfg, menu);
         }
 
         unsafe { t.EndDraw(None, None)? };
