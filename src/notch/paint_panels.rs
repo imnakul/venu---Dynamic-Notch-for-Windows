@@ -38,6 +38,37 @@ use windows::Win32::Graphics::Direct2D::{
 /// A warm red for destructive menu items.
 const DANGER: theme::Rgba = [0.96, 0.40, 0.38, 1.0];
 
+/// The Settings window's colours (`gui::theme::Palette::glass`), for the
+/// right-click menu, so the two read as one app. Kept in step with that
+/// palette by hand: the GUI works in egui bytes, the notch in Direct2D floats.
+struct MenuColors {
+    /// The Settings page: near-black, nudged 9% toward the accent.
+    background: theme::Rgba,
+    divider: theme::Rgba,
+    track_off: theme::Rgba,
+    text_primary: theme::Rgba,
+    text_secondary: theme::Rgba,
+    text_tertiary: theme::Rgba,
+}
+
+impl MenuColors {
+    fn new(accent: theme::Rgba) -> Self {
+        let rgb = |r: u8, g: u8, b: u8| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+        let base = rgb(16, 16, 22);
+        let mix = |i: usize| base[i] + (accent[i].clamp(0.0, 1.0) - base[i]) * 0.09;
+        Self {
+            // Opaque where Settings is see-through: the menu has no blur
+            // behind it to keep it readable.
+            background: [mix(0), mix(1), mix(2), 0.97],
+            divider: [1.0, 1.0, 1.0, 0.09],
+            track_off: [1.0, 1.0, 1.0, 0.14],
+            text_primary: rgb(244, 244, 247),
+            text_secondary: rgb(178, 178, 190),
+            text_tertiary: rgb(128, 128, 142),
+        }
+    }
+}
+
 /// Segoe MDL2 Assets glyphs used here.
 const GLYPH_PASTE: &str = "\u{E77F}";
 const GLYPH_PIN: &str = "\u{E718}";
@@ -185,47 +216,25 @@ impl Painter {
 
     // -- the right-click menu ------------------------------------------------------
 
-    /// The menu card, made of the same glass as the notch: the blurred
-    /// desktop behind it on glass themes, the notch's surface, edge and
-    /// sheen on every theme. It fades in while rising a few pixels from the
-    /// click, and fades out the same way.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn paint_menu(
-        &mut self,
-        t: &ID2D1DCRenderTarget,
-        factory: &ID2D1Factory,
-        cfg: &AppConfig,
-        menu: &MenuView,
-        origin: (i32, i32),
-        may_capture: bool,
-        panel: &crate::notch::geom::NotchShape,
-        expand: f32,
-    ) {
+    /// The menu card, in the Settings window's own colours: its dark,
+    /// accent-tinted page, hairline edge and text, so the menu reads as part
+    /// of the same app whatever the notch theme. It fades in while rising a
+    /// few pixels from the click, and fades out the same way.
+    pub(super) fn paint_menu(&mut self, t: &ID2D1DCRenderTarget, cfg: &AppConfig, menu: &MenuView) {
         let a = menu.alpha();
         if a <= 0.004 {
             return;
         }
         let open = menu.open.value.clamp(0.0, 1.0);
-        // Rising into place rather than scaling: the glass is sampled from
-        // the desktop at the card's real position, which a scale would break.
         let lift = -8.0 * (1.0 - open);
-        let card_rect = menu.rect;
-        let shape = crate::notch::geom::NotchShape {
-            left: card_rect.left,
-            top: card_rect.top + lift,
-            right: card_rect.right,
-            bottom: card_rect.bottom + lift,
-            radius_top: menu_model::RADIUS,
-            radius_bottom: menu_model::RADIUS,
-            flare: 0.0,
-        };
         let card = D2D_RECT_F {
-            left: shape.left,
-            top: shape.top,
-            right: shape.right,
-            bottom: shape.bottom,
+            left: menu.rect.left,
+            top: menu.rect.top + lift,
+            right: menu.rect.right,
+            bottom: menu.rect.bottom + lift,
         };
         let r = menu_model::RADIUS;
+        let colors = MenuColors::new(cfg.notch.accent);
 
         // Soft shadow: a few widening, fading plates under the card.
         let depth = self.pal.shadow_strength.max(0.6);
@@ -241,24 +250,16 @@ impl Painter {
             self.fill_rrect(t, plate, r + grow, [0.0, 0.0, 0.0, fall * a]);
         }
 
-        let Ok(geometry) = shape.build(factory) else {
-            return;
+        // The card itself, with the Settings divider as its edge, drawn on
+        // the half pixel so the hairline stays crisp.
+        self.fill_rrect(t, card, r, theme::fade(colors.background, a));
+        let edge = D2D_RECT_F {
+            left: card.left + 0.5,
+            top: card.top + 0.5,
+            right: card.right - 0.5,
+            bottom: card.bottom - 0.5,
         };
-        // Over the open panel, the desktop behind the card is not what the
-        // eye expects to see through it, so it takes the panel's own tint
-        // there instead of the blur.
-        let over_panel = expand > 0.5
-            && card.left < panel.right
-            && card.right > panel.left
-            && card.top < panel.bottom;
-        let mut surface = cfg.notch.surface;
-        if self.pal.blur_backdrop && may_capture && !over_panel {
-            self.paint_backdrop(t, &[(&geometry, &shape, a)], origin);
-        } else {
-            // No blur to read through: keep the card legible.
-            surface[3] = surface[3].max(0.94);
-        }
-        self.paint_glass(t, factory, &shape, &geometry, surface, a);
+        self.stroke_rrect(t, edge, r - 0.5, 1.0, theme::fade(colors.divider, a));
 
         let menu_dy = lift;
         // The highlight, under the rows.
@@ -272,7 +273,8 @@ impl Painter {
         });
         if hl_alpha > 0.004 {
             let tone = if lit_danger { DANGER } else { cfg.notch.accent };
-            let strength = if menu.pressed.is_some() { 0.32 } else { 0.17 };
+            // The Settings accent wash (0.22), deeper while pressed.
+            let strength = if menu.pressed.is_some() { 0.36 } else { 0.22 };
             let hl = menu.highlight();
             self.fill_rrect(
                 t,
@@ -305,7 +307,7 @@ impl Painter {
                             bottom: ry + 0.5,
                         },
                         0.5,
-                        theme::fade(self.pal.rule, a),
+                        theme::fade(colors.divider, a),
                     );
                     y += menu_model::SEP_H;
                     continue;
@@ -323,13 +325,13 @@ impl Painter {
                     } else if lit_here {
                         cfg.notch.accent
                     } else {
-                        self.pal.text_mid
+                        colors.text_secondary
                     };
                     self.glyph(t, glyph, 12.0, left + 16.0, cy, theme::fade(tone, a));
                     let text_tone = if *danger && lit_here {
                         DANGER
                     } else {
-                        self.pal.text_hi
+                        colors.text_primary
                     };
                     if let Some((layout, _, h)) =
                         self.measure_text(family, label, 12.5, DWRITE_FONT_WEIGHT_MEDIUM)
@@ -343,7 +345,7 @@ impl Painter {
                         );
                     }
                     if let Some(on) = toggle {
-                        self.switch(t, cfg, right - 10.0, cy, *on, a);
+                        self.switch(t, cfg, &colors, right - 10.0, cy, *on, a);
                     }
                 }
                 MenuRow::Pair(first, second) => {
@@ -358,14 +360,14 @@ impl Painter {
                             bottom: cy + 8.0,
                         },
                         0.5,
-                        theme::fade(self.pal.rule, a),
+                        theme::fade(colors.divider, a),
                     );
                     for (half, item) in [(0u8, first), (1u8, second)] {
                         let hot = lit.is_some_and(|s| s.row == index && s.half == half);
                         let tone = if hot {
                             cfg.notch.accent
                         } else {
-                            self.pal.text_mid
+                            colors.text_secondary
                         };
                         let (from, to) = if half == 0 { (left, mid) } else { (mid, right) };
                         let centre = (from + to) * 0.5;
@@ -386,7 +388,7 @@ impl Painter {
                                 &layout,
                                 text_x,
                                 cy - h * 0.5,
-                                theme::fade(self.pal.text_hi, a),
+                                theme::fade(colors.text_primary, a),
                             );
                         }
                     }
@@ -401,6 +403,7 @@ impl Painter {
         &self,
         t: &ID2D1DCRenderTarget,
         cfg: &AppConfig,
+        colors: &MenuColors,
         right: f32,
         cy: f32,
         on: bool,
@@ -417,13 +420,13 @@ impl Painter {
             self.fill_rrect(t, track, h * 0.5, theme::fade(cfg.notch.accent, a));
             self.dot(t, right - h * 0.5, cy, h * 0.5 - 2.0, [1.0, 1.0, 1.0, a]);
         } else {
-            self.fill_rrect(t, track, h * 0.5, theme::fade(self.pal.well, a * 2.6));
+            self.fill_rrect(t, track, h * 0.5, theme::fade(colors.track_off, a));
             self.dot(
                 t,
                 right - w + h * 0.5,
                 cy,
                 h * 0.5 - 2.0,
-                theme::fade(self.pal.text_lo, a),
+                theme::fade(colors.text_tertiary, a),
             );
         }
     }

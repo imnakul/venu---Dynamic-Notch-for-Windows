@@ -787,12 +787,12 @@ impl Painter {
 
         // Pod faces, each clipped to its own little slab.
         for pod in scene.pods.iter().flatten() {
-            self.paint_pod_face(&t, cfg, state, pod);
+            self.paint_pod_face(&t, cfg, state, pod, generation);
         }
 
         // The right-click menu floats over everything.
         if let Some(menu) = menu {
-            self.paint_menu(&t, &factory, cfg, menu, origin, may_capture, &shape, expand);
+            self.paint_menu(&t, cfg, menu);
         }
 
         unsafe { t.EndDraw(None, None)? };
@@ -2073,11 +2073,12 @@ impl Painter {
     /// at most once a second (a timer, an elapsed time), and the wave only
     /// moves while music plays and the live wave is on.
     fn paint_pod_face(
-        &self,
+        &mut self,
         t: &ID2D1DCRenderTarget,
         cfg: &AppConfig,
         state: &NotchState,
         pod: &PodDraw,
+        generation: u64,
     ) {
         let alpha = pod.alpha;
         if alpha <= 0.004 {
@@ -2133,18 +2134,41 @@ impl Painter {
                 Some(word)
             }
             PodKind::Media => {
-                // The music wave: following the sound while it plays, a
-                // flat line when paused.
-                let levels = self.wave_levels(state);
-                let mid = (shape.left + shape.right) * 0.5;
+                // A small music player: the cover on the left, the live wave
+                // on the right, as on the pill's own music face.
+                let now = self.media.snapshot();
+                let side = (shape.height() - 10.0).max(8.0);
+                let art = D2D_RECT_F {
+                    left: shape.left + 9.0,
+                    top: cy - side * 0.5,
+                    right: shape.left + 9.0 + side,
+                    bottom: cy + side * 0.5,
+                };
+                if !self.fill_media_art(t, &now, art, 5.0, alpha, generation) {
+                    // No cover (or it would not decode): a quiet tile with a
+                    // note on it, so the pod still reads as music.
+                    self.fill_rrect(t, art, 5.0, theme::fade(self.pal.well, alpha * 2.2));
+                    self.glyph(
+                        t,
+                        "\u{E8D6}",
+                        side * 0.55,
+                        (art.left + art.right) * 0.5,
+                        cy,
+                        theme::fade(self.pal.text_mid, alpha),
+                    );
+                }
+                let wave_w = 15.0;
                 self.wave(
                     t,
-                    mid,
+                    shape.right - 11.0 - wave_w * 0.5,
                     cy,
-                    shape.height() * 0.5,
+                    shape.height() * 0.42,
                     3.0,
-                    &levels,
-                    theme::fade(cfg.notch.accent, alpha),
+                    &self.wave_levels(state),
+                    theme::fade(
+                        cfg.notch.accent,
+                        alpha * if now.playing { 1.0 } else { 0.6 },
+                    ),
                 );
                 None
             }

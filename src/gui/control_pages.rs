@@ -50,17 +50,24 @@ impl SettingsApp {
         cx.cfg.notch.input.clean();
     }
 
-    /// A row of on/off chips: each is a switch, several can be on.
-    fn chips(ui: &mut egui::Ui, label: &str, items: &mut [(&str, &mut bool)], changed: &mut bool) {
-        Self::row_inline(ui, label, |ui| {
-            // Right to left: listed backwards so they read in order.
-            for (name, on) in items.iter_mut().rev() {
-                if Self::segment(ui, name, **on).clicked() {
-                    **on = !**on;
-                    *changed = true;
-                }
+    /// A labelled group of on/off switches, several of which can be on. Uses
+    /// the same switch as every other setting, so an option reads as on or
+    /// off at a glance instead of as a button that might be a choice.
+    fn switches(
+        ui: &mut egui::Ui,
+        label: &str,
+        items: &mut [(&str, &mut bool)],
+        changed: &mut bool,
+    ) {
+        ui.label(RichText::new(label).size(13.0).color(theme::text_primary()));
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(22.0, 10.0);
+            for (name, on) in items.iter_mut() {
+                *changed |= ui.toggle(on, *name).changed();
             }
         });
+        ui.add_space(10.0);
     }
 
     fn note(ui: &mut egui::Ui, text: &str) {
@@ -78,7 +85,7 @@ impl SettingsApp {
         let mut hover = input.open_with.hovers();
         let mut click = input.open_with.clicks();
         let mut edited = false;
-        Self::chips(
+        Self::switches(
             ui,
             "Open with",
             &mut [("Hover", &mut hover), ("Click", &mut click)],
@@ -159,7 +166,7 @@ impl SettingsApp {
     fn sec_closing(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "CLOSE");
         let input = &mut cx.cfg.notch.input;
-        Self::chips(
+        Self::switches(
             ui,
             "Close with",
             &mut [
@@ -207,7 +214,7 @@ impl SettingsApp {
     fn sec_menu_and_pages(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "RIGHT-CLICK MENU");
         let input = &mut cx.cfg.notch.input;
-        Self::chips(
+        Self::switches(
             ui,
             "Opens on",
             &mut [
@@ -227,7 +234,7 @@ impl SettingsApp {
         let mut closed = scroll.applies(false);
         let mut open = scroll.applies(true);
         let mut edited = false;
-        Self::chips(
+        Self::switches(
             ui,
             "Scroll on",
             &mut [("Closed pill", &mut closed), ("Open panel", &mut open)],

@@ -200,7 +200,7 @@ impl PodKind {
             PodKind::Agent => 78.0,
             PodKind::Timer => 82.0,
             PodKind::Calendar => 70.0,
-            PodKind::Media => 52.0,
+            PodKind::Media => 74.0,
         }
     }
 
