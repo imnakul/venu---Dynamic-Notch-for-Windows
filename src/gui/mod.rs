@@ -324,6 +324,13 @@ const PAGES: &[Page] = &[
                 draw: SettingsApp::tab_notch_controls,
             },
             Tab {
+                title: "Features",
+                keywords: "features slides order reorder drag arrange show hide on off add \
+                           remove deck carousel faces media clock usage stats timer calendar \
+                           shelf clipboard quick toggles",
+                draw: SettingsApp::tab_notch_features,
+            },
+            Tab {
                 title: "Size",
                 keywords: "width height collapsed expanded pill panel dimensions",
                 draw: SettingsApp::tab_notch_size,
@@ -379,11 +386,6 @@ const PAGES: &[Page] = &[
                 and what each one shows.",
         icon: Icon::Layers,
         tabs: &[
-            Tab {
-                title: "Carousel",
-                keywords: "slides order add remove reorder deck faces media clock usage quick \n                           toggles microphone mute dark mode keep awake",
-                draw: SettingsApp::tab_slides_carousel,
-            },
             Tab {
                 title: "Status",
                 keywords: "focus heading one line task list on deck todo checklist",
@@ -1391,11 +1393,6 @@ impl SettingsApp {
         Self::sec_notch_effects(ui, cx.cfg, cx.changed);
     }
 
-    fn tab_slides_carousel(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "IN THE CAROUSEL");
-        Self::sec_notch_deck(ui, cx.cfg, cx.changed);
-    }
-
     fn tab_slides_status(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::sec_status_now(ui, cx.cfg, cx.changed);
         Self::sec_status_deck(ui, cx.cfg, cx.changed);
@@ -1422,12 +1419,12 @@ impl SettingsApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("This slide is not in the notch yet.")
+                RichText::new("This one is switched off in General › Features.")
                     .size(11.0)
                     .color(theme::text_secondary()),
             );
-            if ui.small_button("Add it").clicked() {
-                cfg.notch.slides.push(kind);
+            if ui.small_button("Switch it on").clicked() {
+                cfg.notch.show_feature(kind);
                 *changed = true;
             }
         });
@@ -3578,91 +3575,6 @@ impl SettingsApp {
                 crate::notch::notify::global_store().write().clear_all();
             }
         });
-    }
-
-    fn sec_notch_deck(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
-        let mut move_up: Option<usize> = None;
-        let mut move_down: Option<usize> = None;
-        let mut remove: Option<usize> = None;
-        let len = cfg.notch.slides.len();
-
-        for (i, slide) in cfg.notch.slides.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{}.", i + 1))
-                        .size(12.0)
-                        .color(theme::text_tertiary()),
-                );
-                ui.label(
-                    RichText::new(slide.label())
-                        .size(13.0)
-                        .color(theme::text_primary()),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Removing the last slide would leave nothing to show.
-                    if ui
-                        .add_enabled(len > 1, egui::Button::new("Remove"))
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                    if ui
-                        .add_enabled(i + 1 < len, egui::Button::new("▼"))
-                        .clicked()
-                    {
-                        move_down = Some(i);
-                    }
-                    if ui.add_enabled(i > 0, egui::Button::new("▲")).clicked() {
-                        move_up = Some(i);
-                    }
-                });
-            });
-            ui.add_space(4.0);
-        }
-
-        if let Some(i) = move_up {
-            cfg.notch.slides.swap(i, i - 1);
-            *changed = true;
-        }
-        if let Some(i) = move_down {
-            cfg.notch.slides.swap(i, i + 1);
-            *changed = true;
-        }
-        if let Some(i) = remove {
-            if cfg.notch.slides.get(i) == Some(&SlideKind::Stats) {
-                cfg.notch.set_stats_enabled(false);
-            } else {
-                cfg.notch.slides.remove(i);
-            }
-            *changed = true;
-        }
-
-        let missing: Vec<SlideKind> = SlideKind::ALL
-            .iter()
-            .copied()
-            .filter(|k| !cfg.notch.slides.contains(k))
-            .collect();
-
-        if !missing.is_empty() {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Add")
-                        .size(12.0)
-                        .color(theme::text_secondary()),
-                );
-                for kind in missing {
-                    if ui.button(kind.label()).clicked() {
-                        cfg.notch.slides.push(kind);
-                        *changed = true;
-                    }
-                }
-            });
-        }
-
-        if cfg.notch.active_slide >= cfg.notch.slides.len().max(1) {
-            cfg.notch.active_slide = 0;
-        }
     }
 
     fn sec_notch_size(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {

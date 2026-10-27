@@ -19,6 +19,8 @@ on:
 
 permissions:
   contents: write
+  # SignPath reads the job and its artifacts to verify where a build came from.
+  actions: read
 
 jobs:
   resolve-version:
@@ -78,11 +80,86 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      # Code signing through SignPath (see docs/code-signing.md). Off until the
+      # SIGNPATH_API_TOKEN secret and the SIGNPATH_* repository variables are
+      # set; without them the release is built and published unsigned, as
+      # before.
+      - name: Check whether code signing is set up
+        id: signing
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          if [[ -n "${SIGNPATH_API_TOKEN}" && -n "${SIGNPATH_ORGANIZATION_ID}" \
+                && -n "${SIGNPATH_PROJECT_SLUG}" && -n "${SIGNPATH_SIGNING_POLICY_SLUG}" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Code signing is not set up; publishing unsigned binaries."
+          fi
+
+      - name: Upload the app for signing
+        id: upload-app
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: venu-app-unsigned
+          path: target/release/venu.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the app
+        if: steps.signing.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-app.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed/app
+
+      - name: Use the signed app
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: Copy-Item "signed/app/venu.exe" "target/release/venu.exe" -Force
+
       - name: Build installer with Inno Setup
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$env:VERSION "packaging/venu.iss"
+
+      - name: Upload the installer for signing
+        id: upload-setup
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: venu-setup-unsigned
+          path: dist/venu-setup-*.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the installer
+        if: steps.signing.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed/setup
+
+      - name: Use the signed installer
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: Copy-Item "signed/setup/*.exe" "dist/" -Force
 
       - name: Rename binary with version tag
         shell: pwsh
