@@ -9,8 +9,8 @@ use eframe::egui::{self, Color32, RichText};
 
 use super::{filedlg, theme, PageCtx, SettingsApp, ToggleExt};
 use crate::config::{
-    ClipboardConfig, Hotkey, InputConfig, MouseTrigger, OpenWith, ScrollPages, ShelfConfig,
-    SlideKind,
+    AppConfig, ClipboardConfig, Hotkey, InputConfig, MouseTrigger, OpenWith, ScrollPages,
+    ShelfConfig, SlideKind,
 };
 use crate::notch::keys::{self, HotkeyStatus};
 
@@ -365,6 +365,216 @@ impl SettingsApp {
 
     // -- Slides › Now Playing -------------------------------------------------
 
+    // -- General › Features ---------------------------------------------------
+
+    /// Which features the notch carries and in what order: one row each,
+    /// dragged by its grip to reorder, with a switch to show or hide it.
+    pub(super) fn tab_notch_features(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::note(
+            ui,
+            "Drag a row to change the order the notch and the scroll wheel go through. A \
+             feature you switch off keeps its place for when you switch it back on. Each \
+             one's own settings are under Slides.",
+        );
+        Self::feature_list(ui, cx.cfg, cx.changed);
+    }
+
+    fn feature_list(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+        let drag_id = egui::Id::new("feature_list_drag");
+        let dragging: Option<SlideKind> = ui.ctx().data(|d| d.get_temp(drag_id)).flatten();
+        let mut next_drag = dragging;
+
+        let mut order = cfg.notch.deck_order();
+        let mut on: Vec<SlideKind> = cfg.notch.slides.clone();
+        let on_count = on.len();
+        let mut rows: Vec<(SlideKind, egui::Rect)> = Vec::with_capacity(order.len());
+        let mut edited = false;
+        let mut nudge: Option<(SlideKind, bool)> = None;
+
+        for &kind in &order {
+            let row = Self::feature_row(ui, kind, &mut on, on_count, dragging == Some(kind));
+            edited |= row.toggled;
+            if row.handle.drag_started() {
+                next_drag = Some(kind);
+            }
+            if row.handle.drag_stopped() {
+                next_drag = None;
+            }
+            // Keyboard: focus a row (Tab), then Alt+Up / Alt+Down moves it.
+            if row.handle.has_focus() {
+                let (up, down) = ui.input(|i| {
+                    (
+                        i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp),
+                        i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown),
+                    )
+                });
+                if up || down {
+                    nudge = Some((kind, down));
+                }
+            }
+            rows.push((kind, row.rect));
+            ui.add_space(6.0);
+        }
+
+        // While dragging, the row trades places with a neighbour as soon as
+        // the pointer passes that neighbour's middle, so the list reflows
+        // under the cursor rather than on release.
+        if let (Some(kind), Some(pointer)) = (next_drag, ui.ctx().pointer_interact_pos()) {
+            if let Some(index) = order.iter().position(|k| *k == kind) {
+                let above = index.checked_sub(1).map(|i| rows[i].1.center().y);
+                let below = rows.get(index + 1).map(|(_, r)| r.center().y);
+                if above.is_some_and(|y| pointer.y < y) {
+                    order.swap(index, index - 1);
+                    edited = true;
+                } else if below.is_some_and(|y| pointer.y > y) {
+                    order.swap(index, index + 1);
+                    edited = true;
+                }
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if let Some((kind, down)) = nudge {
+            if let Some(index) = order.iter().position(|k| *k == kind) {
+                let target = if down {
+                    (index + 1).min(order.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                };
+                if target != index {
+                    order.swap(index, target);
+                    edited = true;
+                }
+            }
+        }
+        // A drag that ended outside the window never reports a stop.
+        if !ui.input(|i| i.pointer.any_down()) {
+            next_drag = None;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(drag_id, next_drag));
+
+        if edited && cfg.notch.set_deck(order, |kind| on.contains(&kind)) {
+            *changed = true;
+        }
+    }
+
+    /// One row: grip, name and switch. The grip and name are the drag handle;
+    /// the switch is left to itself so a click on it never starts a drag.
+    fn feature_row(
+        ui: &mut egui::Ui,
+        kind: SlideKind,
+        on: &mut Vec<SlideKind>,
+        on_count: usize,
+        lifted: bool,
+    ) -> FeatureRow {
+        let background = ui.painter().add(egui::Shape::Noop);
+        let mut shown = on.contains(&kind);
+        // The last feature that is on stays on: the notch needs a face.
+        let locked = shown && on_count <= 1;
+        let mut toggled = false;
+        let mut switch_left = f32::INFINITY;
+
+        let inner = ui.horizontal(|ui| {
+            ui.set_min_height(40.0);
+            ui.add_space(12.0);
+            let (grip, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
+            let dot = if lifted {
+                theme::accent()
+            } else {
+                theme::text_tertiary()
+            };
+            for col in 0..2 {
+                for line in 0..3 {
+                    ui.painter().circle_filled(
+                        egui::pos2(
+                            grip.left() + 2.0 + col as f32 * 6.0,
+                            grip.top() + 2.5 + line as f32 * 5.5,
+                        ),
+                        1.4,
+                        dot,
+                    );
+                }
+            }
+            ui.add_space(12.0);
+            ui.label(RichText::new(kind.label()).size(13.0).color(if shown {
+                theme::text_primary()
+            } else {
+                theme::text_tertiary()
+            }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(12.0);
+                let switch = ui
+                    .add_enabled_ui(!locked, |ui| ui.toggle(&mut shown, ""))
+                    .inner
+                    .on_hover_text(if locked {
+                        "At least one feature stays on"
+                    } else if shown {
+                        "Hide from the notch"
+                    } else {
+                        "Show in the notch"
+                    });
+                switch_left = switch.rect.left();
+                if switch.changed() {
+                    toggled = true;
+                }
+            });
+        });
+        let rect = inner.response.rect;
+
+        let handle_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2((switch_left - 8.0).min(rect.right()), rect.bottom()),
+        );
+        let handle = ui
+            .interact(
+                handle_rect,
+                egui::Id::new(("feature_row", kind)),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab);
+        handle.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("{}, drag or Alt+arrow keys to reorder", kind.label()),
+            )
+        });
+
+        let hover = ui.ctx().animate_bool_with_time(
+            egui::Id::new(("feature_row_hover", kind)),
+            handle.hovered() || lifted,
+            0.12,
+        );
+        let fill = if lifted {
+            theme::surface_active()
+        } else {
+            lerp(theme::surface(), theme::surface_hover(), hover)
+        };
+        let stroke = if lifted || handle.has_focus() {
+            egui::Stroke::new(1.0_f32, theme::accent().gamma_multiply(0.7))
+        } else {
+            egui::Stroke::new(1.0_f32, theme::divider())
+        };
+        ui.painter().set(
+            background,
+            egui::Shape::rect_filled(rect, egui::Rounding::same(10.0), fill),
+        );
+        ui.painter()
+            .rect_stroke(rect, egui::Rounding::same(10.0), stroke);
+
+        if toggled {
+            if shown {
+                on.push(kind);
+            } else {
+                on.retain(|k| *k != kind);
+            }
+        }
+        FeatureRow {
+            rect,
+            handle,
+            toggled,
+        }
+    }
+
     pub(super) fn tab_slides_media(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         Self::section_title(ui, "NOW PLAYING");
         let media = &mut cx.cfg.notch.media;
@@ -586,12 +796,15 @@ impl SettingsApp {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{} is not in the carousel yet.", kind.label()))
-                    .size(11.5)
-                    .color(theme::text_secondary()),
+                RichText::new(format!(
+                    "{} is switched off in General › Features.",
+                    kind.label()
+                ))
+                .size(11.5)
+                .color(theme::text_secondary()),
             );
-            if ui.small_button("Add it").clicked() {
-                cx.cfg.notch.slides.push(kind);
+            if ui.small_button("Switch it on").clicked() {
+                cx.cfg.notch.show_feature(kind);
                 *cx.changed = true;
             }
         });
@@ -603,4 +816,22 @@ fn screenshots_folder() -> Option<String> {
     let mut path = dirs::picture_dir()?;
     path.push("Screenshots");
     path.is_dir().then(|| path.to_string_lossy().into_owned())
+}
+
+/// What [`SettingsApp::feature_row`] reports back to the list.
+struct FeatureRow {
+    rect: egui::Rect,
+    handle: egui::Response,
+    toggled: bool,
+}
+
+/// Blend two colours, `t` from 0 (`a`) to 1 (`b`).
+fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_premultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
 }

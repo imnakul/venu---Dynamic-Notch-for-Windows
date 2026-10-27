@@ -2,6 +2,25 @@
 
 What's new in each version of Venu, written for the people who use it.
 
+## [0.6.1] - 2026-10-27
+
+### New
+- **Choose and arrange your features in one list.** Settings › General ›
+  Features shows every feature with an on/off switch. Drag a row to change the
+  order the notch and the scroll wheel go through (or focus it and press
+  Alt + Up / Down). A feature you switch off keeps its place for when you
+  switch it back on.
+- **Music pod** beside the notch now shows the album cover next to the live
+  wave, so it reads as music at a glance.
+
+### Improved
+- The right-click menu uses the same dark background and text colours as
+  Settings, so it stays readable on any wallpaper or theme.
+- Options you can combine in Settings › General › Controls (open with, close
+  with, where the menu and the scroll wheel work) are now on/off switches.
+- Release builds can be code-signed, so Windows can show Venu's publisher
+  instead of an unknown-app warning once signing is set up.
+
 ## [0.6.0] - 2026-10-27
 
 The notch is now as easy to click as it is to hover, and it does a lot more.

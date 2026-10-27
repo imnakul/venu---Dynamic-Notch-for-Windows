@@ -177,7 +177,7 @@ impl Default for SettingsWindowConfig {
 
 /// The faces the notch can show. The order of [`NotchConfig::slides`] is the
 /// carousel order the scroll wheel walks through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SlideKind {
     /// Split view: what today is about (left) and today's short list (right).
     Status,
@@ -1424,6 +1424,13 @@ pub struct NotchConfig {
     /// shows up for existing users once and stays removed if they remove it.
     #[serde(default)]
     pub deck_revision: u32,
+    /// Every feature in the order the user arranged them, including the ones
+    /// switched off, so turning one back on returns it to its place.
+    /// [`NotchConfig::slides`] stays the deck itself (the ones switched on);
+    /// this only remembers where the others sit. Empty in configs from
+    /// before it existed, which [`NotchConfig::deck_order`] fills in.
+    #[serde(default)]
+    pub slide_order: Vec<SlideKind>,
 }
 
 impl Default for NotchConfig {
@@ -1463,6 +1470,7 @@ impl Default for NotchConfig {
             shelf: ShelfConfig::default(),
             clipboard: ClipboardConfig::default(),
             deck_revision: NotchConfig::DECK_REVISION,
+            slide_order: Vec::new(),
         }
     }
 }
@@ -1483,6 +1491,65 @@ impl NotchConfig {
         }
         self.deck_revision = Self::DECK_REVISION;
         true
+    }
+
+    /// Every feature, in the user's order, on or off.
+    ///
+    /// Starts from the remembered [`NotchConfig::slide_order`], adds any kind
+    /// it is missing (older configs, features added in a release), then fills
+    /// the places held by switched-on features from [`NotchConfig::slides`]
+    /// in its order. The deck therefore always wins for the features that are
+    /// on — anything that edits it directly, like the Stats switch, still
+    /// reads right here — and switched-off features keep their places.
+    pub fn deck_order(&self) -> Vec<SlideKind> {
+        let mut order: Vec<SlideKind> = Vec::with_capacity(SlideKind::ALL.len());
+        for kind in self.slide_order.iter().chain(self.slides.iter()) {
+            if !order.contains(kind) {
+                order.push(*kind);
+            }
+        }
+        for kind in SlideKind::ALL {
+            if !order.contains(&kind) {
+                order.push(kind);
+            }
+        }
+        let mut on = self.slides.iter().copied();
+        for slot in order.iter_mut() {
+            if self.slides.contains(slot) {
+                if let Some(kind) = on.next() {
+                    *slot = kind;
+                }
+            }
+        }
+        order
+    }
+
+    /// Store a new arrangement: `order` holds every feature in place, and
+    /// the deck becomes those for which `is_on` holds, in that order. The
+    /// notch keeps resting on the same face if it is still on. Refuses an
+    /// arrangement with nothing on, so the notch always has a face; returns
+    /// whether it was applied.
+    pub fn set_deck(&mut self, order: Vec<SlideKind>, is_on: impl Fn(SlideKind) -> bool) -> bool {
+        let slides: Vec<SlideKind> = order.iter().copied().filter(|k| is_on(*k)).collect();
+        if slides.is_empty() {
+            return false;
+        }
+        let resting = self.effective_slides().get(self.clamped_active()).copied();
+        if !slides.contains(&SlideKind::Stats) && self.default_collapsed == CollapsedMode::Stats {
+            self.default_collapsed = CollapsedMode::LastActive;
+        }
+        self.active_slide = resting
+            .and_then(|kind| slides.iter().position(|k| *k == kind))
+            .unwrap_or(0);
+        self.slides = slides;
+        self.slide_order = order;
+        true
+    }
+
+    /// Switch a feature on in its remembered place in the order.
+    pub fn show_feature(&mut self, kind: SlideKind) {
+        let on = self.slides.clone();
+        self.set_deck(self.deck_order(), |k| k == kind || on.contains(&k));
     }
 
     /// Slides, guaranteed non-empty, so the carousel always has something to
@@ -2245,5 +2312,46 @@ mod tests {
         assert!(input.close_on_leave && input.menu_on_pill);
         assert_eq!(input.mouse_trigger, MouseTrigger::Off);
         assert_eq!(input.hotkey_toggle, Some(Hotkey::ctrl_alt("J")));
+    }
+
+    #[test]
+    fn deck_order_lists_every_feature_and_follows_the_deck() {
+        let mut notch = NotchConfig {
+            slides: vec![SlideKind::Media, SlideKind::Clock],
+            ..NotchConfig::default()
+        };
+        let order = notch.deck_order();
+        assert_eq!(order.len(), SlideKind::ALL.len());
+        assert_eq!(&order[..2], &[SlideKind::Media, SlideKind::Clock]);
+
+        // A hidden feature keeps its remembered place between two that are on.
+        notch.slide_order = vec![SlideKind::Clock, SlideKind::Timer, SlideKind::Media];
+        notch.slides = vec![SlideKind::Clock, SlideKind::Media];
+        assert_eq!(
+            &notch.deck_order()[..3],
+            &[SlideKind::Clock, SlideKind::Timer, SlideKind::Media]
+        );
+
+        // The deck's own order wins for features that are on.
+        notch.slides = vec![SlideKind::Media, SlideKind::Clock];
+        assert_eq!(
+            &notch.deck_order()[..3],
+            &[SlideKind::Media, SlideKind::Timer, SlideKind::Clock]
+        );
+    }
+
+    #[test]
+    fn set_deck_keeps_the_resting_face_and_never_empties() {
+        let mut notch = NotchConfig {
+            slides: vec![SlideKind::Clock, SlideKind::Media],
+            active_slide: 1,
+            ..NotchConfig::default()
+        };
+        let order = vec![SlideKind::Media, SlideKind::Timer, SlideKind::Clock];
+        assert!(notch.set_deck(order.clone(), |k| k != SlideKind::Timer));
+        assert_eq!(notch.slides, vec![SlideKind::Media, SlideKind::Clock]);
+        assert_eq!(notch.active_slide, 0, "still resting on Now Playing");
+        assert!(!notch.set_deck(order, |_| false));
+        assert_eq!(notch.slides.len(), 2, "an empty deck is refused");
     }
 }
