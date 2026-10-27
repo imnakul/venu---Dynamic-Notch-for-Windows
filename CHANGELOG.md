@@ -2,6 +2,47 @@
 
 What's new in each version of Venu, written for the people who use it.
 
+## [0.6.0] - 2026-10-27
+
+The notch is now as easy to click as it is to hover, and it does a lot more.
+
+### New
+- **Open and close the way you like.** Open with a hover, a click, or both;
+  pick a click gesture (such as Ctrl + click) so it never opens by accident.
+  Close with Esc, a click outside, or by moving the cursor away. Everything
+  is in one place: Settings › General › Controls.
+- **Right-click menu** on the notch's own glass, with smooth animation and
+  arrow keys: Settings, keep open, pause hover, clicks pass through, pages and
+  quit. It works even while clicks pass through.
+- **Never stuck.** The tray menu and the top of Settings can turn click-through
+  off or reset all the notch's controls in one click.
+- **Keyboard shortcuts** you record yourself, such as Ctrl + Alt + N to open or
+  close the notch.
+- **Shelf:** pin files, folders, apps and scripts, plus the newest files of a
+  folder like Screenshots. Drop files on the notch to pin them. Venu keeps the
+  path only, never a copy.
+- **Clipboard history** (off by default, memory only): one click copies an
+  earlier snippet again.
+- **Now Playing, redesigned:** a centred player with large artwork, the
+  timeline, and a live wave that moves with the music, plus play controls
+  right on the closed pill.
+- **Split pill and satellite pods:** show more than one thing on the pill, and
+  live activities beside it.
+- **Notch shape:** roundness, shoulders, outline, sheen and shadow, with
+  presets.
+- **Status:** tick items off and add new ones right in the notch.
+- **Windows notifications** from every app, in the Microsoft Store version.
+
+### Improved
+- Hover highlights, a hand cursor and a soft ripple on everything clickable.
+- Settings can be resized, scrolls in every direction, shows every tab, and
+  takes a soft tint of your accent colour.
+- In the Microsoft Store version, starting with Windows uses Windows' own
+  startup setting and respects it if you turn Venu off there.
+
+### Fixed
+- Even padding at both ends of a split pill, and moving text sized to fit.
+
 ## [0.5.2] - 2026-10-21
 
 ### Improved
