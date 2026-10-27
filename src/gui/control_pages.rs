@@ -21,139 +21,230 @@ impl SettingsApp {
     // -- General › Controls ----------------------------------------------------
 
     pub(super) fn tab_notch_controls(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_opening(ui, cx);
-        Self::divider(ui);
-        Self::sec_wheel_and_mouse(ui, cx);
-        Self::divider(ui);
-        Self::sec_shortcuts(ui, cx);
-    }
-
-    fn sec_opening(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "OPENING");
-        let input = &mut cx.cfg.notch.input;
-        Self::row_inline(ui, "Open with", |ui| {
-            // Right to left: listed backwards so they read Click, Hover, Both.
-            for mode in OpenWith::ALL.into_iter().rev() {
-                if Self::segment(ui, mode.label(), input.open_with == mode).clicked()
-                    && input.open_with != mode
-                {
-                    input.open_with = mode;
-                    *cx.changed = true;
-                }
-            }
-        });
-        ui.label(
-            RichText::new(match input.open_with {
-                OpenWith::Click => {
-                    "Click the pill to open it; it stays open until you click somewhere else. \
-                     Resting the cursor on it only makes it grow a little."
-                }
-                OpenWith::Hover => {
-                    "Rest the cursor on the pill to open it, move away to close it. Clicking \
-                     the pill does nothing until it is open."
-                }
-                OpenWith::Both => {
-                    "A click opens it and keeps it open until you click elsewhere. Resting the \
-                     cursor opens it only while you stay."
-                }
-            })
-            .size(11.0)
-            .color(theme::text_secondary()),
-        );
-        ui.add_space(14.0);
-
-        if input.open_with.hovers() {
-            Self::row_stacked(
-                ui,
-                "Hover delay",
-                Some(
-                    "How long the cursor has to rest on the pill before it opens. Sweeping \
-                     across it on the way to a tab never counts, whatever this says.",
-                ),
-                |ui| {
-                    *cx.changed |= Self::slider_line(
-                        ui,
-                        "Delay",
-                        egui::Slider::new(
-                            &mut input.hover_delay_ms,
-                            0..=InputConfig::MAX_HOVER_DELAY_MS,
-                        )
-                        .suffix(" ms"),
-                    );
-                },
-            );
-            *cx.changed |= ui
-                .toggle(
-                    &mut input.hover_in_fullscreen,
-                    "Open on hover over full-screen apps and games",
-                )
-                .changed();
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Off, a full-screen video, game or presentation never has the notch drop \
-                     open over it by accident. A click or a shortcut still opens it.",
-                )
-                .size(11.0)
-                .color(theme::text_secondary()),
-            );
-            ui.add_space(12.0);
-        }
-
-        if input.open_with == OpenWith::Click && cx.cfg.notch.click_through {
-            ui.label(
-                RichText::new(
-                    "Clicks pass through the notch right now, so a plain click cannot open it. \
-                     Use a shortcut or a mouse trigger below, or switch on hover.",
-                )
-                .size(11.5)
-                .color(WARNING),
-            );
-            ui.add_space(8.0);
-        }
-    }
-
-    fn sec_wheel_and_mouse(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::section_title(ui, "WHEEL AND MOUSE");
-        let notch = &mut cx.cfg.notch;
-        let current = notch.scroll_pages();
-        Self::row_inline(ui, "Scroll changes pages", |ui| {
-            egui::ComboBox::from_id_salt("scroll_pages")
-                .selected_text(current.label())
-                .show_ui(ui, |ui| {
-                    for mode in ScrollPages::ALL {
-                        if ui.selectable_label(current == mode, mode.label()).clicked() {
-                            notch.input.scroll = Some(mode);
-                            // Kept in step for anything that reads the old switch.
-                            notch.scroll_to_switch = mode != ScrollPages::Off;
-                            *cx.changed = true;
-                        }
-                    }
-                });
-        });
-
-        let trigger = notch.input.mouse_trigger;
-        Self::row_inline(ui, "Open or close with", |ui| {
-            egui::ComboBox::from_id_salt("mouse_trigger")
-                .selected_text(trigger.label())
-                .show_ui(ui, |ui| {
-                    for kind in MouseTrigger::ALL {
-                        if ui.selectable_label(trigger == kind, kind.label()).clicked() {
-                            notch.input.mouse_trigger = kind;
-                            *cx.changed = true;
-                        }
-                    }
-                });
-        });
         ui.label(
             RichText::new(
-                "Only over the notch: everywhere else the button does what it always does. It \
-                 also works while clicks pass through. Right-click the notch for its menu.",
+                "Everything about driving the notch, in one place. If it ever ends up in a \
+                 state you cannot use, Reset controls (here, at the top right, or in the tray \
+                 menu) puts all of this back.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
         );
+        ui.add_space(8.0);
+        if ui.button("Reset controls").clicked() {
+            cx.cfg.notch.input.reset_behaviour();
+            cx.cfg.notch.click_through = false;
+            *cx.changed = true;
+        }
+        ui.add_space(14.0);
+
+        Self::sec_opening(ui, cx);
+        Self::divider(ui);
+        Self::sec_closing(ui, cx);
+        Self::divider(ui);
+        Self::sec_click_through(ui, cx);
+        Self::divider(ui);
+        Self::sec_menu_and_pages(ui, cx);
+        Self::divider(ui);
+        Self::sec_shortcuts(ui, cx);
+        cx.cfg.notch.input.clean();
+    }
+
+    /// A row of on/off chips: each is a switch, several can be on.
+    fn chips(ui: &mut egui::Ui, label: &str, items: &mut [(&str, &mut bool)], changed: &mut bool) {
+        Self::row_inline(ui, label, |ui| {
+            // Right to left: listed backwards so they read in order.
+            for (name, on) in items.iter_mut().rev() {
+                if Self::segment(ui, name, **on).clicked() {
+                    **on = !**on;
+                    *changed = true;
+                }
+            }
+        });
+    }
+
+    fn note(ui: &mut egui::Ui, text: &str) {
+        ui.label(
+            RichText::new(text)
+                .size(11.0)
+                .color(theme::text_secondary()),
+        );
         ui.add_space(12.0);
+    }
+
+    fn sec_opening(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "OPEN");
+        let input = &mut cx.cfg.notch.input;
+        let mut hover = input.open_with.hovers();
+        let mut click = input.open_with.clicks();
+        let mut edited = false;
+        Self::chips(
+            ui,
+            "Open with",
+            &mut [("Hover", &mut hover), ("Click", &mut click)],
+            &mut edited,
+        );
+        if edited {
+            // One of the two always stays on.
+            input.open_with = match (hover, click) {
+                (true, true) => OpenWith::Both,
+                (true, false) => OpenWith::Hover,
+                (false, true) => OpenWith::Click,
+                (false, false) if input.open_with.hovers() => OpenWith::Click,
+                (false, false) => OpenWith::Hover,
+            };
+            *cx.changed = true;
+        }
+        Self::note(
+            ui,
+            match input.open_with {
+                OpenWith::Click => "Click the pill to open it. Hovering does nothing at all.",
+                OpenWith::Hover => "Rest the cursor on the pill to open it. Clicks do not open it.",
+                OpenWith::Both => "Either opens it: a click at once, a hover after the delay.",
+            },
+        );
+
+        if input.open_with.hovers() {
+            *cx.changed |= Self::slider_line(
+                ui,
+                "Delay",
+                egui::Slider::new(
+                    &mut input.hover_delay_ms,
+                    0..=InputConfig::MAX_HOVER_DELAY_MS,
+                )
+                .suffix(" ms"),
+            );
+            ui.add_space(6.0);
+            *cx.changed |= ui
+                .toggle(
+                    &mut input.hover_in_fullscreen,
+                    "Also open on hover over full-screen apps and games",
+                )
+                .changed();
+            ui.add_space(12.0);
+        }
+
+        if input.open_with.clicks() {
+            let trigger = input.mouse_trigger;
+            let shown = |kind: MouseTrigger| -> &'static str {
+                match kind {
+                    MouseTrigger::Off => "Plain click",
+                    other => other.label(),
+                }
+            };
+            Self::row_inline(ui, "Click with", |ui| {
+                egui::ComboBox::from_id_salt("mouse_trigger")
+                    .selected_text(shown(trigger))
+                    .show_ui(ui, |ui| {
+                        for kind in MouseTrigger::ALL {
+                            if ui.selectable_label(trigger == kind, shown(kind)).clicked() {
+                                input.mouse_trigger = kind;
+                                *cx.changed = true;
+                            }
+                        }
+                    });
+            });
+            Self::note(
+                ui,
+                if trigger == MouseTrigger::Off {
+                    "Any click on the pill opens it."
+                } else {
+                    "Only this gesture opens it; a plain click on the pill does nothing. It \
+                     works even while clicks pass through."
+                },
+            );
+        }
+    }
+
+    fn sec_closing(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "CLOSE");
+        let input = &mut cx.cfg.notch.input;
+        Self::chips(
+            ui,
+            "Close with",
+            &mut [
+                ("Esc key", &mut input.close_on_esc),
+                ("Click outside", &mut input.close_on_outside_click),
+                ("Cursor leaves", &mut input.close_on_leave),
+            ],
+            cx.changed,
+        );
+        input.clean();
+        Self::note(
+            ui,
+            "Any that are on close it. Esc is only taken while the notch is open, so it \
+             reaches your other apps the rest of the time. At least one stays on, so the \
+             notch can always be closed.",
+        );
+        if input.close_on_leave {
+            *cx.changed |= Self::slider_line(
+                ui,
+                "After",
+                egui::Slider::new(&mut cx.cfg.notch.collapse_delay_ms, 0..=1500).suffix(" ms"),
+            );
+            ui.add_space(12.0);
+        }
+    }
+
+    fn sec_click_through(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "CLICKS PASS THROUGH");
+        *cx.changed |= ui
+            .toggle(
+                &mut cx.cfg.notch.click_through,
+                "Let clicks go to the window underneath",
+            )
+            .changed();
+        ui.add_space(4.0);
+        Self::note(
+            ui,
+            "The notch still opens on hover and still answers the wheel, its right-click \
+             menu and your shortcuts. To switch this back off: the right-click menu, both \
+             mouse buttons together on the notch, the tray icon's menu, or the button at the \
+             top right of this window.",
+        );
+    }
+
+    fn sec_menu_and_pages(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "RIGHT-CLICK MENU");
+        let input = &mut cx.cfg.notch.input;
+        Self::chips(
+            ui,
+            "Opens on",
+            &mut [
+                ("Closed pill", &mut input.menu_on_pill),
+                ("Open panel", &mut input.menu_on_panel),
+            ],
+            cx.changed,
+        );
+        Self::note(
+            ui,
+            "Settings, keep open, pause hover, click-through, pages and quit. It works even \
+             while clicks pass through.",
+        );
+
+        Self::section_title(ui, "CHANGE PAGES WITH THE WHEEL");
+        let scroll = cx.cfg.notch.scroll_pages();
+        let mut closed = scroll.applies(false);
+        let mut open = scroll.applies(true);
+        let mut edited = false;
+        Self::chips(
+            ui,
+            "Scroll on",
+            &mut [("Closed pill", &mut closed), ("Open panel", &mut open)],
+            &mut edited,
+        );
+        if edited {
+            let mode = ScrollPages::from_parts(closed, open);
+            cx.cfg.notch.input.scroll = Some(mode);
+            // Kept in step for anything that reads the old switch.
+            cx.cfg.notch.scroll_to_switch = mode != ScrollPages::Off;
+            *cx.changed = true;
+        }
+        Self::note(
+            ui,
+            "On the closed pill, scrolling changes the face it rests on; on the open panel, \
+             the page.",
+        );
     }
 
     fn sec_shortcuts(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {

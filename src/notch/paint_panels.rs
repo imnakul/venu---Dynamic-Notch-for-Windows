@@ -23,10 +23,20 @@ use crate::config::AppConfig;
 use crate::notch::clipboard;
 use crate::notch::geom;
 use crate::notch::layout::{self, Rect, ShelfRow, WAVE_BARS};
+use crate::notch::menu::{self as menu_model, MenuRow, MenuView};
 use crate::notch::shelf::{self, Icon, ShelfEntry};
 use crate::notch::state::NotchState;
 use crate::notch::text::TextEngine;
 use crate::notch::theme;
+use windows::core::Interface;
+use windows::Foundation::Numerics::Matrix3x2;
+use windows::Win32::Graphics::Direct2D::{
+    ID2D1Factory, ID2D1Layer, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_LAYER_OPTIONS_NONE,
+    D2D1_LAYER_PARAMETERS, D2D1_ROUNDED_RECT,
+};
+
+/// A warm red for destructive menu items.
+const DANGER: theme::Rgba = [0.96, 0.40, 0.38, 1.0];
 
 /// Segoe MDL2 Assets glyphs used here.
 const GLYPH_PASTE: &str = "\u{E77F}";
@@ -69,6 +79,355 @@ pub fn shelf_entry_at(body: D2D_RECT_F, x: f32, y: f32) -> Option<ShelfEntry> {
 }
 
 impl Painter {
+    // -- buttons, hover and press -------------------------------------------------
+
+    /// A round icon button: a soft chip with a glyph, lit in the accent when
+    /// `active` (a held pin). Hover and press come from `paint_feedback`.
+    pub(super) fn chip_button(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        (cx, cy, r): (f32, f32, f32),
+        glyph: &str,
+        active: bool,
+        alpha: f32,
+    ) {
+        let chip = r + 4.0;
+        if active {
+            self.dot(t, cx, cy, chip, theme::fade(cfg.notch.accent, alpha * 0.22));
+            self.glyph(t, glyph, 12.0, cx, cy, theme::fade(cfg.notch.accent, alpha));
+        } else {
+            self.dot(t, cx, cy, chip, theme::fade(self.pal.well, alpha * 1.3));
+            self.glyph(
+                t,
+                glyph,
+                12.0,
+                cx,
+                cy,
+                theme::fade(self.pal.text_mid, alpha),
+            );
+        }
+    }
+
+    /// Hover highlight and click ripple over the panel's clickable targets.
+    /// The highlight fades in and out on its own spring; a click sends a
+    /// ripple out from where it landed, clipped to the target's shape.
+    pub(super) fn paint_feedback(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        factory: &ID2D1Factory,
+        cfg: &AppConfig,
+        state: &NotchState,
+        alpha: f32,
+    ) {
+        if let Some(target) = state.hot_shown {
+            let a = state.hot_amount.value.clamp(0.0, 1.0) * alpha;
+            if a > 0.004 {
+                self.fill_rrect(
+                    t,
+                    d2d(target.rect),
+                    target.radius,
+                    theme::fade(self.pal.text_hi, a * 0.075),
+                );
+            }
+        }
+
+        let Some(press) = state.press else {
+            return;
+        };
+        let p = press.progress();
+        let ease = 1.0 - (1.0 - p).powi(3);
+        let fade = (1.0 - p).powi(2) * alpha;
+        let rect = d2d(press.target.rect);
+
+        // A brief accent wash over the whole target…
+        self.fill_rrect(
+            t,
+            rect,
+            press.target.radius,
+            theme::fade(cfg.notch.accent, fade * 0.16),
+        );
+
+        // …and a ripple from the click, inside the target's own shape.
+        let reach = {
+            let dx = (press.x - rect.left).max(rect.right - press.x);
+            let dy = (press.y - rect.top).max(rect.bottom - press.y);
+            (dx * dx + dy * dy).sqrt()
+        };
+        let rr = D2D1_ROUNDED_RECT {
+            rect,
+            radiusX: press.target.radius,
+            radiusY: press.target.radius,
+        };
+        let Ok(mask) = (unsafe { factory.CreateRoundedRectangleGeometry(&rr) }) else {
+            return;
+        };
+        let params = D2D1_LAYER_PARAMETERS {
+            contentBounds: rect,
+            geometricMask: std::mem::ManuallyDrop::new(mask.cast().ok()),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        unsafe { t.PushLayer(&params, None::<&ID2D1Layer>) };
+        drop(std::mem::ManuallyDrop::into_inner(params.geometricMask));
+        self.dot(
+            t,
+            press.x,
+            press.y,
+            (reach * ease).max(2.0),
+            theme::fade(cfg.notch.accent, fade * 0.28),
+        );
+        unsafe { t.PopLayer() };
+    }
+
+    // -- the right-click menu ------------------------------------------------------
+
+    /// The menu card, made of the same glass as the notch: the blurred
+    /// desktop behind it on glass themes, the notch's surface, edge and
+    /// sheen on every theme. It fades in while rising a few pixels from the
+    /// click, and fades out the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn paint_menu(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        factory: &ID2D1Factory,
+        cfg: &AppConfig,
+        menu: &MenuView,
+        origin: (i32, i32),
+        may_capture: bool,
+        panel: &crate::notch::geom::NotchShape,
+        expand: f32,
+    ) {
+        let a = menu.alpha();
+        if a <= 0.004 {
+            return;
+        }
+        let open = menu.open.value.clamp(0.0, 1.0);
+        // Rising into place rather than scaling: the glass is sampled from
+        // the desktop at the card's real position, which a scale would break.
+        let lift = -8.0 * (1.0 - open);
+        let card_rect = menu.rect;
+        let shape = crate::notch::geom::NotchShape {
+            left: card_rect.left,
+            top: card_rect.top + lift,
+            right: card_rect.right,
+            bottom: card_rect.bottom + lift,
+            radius_top: menu_model::RADIUS,
+            radius_bottom: menu_model::RADIUS,
+            flare: 0.0,
+        };
+        let card = D2D_RECT_F {
+            left: shape.left,
+            top: shape.top,
+            right: shape.right,
+            bottom: shape.bottom,
+        };
+        let r = menu_model::RADIUS;
+
+        // Soft shadow: a few widening, fading plates under the card.
+        let depth = self.pal.shadow_strength.max(0.6);
+        for i in 0..4 {
+            let grow = 2.0 + i as f32 * 3.0;
+            let plate = D2D_RECT_F {
+                left: card.left - grow,
+                top: card.top - grow * 0.4,
+                right: card.right + grow,
+                bottom: card.bottom + grow * 1.4,
+            };
+            let fall = 0.075 * (1.0 - i as f32 / 4.0) * depth;
+            self.fill_rrect(t, plate, r + grow, [0.0, 0.0, 0.0, fall * a]);
+        }
+
+        let Ok(geometry) = shape.build(factory) else {
+            return;
+        };
+        // Over the open panel, the desktop behind the card is not what the
+        // eye expects to see through it, so it takes the panel's own tint
+        // there instead of the blur.
+        let over_panel = expand > 0.5
+            && card.left < panel.right
+            && card.right > panel.left
+            && card.top < panel.bottom;
+        let mut surface = cfg.notch.surface;
+        if self.pal.blur_backdrop && may_capture && !over_panel {
+            self.paint_backdrop(t, &[(&geometry, &shape, a)], origin);
+        } else {
+            // No blur to read through: keep the card legible.
+            surface[3] = surface[3].max(0.94);
+        }
+        self.paint_glass(t, factory, &shape, &geometry, surface, a);
+
+        let menu_dy = lift;
+        // The highlight, under the rows.
+        let hl_alpha = menu.hl_alpha.value.clamp(0.0, 1.0) * a;
+        let lit = menu.pressed.or(menu.hot);
+        let lit_danger = lit.is_some_and(|slot| {
+            matches!(
+                menu.rows.get(slot.row),
+                Some(MenuRow::Item { danger: true, .. })
+            )
+        });
+        if hl_alpha > 0.004 {
+            let tone = if lit_danger { DANGER } else { cfg.notch.accent };
+            let strength = if menu.pressed.is_some() { 0.32 } else { 0.17 };
+            let hl = menu.highlight();
+            self.fill_rrect(
+                t,
+                d2d(layout::Rect::new(
+                    hl.left,
+                    hl.top + menu_dy,
+                    hl.right,
+                    hl.bottom + menu_dy,
+                )),
+                8.0,
+                theme::fade(tone, hl_alpha * strength),
+            );
+        }
+
+        let family = &cfg.notch.font_family;
+        let left = card.left + menu_model::PAD;
+        let right = card.right - menu_model::PAD;
+        let mut y = card.top + menu_model::PAD;
+        for (index, row) in menu.rows.iter().enumerate() {
+            let lit_here = lit.is_some_and(|slot| slot.row == index);
+            match row {
+                MenuRow::Separator => {
+                    let ry = (y + menu_model::SEP_H * 0.5).round();
+                    self.fill_rrect(
+                        t,
+                        D2D_RECT_F {
+                            left: left + 8.0,
+                            top: ry - 0.5,
+                            right: right - 8.0,
+                            bottom: ry + 0.5,
+                        },
+                        0.5,
+                        theme::fade(self.pal.rule, a),
+                    );
+                    y += menu_model::SEP_H;
+                    continue;
+                }
+                MenuRow::Item {
+                    label,
+                    glyph,
+                    toggle,
+                    danger,
+                    ..
+                } => {
+                    let cy = y + menu_model::ROW_H * 0.5;
+                    let tone = if *danger && lit_here {
+                        DANGER
+                    } else if lit_here {
+                        cfg.notch.accent
+                    } else {
+                        self.pal.text_mid
+                    };
+                    self.glyph(t, glyph, 12.0, left + 16.0, cy, theme::fade(tone, a));
+                    let text_tone = if *danger && lit_here {
+                        DANGER
+                    } else {
+                        self.pal.text_hi
+                    };
+                    if let Some((layout, _, h)) =
+                        self.measure_text(family, label, 12.5, DWRITE_FONT_WEIGHT_MEDIUM)
+                    {
+                        self.draw_layout(
+                            t,
+                            &layout,
+                            left + 34.0,
+                            cy - h * 0.5,
+                            theme::fade(text_tone, a),
+                        );
+                    }
+                    if let Some(on) = toggle {
+                        self.switch(t, cfg, right - 10.0, cy, *on, a);
+                    }
+                }
+                MenuRow::Pair(first, second) => {
+                    let cy = y + menu_model::ROW_H * 0.5;
+                    let mid = (left + right) * 0.5;
+                    self.fill_rrect(
+                        t,
+                        D2D_RECT_F {
+                            left: mid - 0.5,
+                            top: cy - 8.0,
+                            right: mid + 0.5,
+                            bottom: cy + 8.0,
+                        },
+                        0.5,
+                        theme::fade(self.pal.rule, a),
+                    );
+                    for (half, item) in [(0u8, first), (1u8, second)] {
+                        let hot = lit.is_some_and(|s| s.row == index && s.half == half);
+                        let tone = if hot {
+                            cfg.notch.accent
+                        } else {
+                            self.pal.text_mid
+                        };
+                        let (from, to) = if half == 0 { (left, mid) } else { (mid, right) };
+                        let centre = (from + to) * 0.5;
+                        if let Some((layout, w, h)) =
+                            self.measure_text(family, item.label, 12.5, DWRITE_FONT_WEIGHT_MEDIUM)
+                        {
+                            let group = w + 20.0;
+                            let start = centre - group * 0.5;
+                            // Arrows point outward: ‹ Previous | Next ›.
+                            let (glyph_x, text_x) = if half == 0 {
+                                (start + 6.0, start + 20.0)
+                            } else {
+                                (start + w + 14.0, start)
+                            };
+                            self.glyph(t, item.glyph, 11.0, glyph_x, cy, theme::fade(tone, a));
+                            self.draw_layout(
+                                t,
+                                &layout,
+                                text_x,
+                                cy - h * 0.5,
+                                theme::fade(self.pal.text_hi, a),
+                            );
+                        }
+                    }
+                }
+            }
+            y += menu_model::ROW_H;
+        }
+    }
+
+    /// A small on/off switch ending at `right`, centred on `cy`.
+    fn switch(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        right: f32,
+        cy: f32,
+        on: bool,
+        a: f32,
+    ) {
+        let (w, h) = (26.0, 15.0);
+        let track = D2D_RECT_F {
+            left: right - w,
+            top: cy - h * 0.5,
+            right,
+            bottom: cy + h * 0.5,
+        };
+        if on {
+            self.fill_rrect(t, track, h * 0.5, theme::fade(cfg.notch.accent, a));
+            self.dot(t, right - h * 0.5, cy, h * 0.5 - 2.0, [1.0, 1.0, 1.0, a]);
+        } else {
+            self.fill_rrect(t, track, h * 0.5, theme::fade(self.pal.well, a * 2.6));
+            self.dot(
+                t,
+                right - w + h * 0.5,
+                cy,
+                h * 0.5 - 2.0,
+                theme::fade(self.pal.text_lo, a),
+            );
+        }
+    }
+
     // -- the music wave -------------------------------------------------------
 
     /// Equaliser bars centred on `(cx, cy)`. `bars` come from the audio

@@ -92,6 +92,16 @@ const RELEASE_X: u8 = 3;
 static WATCH_OUTSIDE: AtomicBool = AtomicBool::new(false);
 static OUTSIDE: AtomicBool = AtomicBool::new(false);
 
+/// Right-click over the notch opens its menu, when the setting allows it for
+/// the state the notch is in.
+static MENU_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// A right press over the notch is under way; its release opens the menu.
+static R_PENDING: AtomicBool = AtomicBool::new(false);
+/// Latched by that release, with where it happened, until consumed.
+static MENU_LATCH: AtomicBool = AtomicBool::new(false);
+static MENU_X: AtomicI32 = AtomicI32::new(0);
+static MENU_Y: AtomicI32 = AtomicI32::new(0);
+
 static INSTALL: Once = Once::new();
 
 /// Install the hook on its own thread. Idempotent; safe to call every frame.
@@ -145,6 +155,9 @@ pub struct Watch {
     pub trigger: MouseTrigger,
     /// The notch is held open by a click: a press outside it closes it.
     pub outside: bool,
+    /// Right-click over the notch opens its menu. Taken here rather than
+    /// from window messages, so it works while clicks pass through.
+    pub menu: bool,
     /// Screen-space bounds of the notch.
     pub bounds: (i32, i32, i32, i32),
 }
@@ -158,6 +171,7 @@ pub fn publish(watch: Watch) {
     BOUND_B.store(bottom, Ordering::Relaxed);
     TRIGGER_KIND.store(trigger_code(watch.trigger), Ordering::Release);
     WATCH_OUTSIDE.store(watch.outside, Ordering::Release);
+    MENU_ACTIVE.store(watch.menu, Ordering::Release);
     WHEEL_ACTIVE.store(watch.wheel, Ordering::Release);
     CHORD_ACTIVE.store(watch.chord, Ordering::Release);
 }
@@ -180,6 +194,16 @@ pub fn take_chord() -> bool {
 /// Consume a pending mouse-trigger press over the notch.
 pub fn take_trigger() -> bool {
     TRIGGERED.swap(false, Ordering::AcqRel)
+}
+
+/// Consume a right-click over the notch: where it was released, on screen.
+pub fn take_menu() -> Option<(i32, i32)> {
+    MENU_LATCH.swap(false, Ordering::AcqRel).then(|| {
+        (
+            MENU_X.load(Ordering::Acquire),
+            MENU_Y.load(Ordering::Acquire),
+        )
+    })
 }
 
 /// Consume a pending press outside the notch.
@@ -273,6 +297,7 @@ unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             }
 
             if SWALLOWING.load(Ordering::Acquire) {
+                R_PENDING.store(false, Ordering::Release);
                 // Both buttons back up: the chord is over.
                 if !L_DOWN.load(Ordering::Acquire) && !R_DOWN.load(Ordering::Acquire) {
                     SWALLOWING.store(false, Ordering::Release);
@@ -305,6 +330,19 @@ unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                     SWALLOW_RELEASE.store(RELEASE_LEFT, Ordering::Release);
                     return LRESULT(1);
                 }
+
+                // A right press over the notch belongs to its menu: nothing
+                // underneath gets it, click-through or not.
+                if msg == WM_RBUTTONDOWN && inside && MENU_ACTIVE.load(Ordering::Acquire) {
+                    R_PENDING.store(true, Ordering::Release);
+                    return LRESULT(1);
+                }
+            } else if msg == WM_RBUTTONUP && R_PENDING.swap(false, Ordering::AcqRel) {
+                let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                MENU_X.store(info.pt.x, Ordering::Release);
+                MENU_Y.store(info.pt.y, Ordering::Release);
+                MENU_LATCH.store(true, Ordering::Release);
+                return LRESULT(1);
             }
         }
 

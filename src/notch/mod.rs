@@ -44,6 +44,7 @@ pub mod timer;
 pub mod toggles;
 pub mod window;
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -54,6 +55,37 @@ use window::NotchWindow;
 /// Quiet period after the last change before the config is written to disk, so
 /// a burst of typing or scrolling produces one write rather than dozens.
 const SAVE_DEBOUNCE: f32 = 0.9;
+
+/// Requests from outside the notch — the tray menu — carried out on the
+/// next tick. The way back from a setup the notch itself cannot be used to
+/// undo, such as click-through on with hover-only opening.
+pub mod rescue {
+    use super::*;
+
+    pub const OPEN: u8 = 1;
+    pub const TOGGLE_CLICK_THROUGH: u8 = 2;
+    pub const RESET_CONTROLS: u8 = 4;
+
+    static PENDING: AtomicU8 = AtomicU8::new(0);
+    static CLICK_THROUGH_ON: AtomicBool = AtomicBool::new(false);
+
+    pub fn request(what: u8) {
+        PENDING.fetch_or(what, Ordering::AcqRel);
+    }
+
+    pub(super) fn take() -> u8 {
+        PENDING.swap(0, Ordering::AcqRel)
+    }
+
+    /// Whether clicks pass through right now, for the tray menu's tick mark.
+    pub fn click_through_on() -> bool {
+        CLICK_THROUGH_ON.load(Ordering::Acquire)
+    }
+
+    pub(super) fn publish(on: bool) {
+        CLICK_THROUGH_ON.store(on, Ordering::Release);
+    }
+}
 
 pub struct NotchManager {
     config: Arc<RwLock<AppConfig>>,
@@ -92,7 +124,24 @@ impl NotchManager {
     /// poll instead of driving sixty frames a second into a picture that is
     /// not changing.
     pub fn tick(&mut self, dt: f32) -> bool {
-        let enabled = self.config.read().notch.enabled;
+        let requests = rescue::take();
+        if requests & (rescue::TOGGLE_CLICK_THROUGH | rescue::RESET_CONTROLS) != 0 {
+            let mut cfg = self.config.write();
+            if requests & rescue::RESET_CONTROLS != 0 {
+                cfg.notch.input.reset_behaviour();
+                cfg.notch.click_through = false;
+                // A reset is asking to get the notch back.
+                cfg.notch.enabled = true;
+            } else {
+                cfg.notch.click_through = !cfg.notch.click_through;
+            }
+            cfg.save();
+        }
+        let enabled = {
+            let cfg = self.config.read();
+            rescue::publish(cfg.notch.click_through);
+            cfg.notch.enabled
+        };
 
         if !enabled {
             if self.window.is_some() {
@@ -124,6 +173,12 @@ impl NotchManager {
         let Some(window) = self.window.as_mut() else {
             return false;
         };
+        if requests & rescue::OPEN != 0 {
+            window.state.open_sticky();
+        }
+        if requests & rescue::TOGGLE_CLICK_THROUGH != 0 {
+            window.state.flash_click_through();
+        }
 
         // The write lock is held for the frame because inline editing and slide
         // changes mutate the config in place. Contention is with the settings
@@ -147,27 +202,11 @@ impl NotchManager {
             crate::tray::restore_settings_window();
         }
 
-        // The right-click menu, likewise shown with the lock released: it
-        // runs a modal loop until the user picks something or looks away.
-        if let Some(request) = outcome.menu {
-            let owner = window.hwnd();
-            match menu::show(&request, owner) {
-                Some(menu::MenuCommand::Settings) => crate::tray::restore_settings_window(),
-                Some(menu::MenuCommand::Quit) => {
-                    // Anything still waiting on the save debounce goes now.
-                    self.config.read().save();
-                    std::process::exit(0);
-                }
-                Some(command) => {
-                    let mut cfg = self.config.write();
-                    if window.apply_menu(command, &mut cfg) {
-                        self.save_countdown = Some(SAVE_DEBOUNCE);
-                    }
-                }
-                None => {}
-            }
-            // The click that closed the menu must not also close the notch.
-            let _ = hook::take_outside();
+        // Quit from the notch's menu: save anything still waiting on the
+        // debounce, then go — the same exit the tray's Exit takes.
+        if outcome.quit {
+            self.config.read().save();
+            std::process::exit(0);
         }
 
         if outcome.config_dirty {

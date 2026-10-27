@@ -141,8 +141,12 @@ possible while they are on.
   on a left press while a modifier trigger is set.
 - **Shortcuts are `RegisterHotKey`**, delivered as window messages: no keyboard
   hook, nothing per keystroke.
-- **The menu is the system popup menu**, created on right-click and destroyed
-  when it closes.
+- **The menu is drawn by the notch** inside its existing layered window: no
+  extra window, surface or blit. It exists only while open or fading, and
+  repaints only while it moves (open, close, the highlight sliding).
+- **Hover and press feedback** reuse the targets clicks already hit-test; the
+  highlight and ripple are springs in the frame key, so a still panel under a
+  still cursor paints nothing.
 - **Shelf work happens off the render thread.** One thread lists the peeked
   folder, checks pinned paths and asks the shell for icons, only while the
   Shelf is in the deck. It sleeps on a folder change notification, not a
@@ -158,3 +162,13 @@ possible while they are on.
 - **The player's timeline repaints once a second** while the player is open,
   from a position the media poller anchors; the poll itself does not cause a
   repaint unless the track, state or position (a seek) actually changed.
+
+## Closing keys, right-click and the pill's music controls
+
+- **Esc, the arrows and Enter are `RegisterHotKey`s held only while needed**:
+  Esc while the panel or menu is open, the arrows and Enter while the menu
+  is. Nothing listens to the keyboard otherwise.
+- **Right-click is read by the existing mouse hook** (a button press, never
+  a move), so the menu works with click-through on.
+- **The menu's glass** reuses the notch's backdrop capture and glass
+  painter for the card's rectangle, only while the menu is on screen.

@@ -287,15 +287,15 @@ fn main() {
     }
     startup_log::record_event("settings_gui_starting");
 
-    // A fixed-size floating panel rather than a document window: settings
-    // are a handful of short pages, and a window that can be maximised just
-    // spreads them thin. It draws its own title bar so the glass runs edge
-    // to edge.
+    // A floating panel that can be resized from its edges but not maximised:
+    // settings are a handful of pages, and a maximised window just spreads
+    // them thin. It draws its own title bar so the glass runs edge to edge.
     let pinned = config.read().settings_window.pinned;
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
         .with_title("Venu - Settings")
         .with_inner_size(gui::WINDOW_SIZE)
-        .with_resizable(false)
+        .with_min_inner_size(gui::MIN_WINDOW_SIZE)
+        .with_resizable(true)
         .with_maximize_button(false)
         .with_decorations(false)
         .with_transparent(true)

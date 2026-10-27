@@ -42,25 +42,26 @@ use windows::Win32::UI::Shell::{
     QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, RegisterClassW,
-    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
-    GWL_EXSTYLE, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CHAR, WM_DROPFILES, WM_HOTKEY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW,
-    WS_EX_ACCEPTFILES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, LoadCursorW, RegisterClassW,
+    SetCursor, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
+    GWL_EXSTYLE, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, IDC_HAND, SM_CXSCREEN, SM_CYSCREEN,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CHAR,
+    WM_DROPFILES, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_NCHITTEST, WM_SETCURSOR,
+    WNDCLASSW, WS_EX_ACCEPTFILES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config::{
-    AppConfig, BorderEffectConfig, InputConfig, MediaConfig, NotchAlign, NotchTheme, SlideKind,
+    AppConfig, BorderEffectConfig, InputConfig, MediaConfig, MouseTrigger, NotchAlign, NotchTheme,
+    SlideKind,
 };
 use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::audio::{self, AudioMeter};
 use crate::notch::backdrop;
 use crate::notch::geom::NotchShape;
 use crate::notch::hook;
-use crate::notch::layout::{self, PillPart, PodCandidates, PodKind};
-use crate::notch::menu::{MenuCommand, MenuEntry, MenuRequest};
+use crate::notch::layout::{self, Hit, PillPart, PodCandidates, PodKind, Target};
+use crate::notch::menu::{glyph, Half, MenuCommand, MenuRow, MenuView};
 use crate::notch::paint::{clock_key, Motion, Painter, PodDraw, Scene, SegmentDraw};
 use crate::notch::state::{Badge, NotchState};
 use crate::notch::surface::D2DSurface;
@@ -144,6 +145,12 @@ const FULLSCREEN_REFRESH: Duration = Duration::from_secs(1);
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_CLICK_THROUGH: i32 = 2;
 const HOTKEY_PAUSE_HOVER: i32 = 3;
+/// Esc, registered only while the panel or the menu is open; then the
+/// arrows and Enter, only while the menu is. Consecutive ids.
+const HOTKEY_ESCAPE: i32 = 4;
+const HOTKEY_UP: i32 = 5;
+const HOTKEY_DOWN: i32 = 6;
+const HOTKEY_ENTER: i32 = 7;
 
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -174,8 +181,10 @@ struct InputBus {
     /// `WM_LBUTTONDOWN` reports — are offset from the shape's own space by
     /// this much.
     client_offset: (f32, f32),
-    /// A right-click on the notch, in layout coordinates.
-    menu: Option<(f32, f32)>,
+    /// The open menu card, for hit-testing (layout coordinates).
+    menu_rect: Option<layout::Rect>,
+    /// Show the hand cursor: the pointer is on something clickable.
+    hand: bool,
     /// Shortcut ids pressed since the last frame.
     hotkeys: Vec<i32>,
     /// Paths dropped onto the notch.
@@ -191,7 +200,6 @@ struct InputDrain {
     cancel: bool,
     backspace: bool,
     lost_focus: bool,
-    menu: Option<(f32, f32)>,
     hotkeys: Vec<i32>,
     dropped: Vec<String>,
 }
@@ -291,6 +299,8 @@ fn slide_collapsed_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
         // Three metrics need enough room to breathe even when the ordinary
         // collapsed pill is configured for a clock or a short status line.
         SlideKind::Stats => (base_w.max(260.0), base_h.max(30.0)),
+        // Room for the wave, the title and three music controls.
+        SlideKind::Media => (base_w.max(300.0), base_h),
         _ => (base_w, base_h),
     }
 }
@@ -412,6 +422,10 @@ struct FrameKey {
     media_clock: u64,
     /// The short list's add row is being typed into.
     adding_item: bool,
+    /// Hover highlight and click ripple in the panel.
+    feedback: (Option<Hit>, i32, Option<(Hit, i32)>),
+    /// The menu card's motion and highlight.
+    menu: Option<[i32; 6]>,
 }
 
 /// What one frame of the notch asked for.
@@ -422,12 +436,13 @@ pub struct TickOutcome {
     /// this is false the overlay thread drops to a slow poll that watches for
     /// hover and input without drawing anything.
     pub animating: bool,
-    /// The Settings button was clicked. The overlay thread has to raise the
+    /// Open Settings was picked in the menu. The overlay thread has to raise the
     /// Settings window itself once it has dropped the config write lock -- see
     /// `NotchManager::tick`.
     pub open_settings: bool,
-    /// A right-click menu to show, once the config lock is released.
-    pub menu: Option<MenuRequest>,
+    /// Quit was picked from the menu: save and exit, once the config lock
+    /// is released.
+    pub quit: bool,
 }
 
 pub struct NotchWindow {
@@ -455,7 +470,7 @@ pub struct NotchWindow {
     last_motion: Motion,
     last_paint: Instant,
     z_asserted_at: Instant,
-    /// Set by the Settings button, consumed at the end of `tick`. See
+    /// Set by the menu's Open Settings, consumed at the end of `tick`. See
     /// `TickOutcome::open_settings`.
     open_settings: bool,
     /// What pods could show, re-read every [`POD_POLL`] while pods are on.
@@ -470,10 +485,14 @@ pub struct NotchWindow {
     /// A full-screen app, game or presentation is in front.
     fullscreen: bool,
     fullscreen_read_at: Instant,
-    /// A right-click menu waiting to be shown.
-    menu: Option<MenuRequest>,
+    /// The right-click menu, while it is open or fading out.
+    menu: Option<MenuView>,
+    /// Quit was picked from the menu.
+    quit: bool,
     /// The shortcuts as currently registered with Windows.
     hotkeys: [Option<(u32, u32)>; 3],
+    /// Which of Esc, Up, Down and Enter are registered right now.
+    modal_keys: [bool; 4],
     /// The live music wave.
     audio: AudioMeter,
 }
@@ -562,7 +581,9 @@ impl NotchWindow {
             fullscreen: false,
             fullscreen_read_at: Instant::now() - FULLSCREEN_REFRESH,
             menu: None,
+            quit: false,
             hotkeys: [None; 3],
+            modal_keys: [false; 4],
             audio: AudioMeter::default(),
         })
     }
@@ -634,6 +655,11 @@ impl NotchWindow {
             + layout::max_split_extra(&cfg.notch.split)
             + 2.0 * layout::max_pod_reach(&cfg.notch.pods, shoulder);
         expanded_w = expanded_w.max(pill_footprint);
+
+        // Room below the top for the right-click menu card, which may open
+        // from the pill. The window is trimmed to what is drawn, so this only
+        // sizes the off-screen surface, never what is on screen.
+        let expanded_h = expanded_h.max(crate::notch::menu::MAX_H);
 
         let expanded_w = expanded_w.ceil() as i32;
         let expanded_h = expanded_h.ceil() as i32;
@@ -759,10 +785,19 @@ impl NotchWindow {
             r = r.max(pod.shape.right + pod.shape.flare);
         }
 
+        let (mut top_edge, mut bottom_edge) = (shape.top, shape.bottom);
+        // The menu card, with room for its shadow.
+        if let Some(menu) = &self.menu {
+            l = l.min(menu.rect.left - 6.0);
+            r = r.max(menu.rect.right + 6.0);
+            top_edge = top_edge.min(menu.rect.top - 6.0);
+            bottom_edge = bottom_edge.max(menu.rect.bottom + 12.0);
+        }
+
         let left = (l - reach).floor().max(0.0) as i32;
-        let top = (shape.top - reach).floor().max(0.0) as i32;
+        let top = (top_edge - reach).floor().max(0.0) as i32;
         let right = (r + reach).ceil().min(self.placement.w as f32) as i32;
-        let bottom = (shape.bottom + reach).ceil().min(self.placement.h as f32) as i32;
+        let bottom = (bottom_edge + reach).ceil().min(self.placement.h as f32) as i32;
 
         RECT {
             left,
@@ -855,11 +890,6 @@ impl NotchWindow {
             },
             media: pods.media && self.painter.media.snapshot().playing,
         };
-    }
-
-    /// The window, for things that need an owner (the right-click menu).
-    pub fn hwnd(&self) -> HWND {
-        self.hwnd
     }
 
     /// The pod under a point, if any.
@@ -989,6 +1019,44 @@ impl NotchWindow {
         }
     }
 
+    /// Keys the notch only takes while it needs them: Esc while the panel
+    /// or the menu is open (to close it), and the arrows and Enter while the
+    /// menu is open (to move through it). Every other moment they belong to
+    /// whatever app has focus.
+    fn sync_modal_keys(&mut self, cfg: &AppConfig) {
+        const MOD_NOREPEAT: u32 = 0x4000;
+        let menu_up = self.menu.as_ref().is_some_and(|m| !m.closing);
+        let escape = !self.state.editing
+            && (menu_up || (cfg.notch.input.close_on_esc && self.state.open_target));
+        // (id, virtual key, wanted). Arrows repeat while held.
+        let keys = [
+            (HOTKEY_ESCAPE, 0x1B, escape, MOD_NOREPEAT),
+            (HOTKEY_UP, 0x26, menu_up, 0),
+            (HOTKEY_DOWN, 0x28, menu_up, 0),
+            (HOTKEY_ENTER, 0x0D, menu_up, MOD_NOREPEAT),
+        ];
+        for (slot, (id, vk, want, mods)) in keys.into_iter().enumerate() {
+            if want == self.modal_keys[slot] {
+                continue;
+            }
+            unsafe {
+                if want {
+                    // Refused if another app holds the key globally; the
+                    // mouse and a click outside still work, so no retry storm:
+                    // it is tried again the next time it is wanted.
+                    self.modal_keys[slot] =
+                        RegisterHotKey(self.hwnd, id, HOT_KEY_MODIFIERS(mods), vk).is_ok();
+                    if !self.modal_keys[slot] {
+                        continue;
+                    }
+                } else {
+                    let _ = UnregisterHotKey(self.hwnd, id);
+                    self.modal_keys[slot] = false;
+                }
+            }
+        }
+    }
+
     /// Pin files dropped on the notch, and open onto the Shelf to show them.
     fn pin_dropped(&mut self, cfg: &mut AppConfig, paths: &[String]) -> bool {
         let mut changed = false;
@@ -1007,13 +1075,9 @@ impl NotchWindow {
         true
     }
 
-    /// The right-click menu for a point on the notch.
-    fn menu_for(&self, cfg: &AppConfig, cx: f32, cy: f32, shape: NotchShape) -> MenuRequest {
-        let mut at = POINT::default();
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at);
-        }
-        let mut entries = Vec::new();
+    /// The right-click menu's rows for a point on the notch.
+    fn menu_for(&self, cfg: &AppConfig, cx: f32, cy: f32, shape: NotchShape) -> Vec<MenuRow> {
+        let mut rows = Vec::new();
 
         let open = self.state.is_open();
         let slide = cfg.notch.effective_slides().get(self.state.active).copied();
@@ -1021,65 +1085,128 @@ impl NotchWindow {
             let body = crate::notch::geom::slide_body(shape);
             if let Some(entry) = crate::notch::paint::shelf_entry_at(body, cx, cy) {
                 let path = entry.path.clone();
-                entries.push(MenuEntry::item(MenuCommand::Open(path.clone()), "Open"));
+                rows.push(MenuRow::item(
+                    MenuCommand::Open(path.clone()),
+                    "Open",
+                    glyph::OPEN,
+                ));
                 if entry.exists {
-                    entries.push(MenuEntry::item(MenuCommand::CopyFile(path.clone()), "Copy"));
+                    rows.push(MenuRow::item(
+                        MenuCommand::CopyFile(path.clone()),
+                        "Copy",
+                        glyph::COPY,
+                    ));
                 }
-                entries.push(MenuEntry::item(
+                rows.push(MenuRow::item(
                     MenuCommand::CopyPath(path.clone()),
                     "Copy path",
+                    glyph::LINK,
                 ));
-                entries.push(MenuEntry::item(
+                rows.push(MenuRow::item(
                     MenuCommand::Reveal(path.clone()),
                     "Show in folder",
+                    glyph::FOLDER,
                 ));
-                entries.push(if entry.pinned {
-                    MenuEntry::item(MenuCommand::Unpin(path), "Remove from Shelf")
+                rows.push(if entry.pinned {
+                    MenuRow::danger(MenuCommand::Unpin(path), "Remove from Shelf", glyph::UNPIN)
                 } else {
-                    MenuEntry::item(MenuCommand::Pin(path), "Pin to Shelf")
+                    MenuRow::item(MenuCommand::Pin(path), "Pin to Shelf", glyph::PIN)
                 });
-                entries.push(MenuEntry::Separator);
+                rows.push(MenuRow::Separator);
             }
         }
         if open && slide == Some(SlideKind::Clipboard) && crate::notch::clipboard::len() > 0 {
-            entries.push(MenuEntry::item(
+            rows.push(MenuRow::danger(
                 MenuCommand::ClearClipboard,
                 "Clear clipboard history",
+                glyph::CLEAR,
             ));
-            entries.push(MenuEntry::Separator);
+            rows.push(MenuRow::Separator);
         }
 
-        entries.push(MenuEntry::item(MenuCommand::Settings, "Open Settings"));
-        entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::check(
+        rows.push(MenuRow::item(
+            MenuCommand::Settings,
+            "Open Settings",
+            glyph::SETTINGS,
+        ));
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::toggle(
             MenuCommand::TogglePin,
             "Keep open",
+            glyph::PIN,
             self.state.pinned,
         ));
         if cfg.notch.input.open_with.hovers() {
-            entries.push(if self.state.hover_paused() {
-                MenuEntry::item(MenuCommand::ResumeHover, "Resume hover")
-            } else {
-                MenuEntry::item(MenuCommand::PauseHover, "Pause hover for 1 hour")
-            });
+            let paused = self.state.hover_paused();
+            rows.push(MenuRow::toggle(
+                if paused {
+                    MenuCommand::ResumeHover
+                } else {
+                    MenuCommand::PauseHover
+                },
+                "Pause hover for 1 hour",
+                glyph::PAUSE,
+                paused,
+            ));
         }
-        entries.push(MenuEntry::check(
+        rows.push(MenuRow::toggle(
             MenuCommand::ToggleClickThrough,
             "Let clicks pass through",
+            glyph::POINTER,
             cfg.notch.click_through,
         ));
-        entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::item(MenuCommand::NextPage, "Next page"));
-        entries.push(MenuEntry::item(MenuCommand::PreviousPage, "Previous page"));
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Pair(
+            Half {
+                command: MenuCommand::PreviousPage,
+                label: "Previous",
+                glyph: glyph::PREVIOUS,
+            },
+            Half {
+                command: MenuCommand::NextPage,
+                label: "Next",
+                glyph: glyph::NEXT,
+            },
+        ));
         if open {
-            entries.push(MenuEntry::item(MenuCommand::Close, "Close"));
+            rows.push(MenuRow::item(
+                MenuCommand::Close,
+                "Close the notch",
+                glyph::CLOSE,
+            ));
         }
-        entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::item(MenuCommand::Quit, "Quit Venu"));
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::danger(
+            MenuCommand::Quit,
+            "Quit Venu",
+            glyph::POWER,
+        ));
+        rows
+    }
 
-        MenuRequest {
-            at: (at.x, at.y),
-            entries,
+    /// The area the menu may use: the window's whole layout frame.
+    fn menu_frame(&self) -> layout::Rect {
+        layout::Rect::new(
+            0.0,
+            self.placement.top,
+            self.placement.w as f32,
+            self.placement.h as f32,
+        )
+    }
+
+    /// Run a menu choice from inside the tick. Returns whether the config
+    /// needs saving.
+    fn run_menu_command(&mut self, command: MenuCommand, cfg: &mut AppConfig) -> bool {
+        match command {
+            MenuCommand::Settings => {
+                self.open_settings = true;
+                false
+            }
+            MenuCommand::Quit => {
+                self.quit = true;
+                false
+            }
+            other => self.apply_menu(other, cfg),
         }
     }
 
@@ -1270,7 +1397,13 @@ impl NotchWindow {
             && cursor
                 .zip(self.hold_zone)
                 .is_some_and(|((x, y), zone)| zone.contains(x, y));
-        let over = on_pill || on_pod.is_some() || held;
+        // The menu card counts as the notch: resting on it keeps an open
+        // panel open, and nothing behind it opens while it is up.
+        let menu_up = self.menu.as_ref().is_some_and(|m| !m.closing);
+        let on_menu = menu_up
+            && cursor
+                .is_some_and(|(x, y)| self.menu.as_ref().is_some_and(|m| m.rect.contains(x, y)));
+        let over = on_pill || on_pod.is_some() || held || on_menu;
         let on_target = on_pill || on_pod.is_some();
 
         // How fast the cursor is moving, so sweeping across the pill on the
@@ -1292,6 +1425,7 @@ impl NotchWindow {
             .active_toast
             .is_some();
         let hover_ok = open_with.hovers()
+            && !menu_up
             && !self.state.hover_paused()
             && !self.state.hover_blocked
             && !hook::button_held()
@@ -1309,16 +1443,31 @@ impl NotchWindow {
             self.state.dwell = 0.0;
         }
         let hover_opens = hover_ok && on_target && self.state.dwell >= delay;
-        let hover_hold =
-            over && !self.state.hover_blocked && (self.state.open_target || hover_opens);
+        // A click-opened panel stays until the cursor has been on it and
+        // left (when leaving closes it), so a shortcut can open it from
+        // anywhere without it closing at once.
+        if self.state.sticky && over {
+            self.state.sticky_entered = true;
+        }
+        if self.state.sticky && self.state.sticky_entered && !over && cfg.notch.input.close_on_leave
+        {
+            self.state.release_sticky();
+        }
+        // With "close when the cursor leaves" off, an open panel stays open
+        // until Esc or a click elsewhere.
+        let keep_open = self.state.open_target && !cfg.notch.input.close_on_leave;
+        let hover_hold = keep_open
+            || (over && !self.state.hover_blocked && (self.state.open_target || hover_opens));
 
         // The closed pill grows a touch under the cursor: it says "this
         // opens", and while hover is counting down it says "about to".
+        // Only when hover can open it: with click-only opening, a pill that
+        // grows under the cursor would promise something hover will not do.
         self.state.peeking = on_target
             && !self.state.open_target
             && !toast_up
             && !self.state.hover_blocked
-            && (open_with.clicks() || hover_ok);
+            && hover_ok;
 
         // Arriving on a split segment or a pod opens the panel straight onto
         // that slide. Decided once, as the panel starts to open.
@@ -1335,8 +1484,16 @@ impl NotchWindow {
 
         // The mouse trigger and the shortcuts open or close the notch.
         let mut toggle = hook::take_trigger();
-        if hook::take_outside() && self.state.sticky && !self.state.pinned {
-            self.state.release_sticky();
+        if hook::take_outside() {
+            // A click elsewhere closes the menu first; only then the panel.
+            if let Some(menu) = self.menu.as_mut().filter(|m| !m.closing) {
+                menu.close();
+            } else if cfg.notch.input.close_on_outside_click
+                && self.state.open_target
+                && !self.state.pinned
+            {
+                self.state.close_now();
+            }
         }
 
         let drained = with_input(|bus| {
@@ -1346,7 +1503,6 @@ impl NotchWindow {
             let cancel = std::mem::replace(&mut bus.cancel, false);
             let backspace = std::mem::replace(&mut bus.backspace, false);
             let lost_focus = std::mem::replace(&mut bus.lost_focus, false);
-            let menu = bus.menu.take();
             let hotkeys = std::mem::take(&mut bus.hotkeys);
             let dropped = std::mem::take(&mut bus.dropped);
             InputDrain {
@@ -1356,7 +1512,6 @@ impl NotchWindow {
                 cancel,
                 backspace,
                 lost_focus,
-                menu,
                 hotkeys,
                 dropped,
             }
@@ -1367,6 +1522,27 @@ impl NotchWindow {
             match *id {
                 HOTKEY_TOGGLE => toggle = true,
                 HOTKEY_CLICK_THROUGH => flip_click_through = true,
+                HOTKEY_ESCAPE => {
+                    if let Some(menu) = self.menu.as_mut().filter(|m| !m.closing) {
+                        menu.close();
+                    } else if self.state.editing {
+                        self.state.cancel_edit();
+                        self.set_editing_style(cfg, false);
+                    } else {
+                        self.state.close_now();
+                    }
+                }
+                HOTKEY_UP | HOTKEY_DOWN => {
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.step_keyboard(*id == HOTKEY_DOWN);
+                    }
+                }
+                HOTKEY_ENTER => {
+                    if let Some(command) = self.menu.as_mut().and_then(MenuView::choose_highlighted)
+                    {
+                        config_dirty |= self.run_menu_command(command, cfg);
+                    }
+                }
                 HOTKEY_PAUSE_HOVER => {
                     if self.state.hover_paused() {
                         self.state.pause_hover(None);
@@ -1411,11 +1587,26 @@ impl NotchWindow {
         }
 
         if let Some((cx, cy)) = drained.click {
-            config_dirty |= self.handle_click(cfg, cx, cy, shape, &scene);
+            match self.menu.as_mut().filter(|m| !m.closing) {
+                Some(menu) if menu.rect.contains(cx, cy) => {
+                    if let Some(command) = menu.choose(cx, cy) {
+                        config_dirty |= self.run_menu_command(command, cfg);
+                    }
+                }
+                // A click beside the open menu only dismisses it.
+                Some(menu) => menu.close(),
+                None => config_dirty |= self.handle_click(cfg, cx, cy, shape, &scene),
+            }
         }
 
-        if let Some((cx, cy)) = drained.menu {
-            self.menu = Some(self.menu_for(cfg, cx, cy, shape));
+        if let Some((sx, sy)) = hook::take_menu() {
+            let (cx, cy) = (
+                (sx - self.placement.x) as f32,
+                (sy - self.placement.y) as f32,
+            );
+            let rows = self.menu_for(cfg, cx, cy, shape);
+            self.menu = Some(MenuView::new(rows, (cx, cy), self.menu_frame()));
+            self.state.hot = None;
         }
 
         let InputDrain {
@@ -1445,6 +1636,25 @@ impl NotchWindow {
                 }
             }
         }
+
+        // The menu's own motion, and what the pointer is over in the panel.
+        if let Some(menu) = self.menu.as_mut() {
+            if !menu.step(cursor, dt) {
+                self.menu = None;
+            }
+        }
+        self.state.hot = if self.menu.is_some() {
+            None
+        } else if self.state.expand.value > 0.85 {
+            cursor.and_then(|(x, y)| self.target_at(cfg, shape, x, y))
+        } else {
+            cursor.and_then(|(x, y)| {
+                self.pill_targets(cfg, shape, &scene)
+                    .into_iter()
+                    .find(|t| t.contains(x, y))
+            })
+        };
+        let hand = self.state.hot.is_some() || self.menu.as_ref().is_some_and(|m| m.hot.is_some());
 
         // -- animation ------------------------------------------------------
         let delay = Duration::from_millis(cfg.notch.collapse_delay_ms as u64);
@@ -1511,8 +1721,11 @@ impl NotchWindow {
         let pod_hits = scene
             .pods
             .map(|pod| pod.map(|p| p.shape.inset(-HOVER_SLOP)));
+        let menu_rect = self.menu.as_ref().map(|m| m.rect);
         with_input(|bus| {
             bus.shape = Some(shape.inset(-HOVER_SLOP));
+            bus.menu_rect = menu_rect;
+            bus.hand = hand;
             bus.pods = pod_hits;
             bus.origin = (wx, wy);
             bus.client_offset = (visible.left as f32, visible.top as f32);
@@ -1523,13 +1736,27 @@ impl NotchWindow {
             // it can be turned back off from the collapsed pill.
             chord: true,
             trigger: cfg.notch.input.mouse_trigger,
-            outside: self.state.sticky && !self.state.pinned,
-            bounds: (
-                wx + shape.left as i32,
-                wy + shape.top as i32,
-                wx + shape.right as i32,
-                wy + shape.bottom as i32,
-            ),
+            outside: (cfg.notch.input.close_on_outside_click
+                && self.state.open_target
+                && !self.state.pinned)
+                || self.menu.as_ref().is_some_and(|m| !m.closing),
+            menu: if open {
+                cfg.notch.input.menu_on_panel
+            } else {
+                cfg.notch.input.menu_on_pill
+            },
+            bounds: {
+                // The menu card is part of the notch for "outside" purposes.
+                let (mut l, mut t, mut r, mut b) =
+                    (shape.left, shape.top, shape.right, shape.bottom);
+                if let Some(m) = menu_rect {
+                    l = l.min(m.left);
+                    t = t.min(m.top);
+                    r = r.max(m.right);
+                    b = b.max(m.bottom);
+                }
+                (wx + l as i32, wy + t as i32, wx + r as i32, wy + b as i32)
+            },
         });
 
         // Background helpers follow the settings: the shelf's folder watcher
@@ -1539,6 +1766,7 @@ impl NotchWindow {
         crate::notch::shelf::sync(&cfg.notch.shelf, shelf_in_deck, shelf_shown);
         crate::notch::clipboard::sync(cfg.notch.clipboard.enabled, cfg.notch.clipboard.max_items);
         self.sync_hotkeys(cfg);
+        self.sync_modal_keys(cfg);
 
         // The music wave moves only while it is on screen and music plays.
         let wave_live = cfg.notch.media.live_wave
@@ -1586,7 +1814,7 @@ impl NotchWindow {
             // next one should not be kept waiting.
             animating: changed || self.last_motion == Motion::Continuous,
             open_settings: std::mem::take(&mut self.open_settings),
-            menu: self.menu.take(),
+            quit: std::mem::take(&mut self.quit),
         }
     }
 
@@ -1739,6 +1967,14 @@ impl NotchWindow {
             clipboard,
             media_clock,
             adding_item: self.state.adding_item(),
+            feedback: (
+                self.state.hot_shown.map(|t| t.hit),
+                (self.state.hot_amount.value * 100.0) as i32,
+                self.state
+                    .press
+                    .map(|p| (p.target.hit, (p.progress() * 100.0) as i32)),
+            ),
+            menu: self.menu.as_ref().map(MenuView::key),
             pod_content: scene
                 .pods
                 .map(|pod| pod.map(|p| self.pod_content_key(p.kind, cfg)).unwrap_or(0)),
@@ -1760,6 +1996,148 @@ impl NotchWindow {
             }
             PodKind::Media => self.painter.media.revision(),
         }
+    }
+
+    /// The clickable target under a point of the open panel, if any. Shared
+    /// by hover feedback, the hand cursor and click handling, so what lights
+    /// up is always exactly what a click would do.
+    fn target_at(&self, cfg: &AppConfig, shape: NotchShape, x: f32, y: f32) -> Option<Target> {
+        self.targets(cfg, shape)
+            .into_iter()
+            .find(|t| t.contains(x, y))
+    }
+
+    /// The music controls on the closed pill, when it is resting on Now
+    /// Playing and something owns the media session. With the split pill on
+    /// they sit at the right end of the middle face, where they are drawn.
+    fn pill_targets(&self, cfg: &AppConfig, shape: NotchShape, scene: &Scene) -> Vec<Target> {
+        let resting = self.state.expand.value < 0.05 && self.state.toast_progress.value < 0.01;
+        let on_media =
+            cfg.notch.effective_slides().get(self.state.active) == Some(&SlideKind::Media);
+        if !resting || !on_media || !self.painter.media.has_session() {
+            return Vec::new();
+        }
+        let [left, right] = scene.segments;
+        let face = NotchShape {
+            left: left.map(|s| s.right).unwrap_or(shape.left),
+            right: right.map(|s| s.left).unwrap_or(shape.right),
+            ..shape
+        };
+        if face.width() < crate::notch::paint::PILL_CONTROLS_MIN_W {
+            return Vec::new();
+        }
+        crate::notch::geom::pill_media_buttons(face)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y, r))| Target::round(Hit::Pill(i as u8), (x, y, r - 2.0)))
+            .collect()
+    }
+
+    /// Every clickable target on the open panel, buttons first.
+    fn targets(&self, cfg: &AppConfig, shape: NotchShape) -> Vec<Target> {
+        use crate::notch::geom;
+        let mut out = Vec::new();
+        let slides = cfg.notch.effective_slides();
+        let Some(slide) = slides.get(self.state.active).copied() else {
+            return out;
+        };
+        let raw = geom::slide_body(shape);
+        let body = layout_rect(raw);
+        match slide {
+            SlideKind::Media => {
+                for (i, button) in geom::media_transport_buttons(raw).into_iter().enumerate() {
+                    out.push(Target::round(Hit::Media(i as u8), button));
+                }
+            }
+            SlideKind::Timer => {
+                for (i, button) in geom::timer_buttons(raw).into_iter().enumerate() {
+                    out.push(Target::round(Hit::Timer(i as u8), button));
+                }
+            }
+            SlideKind::Controls => {
+                for (i, tile) in geom::toggle_tiles(raw).into_iter().enumerate() {
+                    out.push(Target::rect(Hit::Toggle(i as u8), layout_rect(tile), 12.0));
+                }
+            }
+            SlideKind::Shelf => {
+                let snap = crate::notch::shelf::snapshot();
+                let grid = layout::shelf_layout(body, snap.pinned.len(), snap.recent.len());
+                for tile in grid.tiles {
+                    out.push(Target::rect(
+                        Hit::Shelf(tile.row, tile.index),
+                        tile.rect,
+                        10.0,
+                    ));
+                }
+            }
+            SlideKind::Clipboard if cfg.notch.clipboard.enabled => {
+                let count = crate::notch::clipboard::len();
+                if count > 0 {
+                    out.push(Target::rect(
+                        Hit::ClipClear,
+                        layout::clipboard_clear_button(body),
+                        8.0,
+                    ));
+                }
+                for (i, row) in layout::clipboard_rows(body, count).into_iter().enumerate() {
+                    out.push(Target::rect(Hit::Clip(i), row, 7.0));
+                }
+            }
+            SlideKind::Status => {
+                out.push(Target::round(
+                    Hit::StatusPlus,
+                    geom::status_plus_button(raw),
+                ));
+                let list =
+                    layout::status_list(geom::status_list_column(raw), cfg.status.items.len());
+                for (i, row) in list.items.into_iter().enumerate() {
+                    out.push(Target::rect(Hit::StatusRow(i), row.inset(-4.0, 0.0), 8.0));
+                }
+                if let Some(add) = list.add {
+                    out.push(Target::rect(Hit::StatusAdd, add.inset(-4.0, 0.0), 8.0));
+                }
+                let split = raw.left + (raw.right - raw.left) * theme::SPLIT_RATIO;
+                out.push(Target::rect(
+                    Hit::Focus,
+                    layout::Rect::new(raw.left - 6.0, raw.top + 20.0, split - 12.0, raw.bottom),
+                    10.0,
+                ));
+            }
+            SlideKind::Notifications => {
+                let store = crate::notch::notify::global_store();
+                let store = store.read();
+                if self.state.selected_notification_id.is_some() {
+                    out.push(Target::rect(
+                        Hit::NotifBack,
+                        layout_rect(geom::notification_back_button(raw)),
+                        8.0,
+                    ));
+                    out.push(Target::rect(
+                        Hit::NotifDismiss,
+                        layout_rect(geom::notification_dismiss_button(raw)),
+                        8.0,
+                    ));
+                } else {
+                    if !store.items.is_empty() {
+                        out.push(Target::rect(
+                            Hit::NotifClear,
+                            layout_rect(geom::notification_clear_button(raw)),
+                            8.0,
+                        ));
+                    }
+                    let rows = geom::notification_row_count(raw).min(store.items.len());
+                    for i in 0..rows {
+                        out.push(Target::rect(
+                            Hit::NotifRow(i),
+                            layout_rect(geom::notification_item_rect(raw, i)),
+                            8.0,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
     }
 
     fn handle_click(
@@ -1789,7 +2167,27 @@ impl NotchWindow {
                 return false;
             }
 
-            if !cfg.notch.input.open_with.clicks() {
+            // The music controls on the pill act where they are, without
+            // opening anything.
+            if let Some(target) = self
+                .pill_targets(cfg, shape, scene)
+                .into_iter()
+                .find(|t| t.contains(cx, cy))
+            {
+                self.state.press(target, cx, cy);
+                match target.hit {
+                    Hit::Pill(0) => self.painter.media.previous(),
+                    Hit::Pill(1) => self.painter.media.play_pause(),
+                    _ => self.painter.media.next(),
+                }
+                return false;
+            }
+
+            // A chosen click gesture (Ctrl + click, middle click…) is then
+            // the only click that opens the notch; a plain click does not.
+            if !cfg.notch.input.open_with.clicks()
+                || cfg.notch.input.mouse_trigger != MouseTrigger::Off
+            {
                 return false;
             }
             // A pod's quick action, where it has one; otherwise the click
@@ -1811,184 +2209,74 @@ impl NotchWindow {
             return false;
         }
 
-        // Settings launcher button: opens the Settings panel.
-        // Raising the window is left to the overlay thread once it has dropped
-        // the config write lock -- see `NotchManager::tick`. Doing the Win32
-        // calls here would mean holding that lock across a synchronous
-        // cross-thread message to a window whose thread wants the same lock.
-        let (sx, sy, sr) = shape.settings_button();
-        let hit_s = sr + 5.0;
-        if (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy) <= hit_s * hit_s {
-            self.open_settings = true;
-            return false;
-        }
-
-        // Pin toggle lives above whatever slide is showing, so it is checked
-        // before any per-slide hit-testing below.
-        let (px, py, pr) = shape.pin_button();
-        let hit_p = pr + 5.0; // a little slop past the drawn ring
-        if (cx - px) * (cx - px) + (cy - py) * (cy - py) <= hit_p * hit_p {
-            self.state.toggle_pinned();
-            return false;
-        }
-
-        let slides = cfg.notch.effective_slides();
-        let Some(slide) = slides.get(self.state.active) else {
+        let Some(target) = self.target_at(cfg, shape, cx, cy) else {
             return false;
         };
+        self.state.press(target, cx, cy);
 
-        if *slide == crate::config::SlideKind::Notifications {
-            let body = crate::notch::geom::slide_body(shape);
-            let notif_store = crate::notch::notify::global_store();
-
-            // If a notification is currently expanded into detailed view:
-            if let Some(sel_id) = self.state.selected_notification_id {
-                let back = crate::notch::geom::notification_back_button(body);
-                if cx >= back.left && cx <= back.right && cy >= back.top && cy <= back.bottom {
-                    self.state.selected_notification_id = None;
-                    return false;
-                }
-
-                let dismiss = crate::notch::geom::notification_dismiss_button(body);
-                if cx >= dismiss.left
-                    && cx <= dismiss.right
-                    && cy >= dismiss.top
-                    && cy <= dismiss.bottom
-                {
-                    notif_store.write().dismiss_item(sel_id);
-                    self.state.selected_notification_id = None;
-                    return false;
-                }
-                return false;
-            }
-
-            // Normal list view:
-            let clr = crate::notch::geom::notification_clear_button(body);
-            if cx >= clr.left && cx <= clr.right && cy >= clr.top && cy <= clr.bottom {
-                notif_store.write().clear_all();
-                return false;
-            }
-
-            // Hit test individual notification card rows to open detailed view:
-            let store = notif_store.read();
-            let max_items = crate::notch::geom::notification_row_count(body).min(store.items.len());
-            let mut selected_id = None;
-            for i in 0..max_items {
-                let r = crate::notch::geom::notification_item_rect(body, i);
-                if cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom {
-                    selected_id = store.items.get(i).map(|item| item.id);
-                    break;
+        match target.hit {
+            Hit::Pill(0) | Hit::Media(0) => self.painter.media.previous(),
+            Hit::Pill(1) | Hit::Media(1) => self.painter.media.play_pause(),
+            Hit::Pill(_) | Hit::Media(_) => self.painter.media.next(),
+            Hit::Timer(0) => crate::notch::timer::reset(),
+            Hit::Timer(1) => crate::notch::timer::toggle(&cfg.notch.timer),
+            Hit::Timer(_) => crate::notch::timer::skip(&cfg.notch.timer),
+            Hit::Toggle(i) => {
+                if let Some(toggle) = crate::notch::toggles::Toggle::ALL.get(i as usize) {
+                    crate::notch::toggles::flip(*toggle);
                 }
             }
-            drop(store);
-            if let Some(id) = selected_id {
-                self.state.selected_notification_id = Some(id);
-                notif_store.write().mark_read(id);
-            }
-            return false;
-        }
-
-        // Transport buttons live along the bottom of the Now Playing slide;
-        // same squared-distance-plus-slop hit test as the pin button above.
-        if *slide == crate::config::SlideKind::Media {
-            let body = crate::notch::geom::slide_body(shape);
-            let buttons = crate::notch::geom::media_transport_buttons(body);
-            for (i, (bx, by, br)) in buttons.into_iter().enumerate() {
-                let hit = br + 5.0;
-                if (cx - bx) * (cx - bx) + (cy - by) * (cy - by) <= hit * hit {
-                    match i {
-                        0 => self.painter.media.previous(),
-                        1 => self.painter.media.play_pause(),
-                        2 => self.painter.media.next(),
-                        _ => {}
-                    }
-                    break;
+            Hit::Shelf(row, index) => {
+                let snap = crate::notch::shelf::snapshot();
+                let list = match row {
+                    layout::ShelfRow::Pinned => &snap.pinned,
+                    layout::ShelfRow::Recent => &snap.recent,
+                };
+                if let Some(entry) = list.get(index) {
+                    crate::notch::shelf::open(&entry.path);
                 }
             }
-            return false;
-        }
-
-        if *slide == crate::config::SlideKind::Timer {
-            let body = crate::notch::geom::slide_body(shape);
-            let buttons = crate::notch::geom::timer_buttons(body);
-            for (i, (bx, by, br)) in buttons.into_iter().enumerate() {
-                let hit = br + 5.0;
-                if (cx - bx) * (cx - bx) + (cy - by) * (cy - by) <= hit * hit {
-                    match i {
-                        0 => crate::notch::timer::reset(),
-                        1 => crate::notch::timer::toggle(&cfg.notch.timer),
-                        _ => crate::notch::timer::skip(&cfg.notch.timer),
-                    }
-                    break;
-                }
-            }
-            return false;
-        }
-
-        if *slide == crate::config::SlideKind::Controls {
-            let body = crate::notch::geom::slide_body(shape);
-            let tiles = crate::notch::geom::toggle_tiles(body);
-            for (toggle, r) in crate::notch::toggles::Toggle::ALL.into_iter().zip(tiles) {
-                if cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom {
-                    crate::notch::toggles::flip(toggle);
-                    break;
-                }
-            }
-            return false;
-        }
-
-        if *slide == SlideKind::Shelf {
-            let body = crate::notch::geom::slide_body(shape);
-            if let Some(entry) = crate::notch::paint::shelf_entry_at(body, cx, cy) {
-                crate::notch::shelf::open(&entry.path);
-            }
-            return false;
-        }
-
-        if *slide == SlideKind::Clipboard {
-            let body = layout_rect(crate::notch::geom::slide_body(shape));
-            if layout::clipboard_clear_button(body).contains(cx, cy) {
-                crate::notch::clipboard::clear();
-                return false;
-            }
-            let items = crate::notch::clipboard::items();
-            let rows = layout::clipboard_rows(body, items.len());
-            if let Some(index) = rows.iter().position(|r| r.contains(cx, cy)) {
-                if let Some(text) = items.get(index) {
+            Hit::ClipClear => crate::notch::clipboard::clear(),
+            Hit::Clip(index) => {
+                if let Some(text) = crate::notch::clipboard::items().get(index) {
                     if crate::notch::clipboard::copy_text(text) {
                         self.state.flash(Badge::Copied);
                     }
                 }
             }
-            return false;
-        }
-
-        if *slide != SlideKind::Status {
-            return false;
-        }
-
-        // Left: the editable focus line. Right: the short list, where a
-        // click ticks an item off (or back on) and "+ Add" types a new one.
-        let body = crate::notch::geom::slide_body(shape);
-        let split = body.left + (body.right - body.left) * theme::SPLIT_RATIO;
-        if cx < split && cy > shape.top {
-            self.state.begin_edit(cfg);
-            self.set_editing_style(cfg, true);
-            return false;
-        }
-        let list = layout::status_list(
-            crate::notch::geom::status_list_column(body),
-            cfg.status.items.len(),
-        );
-        if let Some(index) = list.items.iter().position(|r| r.contains(cx, cy)) {
-            if let Some(item) = cfg.status.items.get_mut(index) {
-                item.done = !item.done;
-                return true;
+            Hit::Focus => {
+                self.state.begin_edit(cfg);
+                self.set_editing_style(cfg, true);
             }
-        }
-        if list.add.is_some_and(|r| r.contains(cx, cy)) {
-            self.state.begin_add();
-            self.set_editing_style(cfg, true);
+            Hit::StatusRow(index) => {
+                if let Some(item) = cfg.status.items.get_mut(index) {
+                    item.done = !item.done;
+                    return true;
+                }
+            }
+            Hit::StatusAdd | Hit::StatusPlus => {
+                if cfg.status.items.len() < layout::STATUS_MAX_ITEMS {
+                    self.state.begin_add();
+                    self.set_editing_style(cfg, true);
+                }
+            }
+            Hit::NotifBack => self.state.selected_notification_id = None,
+            Hit::NotifDismiss => {
+                if let Some(id) = self.state.selected_notification_id.take() {
+                    crate::notch::notify::global_store()
+                        .write()
+                        .dismiss_item(id);
+                }
+            }
+            Hit::NotifClear => crate::notch::notify::global_store().write().clear_all(),
+            Hit::NotifRow(index) => {
+                let store = crate::notch::notify::global_store();
+                let id = store.read().items.get(index).map(|item| item.id);
+                if let Some(id) = id {
+                    self.state.selected_notification_id = Some(id);
+                    store.write().mark_read(id);
+                }
+            }
         }
         false
     }
@@ -1997,7 +2285,12 @@ impl NotchWindow {
     /// say. Called every frame because click-through can be switched from the
     /// settings window, which the notch has no other notification of.
     fn apply_ex_style(&mut self, cfg: &AppConfig, editing: bool) {
-        let style = Self::ex_style_for(cfg, editing);
+        let mut style = Self::ex_style_for(cfg, editing);
+        // The menu card must take clicks even while the notch lets them pass
+        // through: it is how click-through gets switched back off.
+        if self.menu.is_some() {
+            style &= !WS_EX_TRANSPARENT.0;
+        }
         if style != self.ex_style {
             self.ex_style = style;
             unsafe {
@@ -2065,6 +2358,7 @@ impl NotchWindow {
             scene,
             (self.placement.x, self.placement.y),
             self.capture_excluded,
+            self.menu.as_ref(),
         )?;
 
         let mem_dc = self.surface.dc();
@@ -2133,6 +2427,7 @@ impl NotchWindow {
                     let (lx, ly) = ((x - ox) as f32, (y - oy) as f32);
                     bus.shape.is_some_and(|shape| shape.contains(lx, ly))
                         || bus.pods.iter().flatten().any(|pod| pod.contains(lx, ly))
+                        || bus.menu_rect.is_some_and(|m| m.contains(lx, ly))
                 })
                 .unwrap_or(false);
 
@@ -2153,14 +2448,16 @@ impl NotchWindow {
                 LRESULT(0)
             }
 
-            WM_RBUTTONUP => {
-                let x = (lparam.0 & 0xFFFF) as i16 as f32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-                with_input(|bus| {
-                    let (ox, oy) = bus.client_offset;
-                    bus.menu = Some((x + ox, y + oy));
-                });
-                LRESULT(0)
+            WM_SETCURSOR => {
+                // A hand over anything clickable, so the notch says "this
+                // does something" before it is clicked.
+                if with_input(|bus| bus.hand).unwrap_or(false) {
+                    if let Ok(hand) = LoadCursorW(None, IDC_HAND) {
+                        SetCursor(hand);
+                        return LRESULT(1);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
 
             WM_HOTKEY => {
@@ -2230,6 +2527,11 @@ impl Drop for NotchWindow {
                 for (index, registered) in self.hotkeys.iter().enumerate() {
                     if registered.is_some() {
                         let _ = UnregisterHotKey(self.hwnd, index as i32 + 1);
+                    }
+                }
+                for (slot, registered) in self.modal_keys.iter().enumerate() {
+                    if *registered {
+                        let _ = UnregisterHotKey(self.hwnd, HOTKEY_ESCAPE + slot as i32);
                     }
                 }
                 let _ = DestroyWindow(self.hwnd);

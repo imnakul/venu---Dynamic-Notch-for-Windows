@@ -1032,16 +1032,6 @@ pub enum OpenWith {
 }
 
 impl OpenWith {
-    pub const ALL: [OpenWith; 3] = [OpenWith::Click, OpenWith::Hover, OpenWith::Both];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            OpenWith::Click => "Click",
-            OpenWith::Hover => "Hover",
-            OpenWith::Both => "Click or hover",
-        }
-    }
-
     pub fn hovers(self) -> bool {
         matches!(self, OpenWith::Hover | OpenWith::Both)
     }
@@ -1060,17 +1050,19 @@ pub enum ScrollPages {
     /// Over the closed pill too, which changes the face it rests on.
     #[default]
     Always,
+    /// Only over the closed pill.
+    ClosedOnly,
 }
 
 impl ScrollPages {
-    pub const ALL: [ScrollPages; 3] =
-        [ScrollPages::Off, ScrollPages::OpenOnly, ScrollPages::Always];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ScrollPages::Off => "Off",
-            ScrollPages::OpenOnly => "Open panel only",
-            ScrollPages::Always => "Open and closed",
+    /// From the two switches Settings shows: on the closed pill, on the open
+    /// panel.
+    pub fn from_parts(closed: bool, open: bool) -> Self {
+        match (closed, open) {
+            (true, true) => ScrollPages::Always,
+            (false, true) => ScrollPages::OpenOnly,
+            (true, false) => ScrollPages::ClosedOnly,
+            (false, false) => ScrollPages::Off,
         }
     }
 
@@ -1078,6 +1070,7 @@ impl ScrollPages {
         match self {
             ScrollPages::Off => false,
             ScrollPages::OpenOnly => open,
+            ScrollPages::ClosedOnly => !open,
             ScrollPages::Always => true,
         }
     }
@@ -1189,6 +1182,16 @@ pub struct InputConfig {
     /// `None` until the user picks one; see [`NotchConfig::scroll_pages`].
     pub scroll: Option<ScrollPages>,
     pub mouse_trigger: MouseTrigger,
+    /// Ways the open panel closes. At least one is always on (see
+    /// [`InputConfig::clean`]), or it could never close.
+    pub close_on_esc: bool,
+    pub close_on_outside_click: bool,
+    /// Closes by itself once the cursor has left it, after the collapse delay.
+    pub close_on_leave: bool,
+    /// Right-click opens the notch's menu on the closed pill and on the open
+    /// panel. Read by the mouse hook, so it works with click-through on.
+    pub menu_on_pill: bool,
+    pub menu_on_panel: bool,
     /// Open or close the notch.
     pub hotkey_toggle: Option<Hotkey>,
     /// Turn click-through on or off.
@@ -1205,6 +1208,11 @@ impl Default for InputConfig {
             hover_in_fullscreen: false,
             scroll: None,
             mouse_trigger: MouseTrigger::Off,
+            close_on_esc: true,
+            close_on_outside_click: true,
+            close_on_leave: true,
+            menu_on_pill: true,
+            menu_on_panel: true,
             hotkey_toggle: Some(Hotkey::ctrl_alt("N")),
             hotkey_click_through: Some(Hotkey::ctrl_alt("C")),
             hotkey_pause_hover: None,
@@ -1214,6 +1222,29 @@ impl Default for InputConfig {
 
 impl InputConfig {
     pub const MAX_HOVER_DELAY_MS: u32 = 1500;
+
+    /// Never leave the notch with no way to close: with every close option
+    /// off, a click outside comes back on.
+    pub fn clean(&mut self) {
+        if !self.close_on_esc && !self.close_on_outside_click && !self.close_on_leave {
+            self.close_on_outside_click = true;
+        }
+    }
+
+    /// Put the opening, closing, menu and wheel behaviour back to the
+    /// defaults, keeping the user's shortcuts. The way out of a setup that
+    /// left the notch impossible to use.
+    pub fn reset_behaviour(&mut self) {
+        let shortcuts = (
+            self.hotkey_toggle.take(),
+            self.hotkey_click_through.take(),
+            self.hotkey_pause_hover.take(),
+        );
+        *self = Self::default();
+        self.hotkey_toggle = shortcuts.0;
+        self.hotkey_click_through = shortcuts.1;
+        self.hotkey_pause_hover = shortcuts.2;
+    }
 
     /// The shortcuts in a fixed order, which is also their id order when
     /// they are registered with Windows.
@@ -2178,5 +2209,41 @@ mod tests {
             shelf.pin(&format!(r"C:\file{i}.txt"));
         }
         assert_eq!(shelf.items.len(), ShelfConfig::MAX_ITEMS);
+    }
+
+    #[test]
+    fn the_notch_always_keeps_a_way_to_close() {
+        let mut input = InputConfig::default();
+        input.close_on_esc = false;
+        input.close_on_outside_click = false;
+        input.close_on_leave = false;
+        input.clean();
+        assert!(input.close_on_outside_click);
+    }
+
+    #[test]
+    fn wheel_switches_map_to_where_scrolling_works() {
+        assert!(ScrollPages::from_parts(true, false).applies(false));
+        assert!(!ScrollPages::from_parts(true, false).applies(true));
+        assert!(ScrollPages::from_parts(false, true).applies(true));
+        assert!(!ScrollPages::from_parts(false, false).applies(true));
+        assert_eq!(ScrollPages::from_parts(true, true), ScrollPages::Always);
+    }
+
+    #[test]
+    fn reset_controls_restores_behaviour_but_keeps_shortcuts() {
+        let mut input = InputConfig {
+            open_with: OpenWith::Hover,
+            close_on_leave: false,
+            menu_on_pill: false,
+            mouse_trigger: MouseTrigger::CtrlClick,
+            hotkey_toggle: Some(Hotkey::ctrl_alt("J")),
+            ..InputConfig::default()
+        };
+        input.reset_behaviour();
+        assert_eq!(input.open_with, OpenWith::Both);
+        assert!(input.close_on_leave && input.menu_on_pill);
+        assert_eq!(input.mouse_trigger, MouseTrigger::Off);
+        assert_eq!(input.hotkey_toggle, Some(Hotkey::ctrl_alt("J")));
     }
 }
