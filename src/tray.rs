@@ -12,15 +12,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, FindWindowW, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, LoadImageW,
     PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    TrackPopupMenu, GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_STRING, SM_CXSMICON,
-    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
+    TrackPopupMenu, GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_POPUP,
 };
 
 const WM_TRAY_ICON: u32 = WM_USER + 101;
 const WM_VENU_OPEN_SETTINGS: u32 = WM_USER + 102;
 const ID_TRAY_SETTINGS: usize = 2001;
 const ID_TRAY_EXIT: usize = 2002;
+const ID_TRAY_OPEN_NOTCH: usize = 2003;
+const ID_TRAY_CLICK_THROUGH: usize = 2004;
+const ID_TRAY_RESET: usize = 2005;
 
 static TRAY_CLASS_NAME: &str = "VenuTrayClass";
 
@@ -226,6 +229,30 @@ impl SystemTray {
                     let _ = AppendMenuW(
                         menu,
                         MF_STRING,
+                        ID_TRAY_OPEN_NOTCH,
+                        PCWSTR(HSTRING::from("Open the notch").as_ptr()),
+                    );
+                    let through = if crate::notch::rescue::click_through_on() {
+                        MF_STRING | MF_CHECKED
+                    } else {
+                        MF_STRING
+                    };
+                    let _ = AppendMenuW(
+                        menu,
+                        through,
+                        ID_TRAY_CLICK_THROUGH,
+                        PCWSTR(HSTRING::from("Clicks pass through the notch").as_ptr()),
+                    );
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        ID_TRAY_RESET,
+                        PCWSTR(HSTRING::from("Reset notch controls").as_ptr()),
+                    );
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
                         ID_TRAY_EXIT,
                         PCWSTR(HSTRING::from("❌ Exit Application").as_ptr()),
                     );
@@ -248,6 +275,12 @@ impl SystemTray {
                 let id = (wparam.0 & 0xffff) as usize;
                 if id == ID_TRAY_SETTINGS {
                     restore_settings_window();
+                } else if id == ID_TRAY_OPEN_NOTCH {
+                    crate::notch::rescue::request(crate::notch::rescue::OPEN);
+                } else if id == ID_TRAY_CLICK_THROUGH {
+                    crate::notch::rescue::request(crate::notch::rescue::TOGGLE_CLICK_THROUGH);
+                } else if id == ID_TRAY_RESET {
+                    crate::notch::rescue::request(crate::notch::rescue::RESET_CONTROLS);
                 } else if id == ID_TRAY_EXIT {
                     std::process::exit(0);
                 }

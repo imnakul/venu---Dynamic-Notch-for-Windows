@@ -70,7 +70,10 @@ A compact Dynamic Island-style panel that expands when you need it and stays out
 - Smooth spring-based expansion and collapse
 - Open with a **click**, a **hover**, or either; hover waits a moment you choose and ignores the cursor sweeping past on its way to a tab
 - No accidental opening while dragging a window or file, or over full-screen apps and games
-- Right-click menu drawn in the notch's own style, with smooth open, close and hover: Settings, keep open, pause hover, click-through, pages, quit
+- Close with **Esc**, a **click outside**, or **moving the cursor away** — any combination, all in Settings › Controls
+- Right-click menu on the notch's own glass, with smooth open, close and hover, and arrow keys + Enter: Settings, keep open, pause hover, click-through, pages, quit. It works even while clicks pass through
+- Never stuck: **Reset controls** and a click-through switch in the tray menu and at the top of Settings
+- Music controls and the live wave right on the closed pill
 - Hover highlights, a hand cursor and a soft ripple on everything clickable in the panel
 - Pick a click gesture (Ctrl + click, middle click…) and only that opens the notch
 - Global keyboard shortcuts you set yourself (default `Ctrl + Alt + N` to open or close, `Ctrl + Alt + C` for click-through)

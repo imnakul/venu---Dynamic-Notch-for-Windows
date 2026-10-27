@@ -66,6 +66,8 @@ pub struct NotchState {
     /// Opened by a click, the shortcut or the mouse trigger: stays open until
     /// a click elsewhere, the same gesture again, or a menu choice closes it.
     pub sticky: bool,
+    /// The cursor has been on a click-opened panel since it opened.
+    pub sticky_entered: bool,
     /// Hover may not open the notch before this ("Pause hover" in the menu).
     hover_paused_until: Option<Instant>,
     /// Seconds the cursor has rested on the closed pill. Hover opens the
@@ -159,6 +161,7 @@ impl NotchState {
             left_at: None,
             pinned: false,
             sticky: false,
+            sticky_entered: false,
             hover_paused_until: None,
             dwell: 0.0,
             hover_blocked: false,
@@ -328,6 +331,7 @@ impl NotchState {
     /// away, like any hover.
     pub fn release_sticky(&mut self) {
         self.sticky = false;
+        self.sticky_entered = false;
         if !self.hovered {
             self.left_at = Some(Instant::now());
         }
@@ -473,6 +477,7 @@ impl NotchState {
     /// Open and hold open: a click, the shortcut or the mouse trigger.
     pub fn open_sticky(&mut self) {
         self.sticky = true;
+        self.sticky_entered = false;
         self.hover_blocked = false;
     }
 
@@ -480,6 +485,7 @@ impl NotchState {
     /// the cursor has left.
     pub fn close_now(&mut self) {
         self.sticky = false;
+        self.sticky_entered = false;
         self.pinned = false;
         self.open_target = false;
         self.hovered = false;
@@ -1053,7 +1059,7 @@ mod tests {
     fn a_click_ripple_runs_once_and_the_hover_fades_out() {
         let cfg = AppConfig::default();
         let mut state = NotchState::new(&cfg);
-        let target = Target::round(layout::Hit::Settings, (10.0, 10.0, 9.0));
+        let target = Target::round(layout::Hit::Pill(0), (10.0, 10.0, 9.0));
 
         state.hot = Some(target);
         tick_for(&mut state, &cfg, 0.2);

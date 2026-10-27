@@ -72,9 +72,21 @@ impl Palette {
         let film = |alpha: f32| Color32::from_white_alpha((alpha * 255.0).round() as u8);
 
         let bg = 0.28 + 0.70 * s;
+        // A breath of the accent in the backgrounds: enough to make the
+        // window feel like the user's, little enough that it never competes
+        // with what is on it. A touch more on the rail than the page.
+        let mix = |base: [u8; 3], amount: f32| -> [u8; 3] {
+            let blend =
+                |b: u8, a: u8| -> u8 { (b as f32 + (a as f32 - b as f32) * amount).round() as u8 };
+            [
+                blend(base[0], rgb[0]),
+                blend(base[1], rgb[1]),
+                blend(base[2], rgb[2]),
+            ]
+        };
         Palette {
-            bg: tint([16, 16, 22], bg),
-            sidebar: tint([9, 9, 13], (bg + 0.14).min(1.0)),
+            bg: tint(mix([16, 16, 22], 0.09), bg),
+            sidebar: tint(mix([9, 9, 13], 0.12), (bg + 0.14).min(1.0)),
             surface: film(0.06),
             surface_hover: film(0.10),
             surface_active: film(0.15),

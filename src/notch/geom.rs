@@ -97,19 +97,6 @@ impl NotchShape {
         }
     }
 
-    /// Centre and radius of the settings launcher button.
-    pub fn settings_button(&self) -> (f32, f32, f32) {
-        (self.right - 43.0, self.top + 19.0, 9.0)
-    }
-
-    /// Centre and radius of the pin toggle, in the shape's own coordinates.
-    /// Inset from the top-right corner, clear of the shoulder curve — shared
-    /// by the painter (to draw it) and the window (to hit-test clicks on it),
-    /// so the two can never drift apart.
-    pub fn pin_button(&self) -> (f32, f32, f32) {
-        (self.right - 19.0, self.top + 19.0, 9.0)
-    }
-
     /// Cheap hit test used for hover and for `WM_NCHITTEST`.
     ///
     /// Deliberately ignores the flare and treats the smoothed corners as
@@ -328,6 +315,20 @@ pub fn slide_body(panel: NotchShape) -> D2D_RECT_F {
         right: panel.right - g,
         bottom: panel.bottom - g * 0.72 - 12.0,
     }
+}
+
+/// Previous / play-pause / next on the closed pill's right end, when it is
+/// showing Now Playing: centres and radius, left to right.
+pub fn pill_media_buttons(shape: NotchShape) -> [(f32, f32, f32); 3] {
+    let cy = (shape.top + shape.bottom) * 0.5;
+    let r = 8.0;
+    let step = 22.0;
+    let last = shape.right - super::theme::PILL_GUTTER - r;
+    [
+        (last - step * 2.0, cy, r),
+        (last - step, cy, r),
+        (last, cy, r),
+    ]
 }
 
 /// The round + button at the right end of the Status list's heading.

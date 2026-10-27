@@ -170,8 +170,6 @@ pub fn place(anchor: (f32, f32), size: (f32, f32), frame: Rect) -> Rect {
 pub struct MenuView {
     pub rows: Vec<MenuRow>,
     pub rect: Rect,
-    /// Where it grows from: the click.
-    pub anchor: (f32, f32),
     /// 0 closed, 1 open.
     pub open: Spring,
     pub closing: bool,
@@ -183,6 +181,9 @@ pub struct MenuView {
     pub hl_alpha: Spring,
     /// The item just chosen, lit in the accent while the card fades.
     pub pressed: Option<Slot>,
+    /// The item picked with the arrow keys, used while the cursor is off
+    /// the card.
+    keyboard: Option<Slot>,
 }
 
 impl MenuView {
@@ -191,7 +192,6 @@ impl MenuView {
         Self {
             rows,
             rect,
-            anchor,
             // Quick and just under critical: it arrives with a soft settle.
             open: Spring::new(0.0, 420.0, 34.0),
             closing: false,
@@ -201,7 +201,50 @@ impl MenuView {
             hl_right: Spring::new(0.0, 520.0, 42.0),
             hl_alpha: Spring::new(0.0, 380.0, 36.0),
             pressed: None,
+            keyboard: None,
         }
+    }
+
+    /// Every item in order, a pair counting as two.
+    fn slots(&self) -> Vec<Slot> {
+        self.rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, kind)| match kind {
+                MenuRow::Separator => Vec::new(),
+                MenuRow::Item { .. } => vec![Slot { row, half: 0 }],
+                MenuRow::Pair(..) => vec![Slot { row, half: 0 }, Slot { row, half: 1 }],
+            })
+            .collect()
+    }
+
+    /// Move the highlight with the arrow keys, wrapping at the ends.
+    pub fn step_keyboard(&mut self, down: bool) {
+        if self.closing {
+            return;
+        }
+        let slots = self.slots();
+        if slots.is_empty() {
+            return;
+        }
+        let current = self.hot.and_then(|h| slots.iter().position(|s| *s == h));
+        let next = match (current, down) {
+            (None, true) => 0,
+            (None, false) => slots.len() - 1,
+            (Some(i), true) => (i + 1) % slots.len(),
+            (Some(i), false) => (i + slots.len() - 1) % slots.len(),
+        };
+        self.keyboard = Some(slots[next]);
+        self.hot = self.keyboard;
+    }
+
+    /// Enter: run the highlighted item.
+    pub fn choose_highlighted(&mut self) -> Option<MenuCommand> {
+        let slot = self.hot?;
+        let command = self.command(slot)?;
+        self.pressed = Some(slot);
+        self.close();
+        Some(command)
     }
 
     /// Top of each row, in order.
@@ -290,7 +333,12 @@ impl MenuView {
         self.open.step(target, dt);
 
         if !self.closing {
-            let hot = cursor.and_then(|(x, y)| self.slot_at(x, y));
+            let pointed = cursor.and_then(|(x, y)| self.slot_at(x, y));
+            if pointed.is_some() {
+                // The mouse takes over from the keys.
+                self.keyboard = pointed;
+            }
+            let hot = pointed.or(self.keyboard);
             if let Some(rect) = hot.and_then(|slot| self.slot_rect(slot)) {
                 if self.hot.is_none() && self.hl_alpha.value < 0.3 {
                     // Arriving from outside: appear in place, don't fly in.
@@ -429,6 +477,29 @@ mod tests {
             alive = menu.step(None, 1.0 / 60.0);
         }
         assert!(!alive);
+    }
+
+    #[test]
+    fn arrow_keys_walk_the_items_and_enter_picks_one() {
+        let mut menu = MenuView::new(rows(), (100.0, 50.0), frame());
+        menu.step_keyboard(true);
+        assert_eq!(menu.hot, Some(Slot { row: 0, half: 0 }));
+        menu.step_keyboard(true);
+        menu.step_keyboard(true);
+        // Past the separator, into the pair's left half.
+        assert_eq!(menu.hot, Some(Slot { row: 3, half: 0 }));
+        menu.step_keyboard(false);
+        menu.step_keyboard(false);
+        menu.step_keyboard(false);
+        // Wraps from the first to the last.
+        assert_eq!(menu.hot, Some(Slot { row: 5, half: 0 }));
+        menu.step(None, 1.0 / 60.0);
+        assert_eq!(
+            menu.hot,
+            Some(Slot { row: 5, half: 0 }),
+            "kept with the cursor away"
+        );
+        assert_eq!(menu.choose_highlighted(), Some(MenuCommand::Quit));
     }
 
     #[test]

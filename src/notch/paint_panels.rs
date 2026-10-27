@@ -18,7 +18,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
-use super::{scale_matrix, Painter};
+use super::Painter;
 use crate::config::AppConfig;
 use crate::notch::clipboard;
 use crate::notch::geom;
@@ -185,27 +185,46 @@ impl Painter {
 
     // -- the right-click menu ------------------------------------------------------
 
-    /// The menu card: the notch's own surface and type, a highlight that
-    /// slides between items, and a quick scale-and-fade from where it was
-    /// opened.
-    pub(super) fn paint_menu(&self, t: &ID2D1DCRenderTarget, cfg: &AppConfig, menu: &MenuView) {
+    /// The menu card, made of the same glass as the notch: the blurred
+    /// desktop behind it on glass themes, the notch's surface, edge and
+    /// sheen on every theme. It fades in while rising a few pixels from the
+    /// click, and fades out the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn paint_menu(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        factory: &ID2D1Factory,
+        cfg: &AppConfig,
+        menu: &MenuView,
+        origin: (i32, i32),
+        may_capture: bool,
+        panel: &crate::notch::geom::NotchShape,
+        expand: f32,
+    ) {
         let a = menu.alpha();
         if a <= 0.004 {
             return;
         }
-        let open = menu.open.value.clamp(0.0, 1.05);
-        let (ax, ay) = menu.anchor;
-        let scale = 0.94 + 0.06 * open.min(1.0);
-        let lift = -6.0 * (1.0 - open.min(1.0));
-        unsafe {
-            t.SetTransform(
-                &(Matrix3x2::translation(-ax, -ay)
-                    * scale_matrix(scale)
-                    * Matrix3x2::translation(ax, ay + lift)),
-            );
-        }
-
-        let card = d2d(menu.rect);
+        let open = menu.open.value.clamp(0.0, 1.0);
+        // Rising into place rather than scaling: the glass is sampled from
+        // the desktop at the card's real position, which a scale would break.
+        let lift = -8.0 * (1.0 - open);
+        let card_rect = menu.rect;
+        let shape = crate::notch::geom::NotchShape {
+            left: card_rect.left,
+            top: card_rect.top + lift,
+            right: card_rect.right,
+            bottom: card_rect.bottom + lift,
+            radius_top: menu_model::RADIUS,
+            radius_bottom: menu_model::RADIUS,
+            flare: 0.0,
+        };
+        let card = D2D_RECT_F {
+            left: shape.left,
+            top: shape.top,
+            right: shape.right,
+            bottom: shape.bottom,
+        };
         let r = menu_model::RADIUS;
 
         // Soft shadow: a few widening, fading plates under the card.
@@ -222,13 +241,26 @@ impl Painter {
             self.fill_rrect(t, plate, r + grow, [0.0, 0.0, 0.0, fall * a]);
         }
 
-        // The card: the notch's surface, kept solid enough to read on glass
-        // themes, with the same hairline edge.
-        let surface = cfg.notch.surface;
-        let fill = [surface[0], surface[1], surface[2], surface[3].max(0.95) * a];
-        self.fill_rrect(t, card, r, fill);
-        self.stroke_rrect(t, card, r, 1.0, theme::fade(self.pal.edge, a));
+        let Ok(geometry) = shape.build(factory) else {
+            return;
+        };
+        // Over the open panel, the desktop behind the card is not what the
+        // eye expects to see through it, so it takes the panel's own tint
+        // there instead of the blur.
+        let over_panel = expand > 0.5
+            && card.left < panel.right
+            && card.right > panel.left
+            && card.top < panel.bottom;
+        let mut surface = cfg.notch.surface;
+        if self.pal.blur_backdrop && may_capture && !over_panel {
+            self.paint_backdrop(t, &[(&geometry, &shape, a)], origin);
+        } else {
+            // No blur to read through: keep the card legible.
+            surface[3] = surface[3].max(0.94);
+        }
+        self.paint_glass(t, factory, &shape, &geometry, surface, a);
 
+        let menu_dy = lift;
         // The highlight, under the rows.
         let hl_alpha = menu.hl_alpha.value.clamp(0.0, 1.0) * a;
         let lit = menu.pressed.or(menu.hot);
@@ -241,9 +273,15 @@ impl Painter {
         if hl_alpha > 0.004 {
             let tone = if lit_danger { DANGER } else { cfg.notch.accent };
             let strength = if menu.pressed.is_some() { 0.32 } else { 0.17 };
+            let hl = menu.highlight();
             self.fill_rrect(
                 t,
-                d2d(menu.highlight()),
+                d2d(layout::Rect::new(
+                    hl.left,
+                    hl.top + menu_dy,
+                    hl.right,
+                    hl.bottom + menu_dy,
+                )),
                 8.0,
                 theme::fade(tone, hl_alpha * strength),
             );
@@ -356,8 +394,6 @@ impl Painter {
             }
             y += menu_model::ROW_H;
         }
-
-        unsafe { t.SetTransform(&Matrix3x2::identity()) };
     }
 
     /// A small on/off switch ending at `right`, centred on `cy`.

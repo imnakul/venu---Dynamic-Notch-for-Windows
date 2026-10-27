@@ -147,6 +147,11 @@ impl MediaWatcher {
         self.snapshot.read().clone()
     }
 
+    /// Whether any app owns the media session, without cloning the snapshot.
+    pub fn has_session(&self) -> bool {
+        self.snapshot.read().has_session
+    }
+
     /// Whether something is playing, without cloning the snapshot: read on
     /// every frame for the music wave.
     pub fn is_playing(&self) -> bool {

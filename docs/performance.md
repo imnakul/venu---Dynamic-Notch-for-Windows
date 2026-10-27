@@ -162,3 +162,13 @@ possible while they are on.
 - **The player's timeline repaints once a second** while the player is open,
   from a position the media poller anchors; the poll itself does not cause a
   repaint unless the track, state or position (a seek) actually changed.
+
+## Closing keys, right-click and the pill's music controls
+
+- **Esc, the arrows and Enter are `RegisterHotKey`s held only while needed**:
+  Esc while the panel or menu is open, the arrows and Enter while the menu
+  is. Nothing listens to the keyboard otherwise.
+- **Right-click is read by the existing mouse hook** (a button press, never
+  a move), so the menu works with click-through on.
+- **The menu's glass** reuses the notch's backdrop capture and glass
+  painter for the card's rectangle, only while the menu is on screen.

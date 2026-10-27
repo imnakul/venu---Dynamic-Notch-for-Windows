@@ -203,6 +203,10 @@ struct IconCache {
     >,
 }
 
+/// The pill is wide enough for music controls from here; side segments are
+/// narrower and leave them out.
+pub const PILL_CONTROLS_MIN_W: f32 = 250.0;
+
 /// Local time, read once per frame.
 struct Clock {
     hour24: u32,
@@ -770,11 +774,11 @@ impl Painter {
             );
         }
 
-        if expanded_alpha > 0.004 {
-            self.paint_settings_button(&t, cfg, state, shape, expanded_alpha);
-            self.paint_pin_button(&t, cfg, state, shape, expanded_alpha);
-            // Hover highlight and click ripple over whatever is under them.
-            self.paint_feedback(&t, &factory, cfg, state, expanded_alpha);
+        // Hover highlight and click ripple over whatever is under them: the
+        // open panel's targets, or the music controls on the pill.
+        let feedback_alpha = expanded_alpha.max(collapsed_alpha);
+        if feedback_alpha > 0.004 {
+            self.paint_feedback(&t, &factory, cfg, state, feedback_alpha);
         }
 
         self.paint_click_through(&t, cfg, state, shape);
@@ -788,7 +792,7 @@ impl Painter {
 
         // The right-click menu floats over everything.
         if let Some(menu) = menu {
-            self.paint_menu(&t, cfg, menu);
+            self.paint_menu(&t, &factory, cfg, menu, origin, may_capture, &shape, expand);
         }
 
         unsafe { t.EndDraw(None, None)? };
@@ -957,38 +961,6 @@ impl Painter {
                 }
             }
         }
-    }
-
-    /// The Settings button: a gear on a soft round chip.
-    fn paint_settings_button(
-        &self,
-        t: &ID2D1DCRenderTarget,
-        cfg: &AppConfig,
-        _state: &NotchState,
-        shape: NotchShape,
-        alpha: f32,
-    ) {
-        self.chip_button(
-            t,
-            cfg,
-            shape.settings_button(),
-            crate::notch::menu::glyph::SETTINGS,
-            false,
-            alpha,
-        );
-    }
-
-    /// Keep open: a pin, filled in the accent while it holds the panel open.
-    fn paint_pin_button(
-        &self,
-        t: &ID2D1DCRenderTarget,
-        cfg: &AppConfig,
-        state: &NotchState,
-        shape: NotchShape,
-        alpha: f32,
-    ) {
-        let glyph = if state.pinned { "\u{E840}" } else { "\u{E718}" };
-        self.chip_button(t, cfg, shape.pin_button(), glyph, state.pinned, alpha);
     }
 
     /// A short banner confirming what just changed — click-through switched,
@@ -1597,7 +1569,24 @@ impl Painter {
                 );
 
                 let text_x = shape.left + pad + wave_w + 9.0;
-                let avail = (shape.right - pad - text_x).max(10.0);
+                // On the main pill, previous / play-pause / next sit at the
+                // right end; a side segment is too narrow for them.
+                let controls = now.has_session && shape.width() >= PILL_CONTROLS_MIN_W;
+                let right_edge = if controls {
+                    let buttons = crate::notch::geom::pill_media_buttons(shape);
+                    let glyphs = [
+                        "\u{E892}",
+                        if now.playing { "\u{E769}" } else { "\u{E768}" },
+                        "\u{E893}",
+                    ];
+                    for ((x, y, _), glyph) in buttons.into_iter().zip(glyphs) {
+                        self.glyph(t, glyph, 10.5, x, y, theme::fade(self.pal.text_hi, alpha));
+                    }
+                    buttons[0].0 - 14.0
+                } else {
+                    shape.right - pad
+                };
+                let avail = (right_edge - text_x).max(10.0);
                 let text = if !now.has_session {
                     "Nothing playing".to_string()
                 } else if now.artist.trim().is_empty() {

@@ -114,6 +114,16 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
 /// without covering what is being tuned.
 pub const WINDOW_SIZE: [f32; 2] = [940.0, 640.0];
 
+/// The smallest the window can be dragged to.
+pub const MIN_WINDOW_SIZE: [f32; 2] = [720.0, 480.0];
+
+/// How close to an edge the pointer has to be to resize the window. The
+/// window has no system frame, so it draws its own grips.
+const RESIZE_GRIP: f32 = 6.0;
+
+/// Narrowest a page lays out at; a narrower window scrolls it sideways.
+const PAGE_MIN_WIDTH: f32 = 470.0;
+
 const SIDEBAR_WIDTH: f32 = 224.0;
 
 /// The label column of a [`SettingsApp::slider_line`]. Fixed, so every slider
@@ -306,10 +316,11 @@ const PAGES: &[Page] = &[
             },
             Tab {
                 title: "Controls",
-                keywords: "open click hover delay accidental fullscreen full screen game scroll \
-                           wheel pages mouse middle click back forward side button ctrl alt \
-                           shift trigger keyboard shortcut hotkey global toggle pause right \
-                           click menu",
+                keywords: "open close click hover delay accidental fullscreen full screen game \
+                           esc escape outside leave automatic click through pass through reset \
+                           scroll wheel pages mouse middle click back forward side button ctrl \
+                           alt shift trigger keyboard shortcut hotkey global toggle pause right \
+                           click context menu",
                 draw: SettingsApp::tab_notch_controls,
             },
             Tab {
@@ -684,6 +695,41 @@ impl SettingsApp {
             logo: load_logo(&cc.egui_ctx),
             native_notification_action: None,
             recording_hotkey: None,
+        }
+    }
+
+    /// Resize from any edge or corner: the window has no system frame, so
+    /// it shows the resize cursor near an edge and hands a press there to
+    /// Windows as a resize.
+    fn resize_grips(ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection as Dir;
+        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let near_left = pos.x - screen.left() <= RESIZE_GRIP;
+        let near_right = screen.right() - pos.x <= RESIZE_GRIP;
+        let near_top = pos.y - screen.top() <= RESIZE_GRIP;
+        let near_bottom = screen.bottom() - pos.y <= RESIZE_GRIP;
+        let dir = match (near_left, near_right, near_top, near_bottom) {
+            (true, _, true, _) => Dir::NorthWest,
+            (_, true, true, _) => Dir::NorthEast,
+            (true, _, _, true) => Dir::SouthWest,
+            (_, true, _, true) => Dir::SouthEast,
+            (true, _, _, _) => Dir::West,
+            (_, true, _, _) => Dir::East,
+            (_, _, true, _) => Dir::North,
+            (_, _, _, true) => Dir::South,
+            _ => return,
+        };
+        ctx.set_cursor_icon(match dir {
+            Dir::North | Dir::South => egui::CursorIcon::ResizeVertical,
+            Dir::East | Dir::West => egui::CursorIcon::ResizeHorizontal,
+            Dir::NorthWest | Dir::SouthEast => egui::CursorIcon::ResizeNwSe,
+            Dir::NorthEast | Dir::SouthWest => egui::CursorIcon::ResizeNeSw,
+        });
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
         }
     }
 
@@ -1097,8 +1143,10 @@ impl SettingsApp {
             .show(ui, |ui| {
                 let pill = ui.painter().add(egui::Shape::Noop);
                 let mut target = None;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
+                // Wrapped, so a page with many tabs runs onto a second line
+                // instead of pushing tabs out of reach.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
                     for (index, tab) in tabs.iter().enumerate() {
                         let selected = index == active;
                         let galley = ui.painter().layout_no_wrap(
@@ -1170,7 +1218,12 @@ impl SettingsApp {
 
     /// The page heading, which doubles as the window's title bar: it moves
     /// the window and carries the pin, minimise and close buttons.
-    fn draw_title_bar(ui: &mut egui::Ui, page: &Page, pinned: &mut bool) -> TitleAction {
+    fn draw_title_bar(
+        ui: &mut egui::Ui,
+        page: &Page,
+        pinned: &mut bool,
+        click_through: bool,
+    ) -> TitleAction {
         let (bar, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
         let drag = ui.interact(bar, egui::Id::new("title_drag"), Sense::click_and_drag());
@@ -1241,6 +1294,64 @@ impl SettingsApp {
                     }
                 };
             }
+        }
+
+        // Ways out, always within reach: switch click-through off, or put
+        // every notch control back to its default.
+        let mut x = right - 6.0;
+        let mut pill = |label: &str, tip: &str, lit: bool, id: &str| -> bool {
+            let galley = ui.painter().layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::proportional(12.0),
+                theme::text_primary(),
+            );
+            let w = galley.size().x + 24.0;
+            let rect =
+                Rect::from_min_size(egui::pos2(x - w, bar.center().y - 13.0), Vec2::new(w, 26.0));
+            x -= w + 8.0;
+            let response = ui
+                .interact(rect, egui::Id::new(("title_pill", id)), Sense::click())
+                .on_hover_text(tip)
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let hover =
+                ui.ctx()
+                    .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.1);
+            let fill = if lit {
+                theme::accent().gamma_multiply(0.75 + 0.25 * hover)
+            } else {
+                theme::surface().gamma_multiply(1.0 + hover)
+            };
+            ui.painter().rect_filled(rect, Rounding::same(13.0), fill);
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                if lit {
+                    theme::on_accent()
+                } else {
+                    theme::text_primary()
+                },
+            );
+            response.clicked()
+        };
+        if pill(
+            "Reset controls",
+            "Put opening, closing, click-through, the menu and the wheel back to their defaults",
+            false,
+            "reset",
+        ) {
+            action = TitleAction::ResetControls;
+        }
+        if click_through
+            && pill(
+                "Clicks pass through · Turn off",
+                "The notch lets clicks through to the window underneath. Turn that off.",
+                true,
+                "through",
+            )
+        {
+            action = TitleAction::ClickThroughOff;
         }
         action
     }
@@ -3029,33 +3140,11 @@ impl SettingsApp {
         {
             *changed = true;
         }
-        ui.add_space(6.0);
-        if ui
-            .toggle(&mut cfg.notch.click_through, "Let clicks pass through")
-            .on_hover_text(
-                "Clicks go to the window underneath instead of the notch. \
-                 Hovering and the scroll wheel still work.",
-            )
-            .changed()
-        {
-            *changed = true;
-        }
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Press the left and right mouse buttons together with the cursor over the \
-                 notch to switch this on or off without coming back here. It has to be a \
-                 gesture: once clicks pass through, an ordinary click can no longer reach \
-                 the notch to undo it.",
-            )
-            .size(11.0)
-            .color(theme::text_secondary()),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "How the notch opens, the scroll wheel, a mouse trigger and keyboard \
-                 shortcuts are on the Controls tab.",
+                "Opening, closing, clicks passing through, the right-click menu, the \
+                 wheel and keyboard shortcuts are all on the Controls tab.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
@@ -4506,6 +4595,8 @@ impl SettingsApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleAction {
     None,
+    ResetControls,
+    ClickThroughOff,
     Hide,
     Minimize,
     /// The pin was toggled; the new state is already in the config.
@@ -4681,8 +4772,19 @@ impl eframe::App for SettingsApp {
                 let page = &PAGES[self.active];
 
                 let mut pinned = cfg_guard.settings_window.pinned;
-                match Self::draw_title_bar(ui, page, &mut pinned) {
+                let click_through = cfg_guard.notch.click_through;
+                match Self::draw_title_bar(ui, page, &mut pinned, click_through) {
                     TitleAction::None => {}
+                    TitleAction::ResetControls => {
+                        cfg_guard.notch.input.reset_behaviour();
+                        cfg_guard.notch.click_through = false;
+                        cfg_guard.notch.enabled = true;
+                        config_changed = true;
+                    }
+                    TitleAction::ClickThroughOff => {
+                        cfg_guard.notch.click_through = false;
+                        config_changed = true;
+                    }
                     TitleAction::Hide => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         self.on_screen = false;
@@ -4736,7 +4838,9 @@ impl eframe::App for SettingsApp {
                         bottom: 0.0,
                     })
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
+                        // Both ways: a narrow window scrolls sideways rather
+                        // than cutting off the right-hand controls.
+                        egui::ScrollArea::both()
                             .id_salt(("page", self.active, tab))
                             // Without this the content column shrinks to its
                             // widest widget, so right-aligned controls drift
@@ -4745,8 +4849,11 @@ impl eframe::App for SettingsApp {
                             .show(ui, |ui| {
                                 ui.multiply_opacity(travel);
                                 // Room for the scroll bar, so it never sits
-                                // on top of a right-aligned control.
-                                ui.set_max_width(ui.available_width() - 14.0);
+                                // on top of a right-aligned control; and a
+                                // floor, below which the page scrolls.
+                                let width = (ui.available_width() - 14.0).max(PAGE_MIN_WIDTH);
+                                ui.set_min_width(width);
+                                ui.set_max_width(width);
 
                                 let mut cx = PageCtx {
                                     cfg: &mut cfg_guard,
@@ -4793,6 +4900,8 @@ impl eframe::App for SettingsApp {
             Rounding::same(WINDOW_ROUNDING),
             Stroke::new(1.0, Color32::from_white_alpha(30)),
         );
+
+        Self::resize_grips(ctx);
 
         if config_changed {
             cfg_guard.save();
